@@ -1,15 +1,8 @@
 import math
 from dataclasses import dataclass, field
 
-from config import (
-    DEFAULT_EDGE_EFF,
-    DEFAULT_SUBCYCLE_M_DOT,
-    DEFAULT_SUBCYCLE_M_DOT_MAX,
-    DEFAULT_SUBCYCLE_M_DOT_MIN,
-    DEFAULT_TOLERANCE,
-)
+from config import DEFAULT_SUBCYCLE_M_DOT, DEFAULT_SUBCYCLE_M_DOT_MAX, DEFAULT_SUBCYCLE_M_DOT_MIN, DEFAULT_TOLERANCE
 
-from .process_edge import ProcessEdge
 from .state_node import StateNode
 from .subcycle import SubCycle
 from solvers import CoolPropSolver
@@ -24,10 +17,9 @@ class ClosedCycle:
     subcycles: dict[str, SubCycle] = field(default_factory=dict)    # 子循环
     nodes_raw: dict[str, StateNode] = field(default_factory=dict)   # 原始节点
     nodes_working: dict[str, StateNode] = field(default_factory=dict)   # 工作节点
-    edges_raw: dict[str, ProcessEdge] = field(default_factory=dict)   # 原始边
-    edges_working: dict[str, ProcessEdge] = field(default_factory=dict)   # 工作边
     node_groups_in_p: dict[float, list[StateNode]] = field(default_factory=dict)   # 压力分组
     node_groups_in_s: dict[float, list[StateNode]] = field(default_factory=dict)   # 熵分组
+    edge_flow_map: dict[str, dict] = field(default_factory=dict)   # 全局边流量映射
     topology_diagnostics: dict = field(default_factory=dict)   # 拓扑诊断
     _solver: CoolPropSolver | None = field(default=None, init=False, repr=False)   # 循环内复用的求解器
 
@@ -125,14 +117,13 @@ class ClosedCycle:
         self.node_groups_in_p = group_in_p
         self.node_groups_in_s = group_in_s
 
-        # 步骤4：生成全局边集合
-        self.edges_raw = {}
-        self.edges_working = {}
-        self._append_group_edges(group_in_p, sort_attr="S", family="P")
-        self._append_group_edges(group_in_s, sort_attr="P", family="S")
-
-        # 步骤5：提取子循环
+        # 步骤4：提取子循环
         self.subcycles, invalid_subcycle_count = self._extract_subcycles(group_in_p)
+
+        # 步骤5：根据子循环流量叠加得到全局边流量
+        self._apply_subcycle_flow_inputs()
+        self.edge_flow_map = self._aggregate_edge_flows()
+
         self.topology_diagnostics = self._snapshot_topology_diagnostics(
             n_nodes_a=len(a_nodes),
             n_nodes_b=len(b_nodes),
@@ -174,8 +165,7 @@ class ClosedCycle:
             "n_nodes_raw": len(self.nodes_raw),
             "n_nodes_working": len(self.nodes_working),
             "n_nodes_dedup_removed": n_nodes_dedup_removed,
-            "n_edges_raw": len(self.edges_raw),
-            "n_edges_working": len(self.edges_working),
+            "n_edges": len(self.edge_flow_map),
             "n_pressure_groups": n_pressure_groups,
             "n_entropy_groups": n_entropy_groups,
             "n_subcycles": len(self.subcycles),
@@ -210,27 +200,6 @@ class ClosedCycle:
             key = self._normalized_key(raw_val, tolerance)
             grouped.setdefault(key, []).append(node)
         return grouped
-
-    def _append_group_edges(self, grouped_nodes: dict[float, list[StateNode]], sort_attr: str, family: str) -> None:
-        for key, group in grouped_nodes.items():
-            if len(group) < 2:
-                continue
-            sorted_nodes = sorted(group, key=lambda n: getattr(n, sort_attr))
-            for i in range(len(sorted_nodes) - 1):
-                up = sorted_nodes[i]
-                down = sorted_nodes[i + 1]
-                edge_id = f"E_{family}_{str(key).replace('.', '_')}_{i}"
-                edge = ProcessEdge(
-                    edge_id=edge_id,
-                    edge_type="unknown",
-                    upstream=up,
-                    downstream=down,
-                    role="unknown",
-                    eff=DEFAULT_EDGE_EFF,
-                    m_dot=0.0,
-                )
-                self.edges_raw[edge_id] = edge
-                self.edges_working[edge_id] = edge
 
     def _extract_subcycles(
         self,
@@ -282,4 +251,65 @@ class ClosedCycle:
                     metadata={"p_band": (p_left, p_right), "s_band": (s_low, s_high)},
                 )
         return subcycles, invalid_subcycle_count
+
+    def _apply_subcycle_flow_inputs(self) -> None:
+        """
+        从boundary中读取子循环流量输入并写入子循环。
+        输入格式：
+        boundary["subcycle_flows"] = {"SC_0_0": 1.2, "SC_0_1": -0.8, ...}
+        未提供时使用默认流量。
+        """
+        input_map = self.boundary.get("subcycle_flows", {})
+        if not isinstance(input_map, dict):
+            raise ValueError(f"{self.cycle_id}: boundary.subcycle_flows must be a dict")
+        for sub_id, sub in self.subcycles.items():
+            if sub_id in input_map:
+                sub.m_dot = float(input_map[sub_id])
+
+    @staticmethod
+    def _edge_key(node_a_id: str, node_b_id: str) -> str:
+        a, b = sorted([node_a_id, node_b_id])
+        return f"{a}__{b}"
+
+    def _aggregate_edge_flows(self) -> dict[str, dict]:
+        """
+        将各子循环边流量矢量叠加为闭式循环全局边流量，并在叠加后确定全局方向。
+        """
+        edge_map: dict[str, dict] = {}
+        node_ref = self.nodes_working
+        for sub in self.subcycles.values():
+            for contrib in sub.oriented_edges_for_flow():
+                edge_key = self._edge_key(contrib["start_node_id"], contrib["end_node_id"])
+                node_a_id, node_b_id = edge_key.split("__")
+                if edge_key not in edge_map:
+                    edge_map[edge_key] = {
+                        "edge_key": edge_key,
+                        "start_node_id": node_a_id,
+                        "end_node_id": node_b_id,
+                        "start_node": node_ref[node_a_id],
+                        "end_node": node_ref[node_b_id],
+                        "net_flow": 0.0,
+                        "contributors": [],
+                    }
+                record = edge_map[edge_key]
+                sign = 1.0 if (
+                    contrib["start_node_id"] == node_a_id and contrib["end_node_id"] == node_b_id
+                ) else -1.0
+                signed_flow = sign * contrib["flow"]
+                record["net_flow"] += signed_flow
+                record["contributors"].append({
+                    "subcycle_id": contrib["subcycle_id"],
+                    "role": contrib["role"],
+                    "signed_flow": signed_flow,
+                })
+
+        # 叠加完成后再决定全局方向，确保“方向由分析结果决定”
+        for record in edge_map.values():
+            if record["net_flow"] < 0:
+                record["start_node_id"], record["end_node_id"] = record["end_node_id"], record["start_node_id"]
+                record["start_node"], record["end_node"] = record["end_node"], record["start_node"]
+                record["net_flow"] = abs(record["net_flow"])
+            dh = record["end_node"].H - record["start_node"].H
+            record["energy_rate"] = dh * record["net_flow"]
+        return edge_map
 

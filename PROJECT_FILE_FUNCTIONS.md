@@ -70,8 +70,8 @@
 关键字段（双态设计）：
 
 - `nodes_raw / nodes_working`
-- `edges_raw / edges_working`
 - `node_groups_in_p / node_groups_in_s`
+- `edge_flow_map`
 - `subcycles`
 - `topology_diagnostics`
 
@@ -84,8 +84,8 @@
     3. PS 二级节点
     4. 去重
     5. 分组
-    6. 全局边生成
-    7. 子循环提取
+    6. 子循环提取
+    7. 子循环流量叠加为全局边流量
   - 分位点输入仅要求至少1个，函数内部自动补齐 `0` 与 `1`
   - 同时输出拓扑诊断信息（A/B节点数、去重点数量、无效子循环数、分组数量）
   - 每个 `ClosedCycle` 仅创建一次 `CoolPropSolver`，并在后续复用
@@ -121,6 +121,14 @@
   - 返回 `subcycles` 与 `invalid_subcycle_count`
   - 子循环提取仅依赖节点分布，不依赖边信息
 
+- `_apply_subcycle_flow_inputs()`
+  - 从 `boundary.subcycle_flows` 读取子循环流量并写入 `SubCycle`
+
+- `_aggregate_edge_flows()`
+  - 对所有子循环边流量做矢量叠加
+  - 以边两端节点编号排序作为固定参考方向做叠加，再在叠加完成后确定全局边方向
+  - 统一计算边能量项：`(H_end - H_start) * flow`
+
 ---
 
 #### `core/subcycle.py`
@@ -132,6 +140,7 @@
 - `nodes_raw / nodes_working`
 - `m_dot`, `m_dot_min`, `m_dot_max`
 - `metadata`
+- `edge_flow_contributions`
 
 方法：
 
@@ -139,6 +148,12 @@
   - 直接由子循环左右两侧节点焓差计算功率指标
 - `calc_heat()`
   - 直接由子循环上下两侧节点焓差计算换热指标
+- `oriented_edges_for_flow()`
+  - 按 `m_dot` 正负生成子循环四条边的有向流贡献
+  - `m_dot > 0` 时，TS图上按顺时针方向
+- `_ts_frame_nodes()`
+  - 按 T-S 图几何位置重建四角（左/右由S决定，上/下由T决定）
+  - 子循环方向与功热计算均基于该几何四角，而非拓扑命名
 
 ---
 
@@ -269,8 +284,17 @@
 3. `SystemModel.from_spec()`
 4. `build()`
 5. `solve()`
-6. 绘制闭式循环 `T-S` 图（节点、边、子循环）
-7. 输出构建与功率信息
+6. 给子循环随机注入一组正负流量（用于验证共享边矢量叠加）
+7. 绘制闭式循环 `T-S` 图（节点、全局叠加边箭头、子循环）
+8. 输出构建与功率信息
+
+补充说明：
+
+- 全局边以箭头表示方向（方向由叠加后净流量确定）
+- 箭头旁标注净流量大小
+- `inject_random_subcycle_flows()` 用固定随机种子生成可复现实验流量
+- 默认只绘制全局净箭头，避免共享边出现“局部+全局”双向视觉叠加
+- `show_local_arrows=True` 时可选显示子循环局部箭头用于调试
 
 ---
 
