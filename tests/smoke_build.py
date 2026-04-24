@@ -24,7 +24,7 @@ def sample_spec() -> dict:
                 "cycle_id": "cycle-1",
                 "fluid": "He",
                 "boundary": {"TRange": [200, 1000], "PRange": [10000, 20000]},
-                "levels": {"TLevel": [0, 0.5, 1], "PLevel": [0, 0.5, 1]},
+                "levels": {"TLevel": [0.5], "PLevel": [0.5]},
             }
         ],
         "metadata": {"case": "smoke"},
@@ -84,15 +84,39 @@ def plot_closed_cycle_ts(cycle, output_path: Path) -> None:
         center_t = sum(p[1] for p in polygon_points) / 4.0
         ax.text(center_s, center_t, sub.subcycle_id, fontsize=6, color="darkgreen")
 
-        for edge in sub.edges_working.values():
-            ax.plot(
-                [edge.upstream.S, edge.downstream.S],
-                [edge.upstream.T, edge.downstream.T],
-                color="tab:red" if edge.role in {"left", "right"} else "tab:blue",
-                linewidth=1.4,
-                alpha=0.85,
-                zorder=4,
-            )
+        # 直接根据四角节点绘制子循环四条边
+        ax.plot(
+            [n["left_bottom"].S, n["left_top"].S],
+            [n["left_bottom"].T, n["left_top"].T],
+            color="tab:red",
+            linewidth=1.4,
+            alpha=0.85,
+            zorder=4,
+        )
+        ax.plot(
+            [n["right_bottom"].S, n["right_top"].S],
+            [n["right_bottom"].T, n["right_top"].T],
+            color="tab:red",
+            linewidth=1.4,
+            alpha=0.85,
+            zorder=4,
+        )
+        ax.plot(
+            [n["left_top"].S, n["right_top"].S],
+            [n["left_top"].T, n["right_top"].T],
+            color="tab:blue",
+            linewidth=1.4,
+            alpha=0.85,
+            zorder=4,
+        )
+        ax.plot(
+            [n["left_bottom"].S, n["right_bottom"].S],
+            [n["left_bottom"].T, n["right_bottom"].T],
+            color="tab:blue",
+            linewidth=1.4,
+            alpha=0.85,
+            zorder=4,
+        )
 
     ax.set_title(f"Smoke Closed Cycle Topology (T-S): {cycle.cycle_id}")
     ax.set_xlabel("Entropy S [kJ/(kg.K)]")

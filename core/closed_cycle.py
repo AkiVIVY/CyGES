@@ -1,6 +1,13 @@
+import math
 from dataclasses import dataclass, field
 
-from config import DEFAULT_SUBCYCLE_M_DOT, DEFAULT_SUBCYCLE_M_DOT_MAX, DEFAULT_SUBCYCLE_M_DOT_MIN, DEFAULT_TOLERANCE
+from config import (
+    DEFAULT_EDGE_EFF,
+    DEFAULT_SUBCYCLE_M_DOT,
+    DEFAULT_SUBCYCLE_M_DOT_MAX,
+    DEFAULT_SUBCYCLE_M_DOT_MIN,
+    DEFAULT_TOLERANCE,
+)
 
 from .process_edge import ProcessEdge
 from .state_node import StateNode
@@ -10,18 +17,19 @@ from solvers import CoolPropSolver
 
 @dataclass
 class ClosedCycle:
-    cycle_id: str
-    boundary: dict
-    levels: dict
-    fluid: str
-    subcycles: dict[str, SubCycle] = field(default_factory=dict)
-    nodes_raw: dict[str, StateNode] = field(default_factory=dict)
-    nodes_working: dict[str, StateNode] = field(default_factory=dict)
-    edges_raw: dict[str, ProcessEdge] = field(default_factory=dict)
-    edges_working: dict[str, ProcessEdge] = field(default_factory=dict)
-    node_groups_in_p: dict[float, list[StateNode]] = field(default_factory=dict)
-    node_groups_in_s: dict[float, list[StateNode]] = field(default_factory=dict)
-    topology_diagnostics: dict = field(default_factory=dict)
+    cycle_id: str   # 循环编号
+    boundary: dict   # 边界条件
+    levels: dict   # 分位点
+    fluid: str   # 工质
+    subcycles: dict[str, SubCycle] = field(default_factory=dict)    # 子循环
+    nodes_raw: dict[str, StateNode] = field(default_factory=dict)   # 原始节点
+    nodes_working: dict[str, StateNode] = field(default_factory=dict)   # 工作节点
+    edges_raw: dict[str, ProcessEdge] = field(default_factory=dict)   # 原始边
+    edges_working: dict[str, ProcessEdge] = field(default_factory=dict)   # 工作边
+    node_groups_in_p: dict[float, list[StateNode]] = field(default_factory=dict)   # 压力分组
+    node_groups_in_s: dict[float, list[StateNode]] = field(default_factory=dict)   # 熵分组
+    topology_diagnostics: dict = field(default_factory=dict)   # 拓扑诊断
+    _solver: CoolPropSolver | None = field(default=None, init=False, repr=False)   # 循环内复用的求解器
 
     def generate_topology(self) -> None:
         """
@@ -29,48 +37,50 @@ class ClosedCycle:
         """
         t_range = self.boundary.get("TRange")
         p_range = self.boundary.get("PRange")
-        t_level = self.levels.get("TLevel")
-        p_level = self.levels.get("PLevel")
+        t_level_input = self.levels.get("TLevel")
+        p_level_input = self.levels.get("PLevel")
         tolerance = self.boundary.get("tolerance", DEFAULT_TOLERANCE)
 
         if not isinstance(t_range, (list, tuple)) or len(t_range) != 2:
             raise ValueError(f"{self.cycle_id}: boundary.TRange must be [Tmin, Tmax]")
         if not isinstance(p_range, (list, tuple)) or len(p_range) != 2:
             raise ValueError(f"{self.cycle_id}: boundary.PRange must be [Pmin, Pmax]")
-        if not isinstance(t_level, (list, tuple)) or len(t_level) < 2:
-            raise ValueError(f"{self.cycle_id}: levels.TLevel must have at least 2 values")
-        if not isinstance(p_level, (list, tuple)) or len(p_level) < 2:
-            raise ValueError(f"{self.cycle_id}: levels.PLevel must have at least 2 values")
+        if tolerance <= 0:
+            raise ValueError(f"{self.cycle_id}: tolerance must be > 0")
+        t_level = self._complete_levels(t_level_input, level_name="TLevel")
+        p_level = self._complete_levels(p_level_input, level_name="PLevel")
 
         t_min, t_max = t_range
         p_min, p_max = p_range
         if t_min >= t_max or p_min >= p_max:
             raise ValueError(f"{self.cycle_id}: invalid boundary ranges")
 
-        solver = CoolPropSolver([self.fluid])
+        if self._solver is None:
+            # 每个闭式循环只创建一次求解器，后续步骤复用。
+            self._solver = CoolPropSolver([self.fluid])
+        solver = self._solver
 
         p_list = [p_min + (p_max - p_min) * x for x in p_level]
         t_list = [t_min + (t_max - t_min) * x for x in t_level]
 
-        # Step 1: generate A nodes from TP
+        # 步骤1：由TP参数对生成一级节点
         a_nodes: list[StateNode] = []
         for p_idx, px in enumerate(p_list):
             for t_idx, tx in enumerate(t_list):
                 prop = solver.solve("TP", self.fluid, tx, px)
                 a_nodes.append(
                     StateNode(
-                        node_id=f"N_A_{p_idx}_{t_idx}",
+                        node_id=f"A_{p_idx}_{t_idx}",
                         fluid=self.fluid,
                         T=prop["T"],
                         P=prop["P"],
                         H=prop["H"],
                         S=prop["S"],
                         source_tag="A_TP",
-                        grid_index=(p_idx, t_idx),
                     )
                 )
 
-        # Step 2: generate B nodes by PS projection
+        # 步骤2：通过PS投影生成二级节点
         s_low_list = [solver.solve("TP", self.fluid, t_min, px)["S"] for px in p_list]
         s_high_list = [solver.solve("TP", self.fluid, t_max, px)["S"] for px in p_list]
         b_nodes: list[StateNode] = []
@@ -83,18 +93,17 @@ class ClosedCycle:
                 prop = solver.solve("PS", self.fluid, px, base.S)
                 b_nodes.append(
                     StateNode(
-                        node_id=f"N_B_{base.node_id}_{p_idx}",
+                        node_id=f"{base.node_id}_B_{p_idx}",
                         fluid=self.fluid,
                         T=prop["T"],
                         P=prop["P"],
                         H=prop["H"],
                         S=prop["S"],
                         source_tag="B_PS",
-                        grid_index=None,
                     )
                 )
 
-        # Step 3: deduplicate with tolerance on (P,S)
+        # 步骤3：按(P,S)容差去重
         node_raw = {}
         seen = {}
         for node in a_nodes + b_nodes:
@@ -106,24 +115,24 @@ class ClosedCycle:
             seen[key] = node.node_id
             node_raw[node.node_id] = node
 
-        self.nodes_raw = node_raw
-        self.nodes_working = {nid: n.clone() for nid, n in self.nodes_raw.items()}
-        dedup_removed = len(a_nodes) + len(b_nodes) - len(self.nodes_raw)
+        self.nodes_raw = node_raw   # 合并后的原始节点
+        self.nodes_working = {nid: n.clone() for nid, n in self.nodes_raw.items()}   # 合并后的工作节点
+        dedup_removed = len(a_nodes) + len(b_nodes) - len(self.nodes_raw)   # 去重节点数量
 
         node_list = list(self.nodes_working.values())
-        group_in_p = self._group_nodes(node_list, key_attr="P", tolerance=tolerance)
-        group_in_s = self._group_nodes(node_list, key_attr="S", tolerance=tolerance)
+        group_in_p = self._group_nodes(node_list, key_attr="P", tolerance=tolerance)   # 压力分组，同时进行了容差处理
+        group_in_s = self._group_nodes(node_list, key_attr="S", tolerance=tolerance)   # 熵分组，同时进行了容差处理
         self.node_groups_in_p = group_in_p
         self.node_groups_in_s = group_in_s
 
-        # Step 4: build global edge registry
+        # 步骤4：生成全局边集合
         self.edges_raw = {}
         self.edges_working = {}
         self._append_group_edges(group_in_p, sort_attr="S", family="P")
         self._append_group_edges(group_in_s, sort_attr="P", family="S")
 
-        # Step 5: extract subcycles
-        self.subcycles, invalid_subcycle_count = self._extract_subcycles(group_in_p, group_in_s)
+        # 步骤5：提取子循环
+        self.subcycles, invalid_subcycle_count = self._extract_subcycles(group_in_p)
         self.topology_diagnostics = self._snapshot_topology_diagnostics(
             n_nodes_a=len(a_nodes),
             n_nodes_b=len(b_nodes),
@@ -175,7 +184,24 @@ class ClosedCycle:
 
     @staticmethod
     def _normalized_key(value: float, tolerance: float) -> float:
-        return round(round(value / tolerance) * tolerance, 12)
+        normalized = round(value / tolerance) * tolerance
+        decimal_digits = max(0, int(math.ceil(-math.log10(tolerance))) + 2)
+        return round(normalized, decimal_digits)
+
+    @staticmethod
+    def _complete_levels(levels: list | tuple | None, level_name: str) -> list[float]:
+        """
+        分位点输入仅要求“至少一个”，计算时自动补上0和1。
+        """
+        if not isinstance(levels, (list, tuple)) or len(levels) < 1:
+            raise ValueError(f"{level_name} must have at least 1 value")
+        result = [0.0, 1.0]
+        for value in levels:
+            value_f = float(value)
+            if not 0 <= value_f <= 1:
+                raise ValueError(f"{level_name} must be within [0, 1]")
+            result.append(value_f)
+        return sorted(set(result))
 
     def _group_nodes(self, node_list: list[StateNode], key_attr: str, tolerance: float) -> dict[float, list[StateNode]]:
         grouped: dict[float, list[StateNode]] = {}
@@ -200,7 +226,7 @@ class ClosedCycle:
                     upstream=up,
                     downstream=down,
                     role="unknown",
-                    eta=1.0,
+                    eff=DEFAULT_EDGE_EFF,
                     m_dot=0.0,
                 )
                 self.edges_raw[edge_id] = edge
@@ -209,10 +235,13 @@ class ClosedCycle:
     def _extract_subcycles(
         self,
         group_in_p: dict[float, list[StateNode]],
-        group_in_s: dict[float, list[StateNode]],
     ) -> tuple[dict[str, SubCycle], int]:
         p_keys = sorted(group_in_p.keys())
-        s_keys = sorted(group_in_s.keys())
+        s_keys = sorted({
+            self._normalized_key(n.S, self.boundary.get("tolerance", DEFAULT_TOLERANCE))
+            for group in group_in_p.values()
+            for n in group
+        })
         node_map = {}
         for p_key, group in group_in_p.items():
             for n in group:
@@ -243,83 +272,14 @@ class ClosedCycle:
                     "right_bottom": n_rb,
                 }
                 nodes_working = {k: v.clone() for k, v in nodes_raw.items()}
-
-                edges_raw = self._make_subcycle_edges(sub_id, nodes_working)
-                edges_working = {k: e for k, e in edges_raw.items()}
                 subcycles[sub_id] = SubCycle(
                     subcycle_id=sub_id,
                     nodes_raw=nodes_raw,
                     nodes_working=nodes_working,
-                    edges_raw=edges_raw,
-                    edges_working=edges_working,
                     m_dot=DEFAULT_SUBCYCLE_M_DOT,
                     m_dot_min=DEFAULT_SUBCYCLE_M_DOT_MIN,
                     m_dot_max=DEFAULT_SUBCYCLE_M_DOT_MAX,
                     metadata={"p_band": (p_left, p_right), "s_band": (s_low, s_high)},
                 )
         return subcycles, invalid_subcycle_count
-
-    @staticmethod
-    def _make_subcycle_edges(sub_id: str, nodes_working: dict[str, StateNode]) -> dict[str, ProcessEdge]:
-        edge_map = {
-            "left": ("compress", "left_bottom", "left_top"),
-            "right": ("expand", "right_bottom", "right_top"),
-            "top": ("heat_in", "left_top", "right_top"),
-            "bottom": ("heat_out", "left_bottom", "right_bottom"),
-        }
-        result = {}
-        for role, (edge_type, up_key, down_key) in edge_map.items():
-            result[role] = ProcessEdge(
-                edge_id=f"{sub_id}_{role}",
-                edge_type=edge_type,
-                upstream=nodes_working[up_key],
-                downstream=nodes_working[down_key],
-                role=role,
-                eta=1.0,
-                m_dot=DEFAULT_SUBCYCLE_M_DOT,
-            )
-        return result
-
-    def export_topology_dict(self) -> dict:
-        """
-        兼容旧版createModel输出风格，便于迁移阶段做结果对比。
-        """
-        node_list = list(self.nodes_working.values())
-        edge_list_in_p = [
-            edge for edge in self.edges_working.values()
-            if edge.edge_id.startswith("E_P_")
-        ]
-        edge_list_in_s = [
-            edge for edge in self.edges_working.values()
-            if edge.edge_id.startswith("E_S_")
-        ]
-        sub_cycle_list = []
-        sub_cycle_in_p_band = {}
-        sub_cycle_in_s_band = {}
-        for sub in self.subcycles.values():
-            sub_item = {
-                "id": sub.subcycle_id,
-                "nodes": sub.nodes_working,
-                "p_band": sub.metadata.get("p_band"),
-                "s_band": sub.metadata.get("s_band"),
-            }
-            sub_cycle_list.append(sub_item)
-            p_band = sub_item["p_band"]
-            s_band = sub_item["s_band"]
-            sub_cycle_in_p_band.setdefault(p_band, []).append(sub_item)
-            sub_cycle_in_s_band.setdefault(s_band, []).append(sub_item)
-
-        return {
-            "nodeList": node_list,
-            "nodeListInP": self.node_groups_in_p,
-            "nodeListInS": self.node_groups_in_s,
-            "edgeListInP": edge_list_in_p,
-            "edgeListInS": edge_list_in_s,
-            "subCycleDict": {
-                "subCycleList": sub_cycle_list,
-                "subCycleInPBand": sub_cycle_in_p_band,
-                "subCycleInSBand": sub_cycle_in_s_band,
-            },
-            "topologyDiagnostics": self.topology_diagnostics,
-        }
 

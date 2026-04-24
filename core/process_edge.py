@@ -14,7 +14,7 @@ class ProcessEdge:
     upstream: StateNode
     downstream: StateNode
     role: Literal["left", "right", "top", "bottom", "unknown"] = "unknown"
-    eta: float = 1.0
+    eff: float = 1.0
     m_dot: float = 0.0
     constraints_ref: dict | None = None
 

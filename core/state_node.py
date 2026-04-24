@@ -10,7 +10,6 @@ class StateNode:
     H: float
     S: float
     source_tag: str = "unknown"
-    grid_index: tuple[int, int] | None = None
 
     def clone(self, node_id: str | None = None) -> "StateNode":
         return StateNode(
@@ -21,6 +20,5 @@ class StateNode:
             H=self.H,
             S=self.S,
             source_tag=self.source_tag,
-            grid_index=self.grid_index,
         )
 

@@ -30,7 +30,7 @@
 - `DEFAULT_SUBCYCLE_M_DOT`
 - `DEFAULT_SUBCYCLE_M_DOT_MIN`
 - `DEFAULT_SUBCYCLE_M_DOT_MAX`
-- `DEFAULT_EDGE_ETA`
+- `DEFAULT_EDGE_EFF`
 - `DEFAULT_TOLERANCE`
 
 ---
@@ -86,7 +86,9 @@
     5. 分组
     6. 全局边生成
     7. 子循环提取
+  - 分位点输入仅要求至少1个，函数内部自动补齐 `0` 与 `1`
   - 同时输出拓扑诊断信息（A/B节点数、去重点数量、无效子循环数、分组数量）
+  - 每个 `ClosedCycle` 仅创建一次 `CoolPropSolver`，并在后续复用
 
 - `calc_cycle_balance()`
   - 汇总全部子循环的功率与换热
@@ -103,6 +105,10 @@
 
 - `_normalized_key(value, tolerance)`
   - 浮点归一化辅助
+  - 小数位精度与 `tolerance` 相关，不再写死固定小数位
+
+- `_complete_levels(levels, level_name)`
+  - 校验分位点输入并自动补齐 `0` 和 `1`
 
 - `_group_nodes(node_list, key_attr, tolerance)`
   - 按 `P` 或 `S` 分组节点
@@ -110,15 +116,10 @@
 - `_append_group_edges(grouped_nodes, sort_attr, family)`
   - 在分组中排序后创建边
 
-- `_extract_subcycles(group_in_p, group_in_s)`
+- `_extract_subcycles(group_in_p)`
   - 从网格提取 `SubCycle` 对象
   - 返回 `subcycles` 与 `invalid_subcycle_count`
-
-- `_make_subcycle_edges(sub_id, nodes_working)`
-  - 为单个子循环建立 `left/right/top/bottom` 语义边
-
-- `export_topology_dict()`
-  - 输出与旧版 `createModel` 相近的数据结构，便于新旧结果对比与迁移验证
+  - 子循环提取仅依赖节点分布，不依赖边信息
 
 ---
 
@@ -129,17 +130,15 @@
 字段：
 
 - `nodes_raw / nodes_working`
-- `edges_raw / edges_working`
 - `m_dot`, `m_dot_min`, `m_dot_max`
 - `metadata`
 
 方法：
 
-- `_edge(role)`：取指定角色边
 - `calc_power()`
-  - 通过 left/right 边计算功率指标
+  - 直接由子循环左右两侧节点焓差计算功率指标
 - `calc_heat()`
-  - 通过 top/bottom 边计算换热指标
+  - 直接由子循环上下两侧节点焓差计算换热指标
 
 ---
 
@@ -152,7 +151,7 @@
 - `edge_id`, `edge_type`
 - `upstream`, `downstream`
 - `role`（`left/right/top/bottom/unknown`）
-- `eta`, `m_dot`, `constraints_ref`
+- `eff`, `m_dot`, `constraints_ref`
 
 方法：
 
@@ -169,7 +168,6 @@
 
 - `node_id`, `fluid`, `T`, `P`, `H`, `S`
 - `source_tag`
-- `grid_index`
 
 方法：
 
@@ -220,6 +218,8 @@
   - `stream_id`, `fluid`, `m_dot`
 - 闭式循环必填键：
   - `cycle_id`, `fluid`, `boundary`, `levels`
+- 分位点必填键：
+  - `TLevel`, `PLevel`（每项至少1个值）
 
 #### `inputs/__init__.py`
 
@@ -264,7 +264,7 @@
 **作用**：新架构最小冒烟测试。  
 流程：
 
-1. 生成 `sample_spec()`
+1. 生成 `sample_spec()`（示例分位点仅输入中间值，`0/1` 在闭式循环内自动补齐）
 2. `validate_system_spec()`
 3. `SystemModel.from_spec()`
 4. `build()`
