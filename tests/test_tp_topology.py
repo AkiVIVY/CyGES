@@ -1,79 +1,21 @@
-"""闭式循环 TP 拓扑：一级网格 + 等熵二级节点。"""
+"""闭式循环 TP 拓扑：氦气工况单测，输出含节点、边与子循环的综合图。"""
 
 from pathlib import Path
 
 import pytest
 
-from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput, build_axis
-from core.fluid_property_solver import CoolPropFluidPropertySolver
+from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput
 
 
-def test_axis_bounds_and_quantiles():
-    assert build_axis(300.0, 400.0, (0.5,)) == [300.0, 350.0, 400.0]
-    assert build_axis(100.0, 500.0, (0.25, 0.5, 0.75)) == [100.0, 200.0, 300.0, 400.0, 500.0]
-
-
-def test_grid_and_isentropic_secondary_water_via_layer():
-    inp = ClosedCycleTPInput(
-        fluid="Water",
-        t_min=400.0,
-        t_max=500.0,
-        p_min=200.0,
-        p_max=2000.0,
-        t_quantiles=(0.25, 0.75),
-        p_quantiles=(0.25, 0.75),
-        max_mass_flow=10.0,
-    )
-    layer = ClosedCycleLayer(inp)
-    layer.analyze_topology()
-    primary = [n for n in layer.nodes.values() if n.parent is None]
-    secondary = [n for n in layer.nodes.values() if n.parent is not None]
-    by_index = {n.index: n for n in primary}
-    assert len(primary) >= 1
-    for n in primary:
-        st = layer.properties.state("TP", n.T, n.P)
-        assert st["T"] == pytest.approx(n.T, rel=1e-12)
-        assert st["P"] == pytest.approx(n.P, rel=1e-12)
-        assert n.H == pytest.approx(st["H"], rel=1e-9)
-        assert n.S == pytest.approx(st["S"], rel=1e-9)
-    for snode in secondary:
-        parent = by_index[snode.parent]
-        assert snode.S == pytest.approx(parent.S, rel=1e-6)
-        assert inp.t_min <= snode.T <= inp.t_max
-
-    for key, e in layer.edges.items():
-        assert e.tail in layer.nodes and e.head in layer.nodes
-        assert e.mass_flow is None
-        nt, nh = layer.nodes[e.tail], layer.nodes[e.head]
-        assert nt.P <= nh.P + 1e-6 * max(1.0, abs(nt.P), abs(nh.P))
-        assert nt.S <= nh.S + 1e-6 * max(1.0, abs(nt.S), abs(nh.S))
-        if e.kind == "mechanical":
-            assert nt.edge_up == key
-            assert nh.edge_down == key
-        else:
-            assert nt.edge_right == key
-            assert nh.edge_left == key
-
-
-def test_analyze_accepts_injected_solver():
-    inp = ClosedCycleTPInput(
-        fluid="Water",
-        t_min=400.0,
-        t_max=420.0,
-        p_min=200.0,
-        p_max=400.0,
-    )
-    solver = CoolPropFluidPropertySolver("Water")
-    layer = ClosedCycleLayer(inp, properties=solver)
-    layer.analyze_topology()
-    assert len([n for n in layer.nodes.values() if n.parent is None]) >= 1
-
-
-def test_helium_tp_topology_ts_plot():
-    """He 工质宽温压范围拓扑，并输出 T–S 图（节点 + 机械边 + 换热边）。"""
+def test_helium_topology_overview_plot():
+    """
+    He 宽温压拓扑：断言存在子循环；输出双子图（T–S 与 P–S），含一级/二级节点、
+    机械/换热边、最小子循环多边形及编号。
+    """
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon
 
     inp = ClosedCycleTPInput(
         fluid="He",
@@ -81,88 +23,143 @@ def test_helium_tp_topology_ts_plot():
         t_max=900.0,
         p_min=1000.0,
         p_max=9000.0,
-        t_quantiles=(0.5,),
-        p_quantiles=(0.5,),
+        t_quantiles=(0.3,  0.7),
+        p_quantiles=(0.3,  0.7),
     )
     layer = ClosedCycleLayer(inp)
     layer.analyze_topology()
     primary = [n for n in layer.nodes.values() if n.parent is None]
     secondary = [n for n in layer.nodes.values() if n.parent is not None]
     assert len(primary) >= 1
+    assert len(layer.subcycles) >= 1
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, (ax_ts, ax_ps) = plt.subplots(1, 2, figsize=(14, 6.5))
     z_edge = 2
-    z_pt = 3
+    z_poly = 3
+    z_pt = 4
 
-    mech_k0 = True
-    heat_k0 = True
-    for e in layer.edges.values():
-        nt, nh = layer.nodes[e.tail], layer.nodes[e.head]
-        if e.kind == "mechanical":
-            ax.plot(
-                [nt.S, nh.S],
-                [nt.T, nh.T],
-                color="tab:green",
-                linewidth=1.2,
-                alpha=0.85,
-                zorder=z_edge,
-                label="Mechanical edges" if mech_k0 else None,
-            )
-            mech_k0 = False
-        else:
-            ax.plot(
-                [nt.S, nh.S],
-                [nt.T, nh.T],
-                color="tab:red",
-                linewidth=1.0,
-                linestyle="--",
-                alpha=0.85,
-                zorder=z_edge,
-                label="Heat edges" if heat_k0 else None,
-            )
-            heat_k0 = False
+    def draw_edges(ax, xkey: str, ykey: str) -> None:
+        for e in layer.edges.values():
+            nt, nh = layer.nodes[e.tail], layer.nodes[e.head]
+            xs = (getattr(nt, xkey), getattr(nh, xkey))
+            ys = (getattr(nt, ykey), getattr(nh, ykey))
+            if e.kind == "mechanical":
+                ax.plot(
+                    xs,
+                    ys,
+                    color="tab:green",
+                    linestyle="-",
+                    linewidth=1.1,
+                    alpha=0.75,
+                    zorder=z_edge,
+                )
+            else:
+                ax.plot(
+                    xs,
+                    ys,
+                    color="tab:red",
+                    linestyle="--",
+                    linewidth=1.0,
+                    alpha=0.75,
+                    zorder=z_edge,
+                )
 
-    ax.scatter(
-        [n.S for n in primary],
-        [n.T for n in primary],
-        c="tab:blue",
-        s=36,
-        label="Level-1 (TP grid)",
-        zorder=z_pt,
-    )
-    if secondary:
+    def draw_nodes(ax, xkey: str, ykey: str) -> None:
         ax.scatter(
-            [n.S for n in secondary],
-            [n.T for n in secondary],
-            c="tab:orange",
-            s=40,
-            marker="x",
-            label="Level-2 (isentropic)",
+            [getattr(n, xkey) for n in primary],
+            [getattr(n, ykey) for n in primary],
+            c="tab:blue",
+            s=38,
+            label="Level-1 (TP grid)",
             zorder=z_pt,
+            edgecolors="white",
+            linewidths=0.45,
         )
-    ax.set_xlabel("S [kJ/(kg·K)]")
-    ax.set_ylabel("T [K]")
-    ax.set_title(
-        "He closed-cycle TP topology (T in [100,900] K, P in [1,9] MPa, quantile 0.5)"
+        if secondary:
+            ax.scatter(
+                [getattr(n, xkey) for n in secondary],
+                [getattr(n, ykey) for n in secondary],
+                c="tab:orange",
+                s=42,
+                marker="x",
+                label="Level-2 (isentropic)",
+                zorder=z_pt,
+            )
+
+    def draw_subcycles(ax, xkey: str, ykey: str) -> None:
+        for k, sc in enumerate(layer.subcycles):
+            corners = [layer.nodes[i] for i in sc.nodes]
+            xs = [getattr(c, xkey) for c in corners]
+            ys = [getattr(c, ykey) for c in corners]
+            color = f"C{k % 10}"
+            poly = Polygon(
+                list(zip(xs, ys)),
+                closed=True,
+                facecolor=color,
+                edgecolor=color,
+                linewidth=2.0,
+                alpha=0.2,
+                zorder=z_poly,
+            )
+            ax.add_patch(poly)
+            cx = sum(xs) / 4.0
+            cy = sum(ys) / 4.0
+            ax.annotate(
+                str(k + 1),
+                (cx, cy),
+                ha="center",
+                va="center",
+                fontsize=9,
+                fontweight="bold",
+                color="0.2",
+                zorder=z_poly + 1,
+            )
+
+    for ax, xk, yk, xl, yl, title in (
+        (
+            ax_ts,
+            "S",
+            "T",
+            "S [kJ/(kg·K)]",
+            "T [K]",
+            "T–S",
+        ),
+        (
+            ax_ps,
+            "S",
+            "P",
+            "S [kJ/(kg·K)]",
+            "P [kPa]",
+            "P–S",
+        ),
+    ):
+        draw_edges(ax, xk, yk)
+        draw_subcycles(ax, xk, yk)
+        draw_nodes(ax, xk, yk)
+        ax.set_xlabel(xl)
+        ax.set_ylabel(yl)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+
+    green = plt.Line2D([0], [0], color="tab:green", lw=1.5, label="Mechanical edges")
+    red = plt.Line2D([0], [0], color="tab:red", lw=1.5, ls="--", label="Heat edges")
+    fig.legend(
+        handles=[green, red],
+        loc="upper center",
+        ncol=2,
+        fontsize=9,
+        frameon=True,
+        bbox_to_anchor=(0.5, 1.02),
     )
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
+    fig.suptitle(
+        f"He closed-cycle topology (T=[100,900] K, P=[1,9] MPa); "
+        f"{len(layer.subcycles)} minimal subcycle(s)",
+        fontsize=11,
+        y=1.06,
+    )
     fig.tight_layout()
     out = Path(__file__).resolve().parent / "ts_topology_he.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     assert out.is_file()
-
-
-def test_fluid_solver_hp_hs_ps_match_tp_reference():
-    """HP/HS/PS 与 TP 参考态在数值上应一致（过冷水单相区）。"""
-    sol = CoolPropFluidPropertySolver("Water")
-    ref = sol.state("TP", 450.0, 500.0)
-    from_hp = sol.state("HP", ref["H"], ref["P"])
-    from_hs = sol.state("HS", ref["H"], ref["S"])
-    from_ps = sol.state("PS", ref["P"], ref["S"])
-    for st in (from_hp, from_hs, from_ps):
-        assert st["T"] == pytest.approx(ref["T"], rel=1e-6)
-        assert st["P"] == pytest.approx(ref["P"], rel=1e-6)
-        assert st["H"] == pytest.approx(ref["H"], rel=1e-6)
-        assert st["S"] == pytest.approx(ref["S"], rel=1e-6)

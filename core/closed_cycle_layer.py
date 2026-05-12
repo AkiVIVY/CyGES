@@ -1,22 +1,34 @@
 """
-闭式循环层：由 ``ClosedCycleTPInput``（含工质）创建物性求解器，并提供 TP 拓扑分析。
-
-TP 拓扑由 ``build_node_edge_topology`` 一次完成：温压轴与分位生成一级 TP 网格；二级在同一压力轴上对
-一级状态做等熵延伸并生成机械边；再汇总节点后生成换热边。调用 ``ClosedCycleLayer.analyze_topology()`` 后，
-全部节点写入 ``nodes``（``dict[int, Node]``，键为 ``index``）：``parent is None`` 为一级，
-``parent`` 为一级节点 ``index`` 时为二级。不要求节点顺序。
-
-``nodes`` 与 ``edges``（``dict[str, Edge]``）为 **拓扑快照**；键名 **机械边** 为 ``"M1"``, ``"M2"``, …，
-**换热边** 为 ``"H1"``, ``"H2"``, …（均存于同一字典）。边上 ``mass_flow`` 初始为
-``None``，方向由 ``tail → head``（有向边尾端 / 头端节点序号）表示。PS 平面约定：``P`` 由小到大为自下而上，
-``S`` 由小到大为自左而右；有向边在生成时即取向为仅 **向上**（``P`` 增大或不变）且 **向右**
-（``S`` 增大或不变），即 ``nodes[tail].P <= nodes[head].P`` 且 ``nodes[tail].S <= nodes[head].S``。
-全边生成后，按 ``kind`` 将边键写入端点：机械边 ``tail`` 记 ``edge_up``、``head`` 记 ``edge_down``；换热边 ``tail`` 记 ``edge_right``、``head`` 记 ``edge_left``（值为 ``edges`` 字典键，无邻边为 ``None``）。
-后续可在此基础上再生成用于实际计算的边/流。
+闭式循环层：由 ``ClosedCycleTPInput``（含工质）创建物性求解器，并提供拓扑分析。
 
 单位约定（字段名不缀单位）：T[K]、P[kPa]、H[kJ/kg]、S[kJ/(kg·K)]。
 分位序列由调用方保证互不重复且落在合理区间，本模块不对分位做额外校验。
+
+节点和边拓扑由 ``build_node_edge_topology`` 一次完成：
+1.温压轴与分位生成一级节点；
+2.在同一压力轴上对一级节点做等熵延伸，生成二级节点，并进一步生成机械边；
+3.汇总节点后生成换热边；
+4.机械边和换热边按生成顺序编号，写入 ``edges`` 字典，键名 ``M*`` / ``H*``；
+5.将边键写入节点，具体规则参考PS平面约定。
+
+build_node_edge_topology生成的节点和边为拓扑快照，后续具体计算时可在此基础上再生成用于实际计算的边/流。
+
+最小 **子循环**（``SubCycle``）为沿 ``edge_up`` → ``edge_right`` → ``edge_down`` → ``edge_left`` 闭合的 **4 节点、4 边** 单元；
+节点顺序为顺时针 **左下 → 左上 → 右上 → 右下**，边顺序为 **左、上、右、下**。
+``SubCycle`` 含子循环 **单一** 质量流 ``mass_flow``（单位同 ``Edge.mass_flow``，可为负，初值 ``None``），供后续求解填写；该类非 ``frozen`` 以便就地更新。
+
+由 ``build_subcycles`` 在拓扑快照上枚举（四节点互异；``frozenset`` 去重），**不再**对 ``P``/``S`` 几何一致性做额外校验。
+
 一级节点 ``index`` 从 0 起连续编号；二级节点 ``index`` 紧接一级最大编号之后连续编号。
+
+边上 ``mass_flow`` 初始为``None``，方向由 ``tail → head``（有向边尾端 / 头端节点序号）表示。
+
+PS 平面约定：``P`` 由小到大为自下而上，``S`` 由小到大为自左而右；
+有向边在生成时即取向为仅 **向上**（``P`` 增大或不变）且 **向右**（``S`` 增大或不变），
+即 ``nodes[tail].P <= nodes[head].P`` 且 ``nodes[tail].S <= nodes[head].S``。
+
+全边生成后，按 ``kind`` 将边键写入端点：机械边 ``tail`` 记 ``edge_up``、``head`` 记 ``edge_down``；
+换热边 ``tail`` 记 ``edge_right``、``head`` 记 ``edge_left``（值为 ``edges`` 字典键，无邻边为 ``None``）。
 """
 
 from __future__ import annotations
@@ -82,6 +94,21 @@ class Edge:
     kind: Literal["mechanical", "heat"]
     tail: int
     head: int
+    mass_flow: float | None = None
+
+
+@dataclass
+class SubCycle:
+    """
+    最小子循环（4 节点、4 边）。非 ``frozen``，便于后续写入流量等。
+
+    - ``nodes``：``(左下, 左上, 右上, 右下)`` 顺时针，各元素为 ``Node.index``。
+    - ``edges``：``(左, 上, 右, 下)``，各为 ``edges`` 字典键——左/右须为机械边，上/下须为换热边（由 ``build_subcycles`` 走边保证）。
+    - ``mass_flow``：子循环质量流 [kg/s] 等标量，初值 ``None``；可为负（与约定正方向相反）。
+    """
+
+    nodes: tuple[int, int, int, int]
+    edges: tuple[str, str, str, str]
     mass_flow: float | None = None
 
 
@@ -236,12 +263,72 @@ def build_node_edge_topology(
     return nodes, all_edges
 
 
+def build_subcycles(nodes: dict[int, Node], edges: dict[str, Edge]) -> list[SubCycle]:
+    """
+    枚举最小子循环：对每个起始节点尝试 ``edge_up`` → 对端 ``edge_right`` → 对端 ``edge_down``（取该边 ``tail``）
+    → 对端 ``edge_left``（取该边 ``tail``）须回到起始节点；四节点互异。
+
+    使用 ``frozenset`` 对四角去重，每个物理单元至多输出一次。不对 ``P``/``S`` 几何做一致性校验。
+    """
+    seen_cells: set[frozenset[int]] = set()
+    out: list[SubCycle] = []
+
+    for n0 in nodes.values():
+        ku = n0.edge_up
+        if ku is None:
+            continue
+        e_left = edges[ku]
+        if e_left.kind != "mechanical":
+            continue
+        n1 = nodes[e_left.head]
+        kr = n1.edge_right
+        if kr is None:
+            continue
+        e_top = edges[kr]
+        if e_top.kind != "heat":
+            continue
+        n2 = nodes[e_top.head]
+        kd = n2.edge_down
+        if kd is None:
+            continue
+        e_right = edges[kd]
+        if e_right.kind != "mechanical":
+            continue
+        n3 = nodes[e_right.tail]
+        kl = n3.edge_left
+        if kl is None:
+            continue
+        e_bottom = edges[kl]
+        if e_bottom.kind != "heat":
+            continue
+        if e_bottom.tail != n0.index:
+            continue
+
+        idxs = (n0.index, n1.index, n2.index, n3.index)
+        if len(set(idxs)) != 4:
+            continue
+
+        cell = frozenset(idxs)
+        if cell in seen_cells:
+            continue
+        seen_cells.add(cell)
+
+        out.append(
+            SubCycle(
+                nodes=(n0.index, n1.index, n2.index, n3.index),
+                edges=(ku, kr, kd, kl),
+            )
+        )
+
+    return out
+
+
 class ClosedCycleLayer:
     """
     闭式循环层。仅依赖 ``ClosedCycleTPInput`` 即可持有工质并创建默认物性后端；
     也可注入 ``properties`` 以便测试或替换实现。
 
-    ``analyze_topology()`` 填充 ``nodes`` 与快照边 ``edges``（``dict[str, Edge]``，键 ``M*`` / ``H*``）。
+    ``analyze_topology()`` 填充 ``nodes``、``edges``（``dict[str, Edge]``，键 ``M*`` / ``H*``）与 ``subcycles``。
     """
 
     def __init__(self, inp: ClosedCycleTPInput, *, properties: FluidPropertySolver | None = None) -> None:
@@ -251,7 +338,9 @@ class ClosedCycleLayer:
         # 分析前为空；``analyze_topology`` 一次性写入基准拓扑
         self.nodes: dict[int, Node] = {}
         self.edges: dict[str, Edge] = {}
+        self.subcycles: list[SubCycle] = []
 
     def analyze_topology(self) -> None:
-        """调用 ``build_node_edge_topology`` 写入 ``nodes`` 与 ``edges``（``M*`` 后 ``H*``）。"""
+        """调用 ``build_node_edge_topology`` 写入 ``nodes`` 与 ``edges``，再 ``build_subcycles`` 写入 ``subcycles``。"""
         self.nodes, self.edges = build_node_edge_topology(self.properties, self.input)
+        self.subcycles = build_subcycles(self.nodes, self.edges)
