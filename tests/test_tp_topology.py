@@ -41,9 +41,18 @@ def test_grid_and_isentropic_secondary_water_via_layer():
         assert snode.S == pytest.approx(parent.S, rel=1e-6)
         assert inp.t_min <= snode.T <= inp.t_max
 
-    for e in layer.mechanical_edges + layer.heat_edges:
+    for key, e in layer.edges.items():
         assert e.tail in layer.nodes and e.head in layer.nodes
         assert e.mass_flow is None
+        nt, nh = layer.nodes[e.tail], layer.nodes[e.head]
+        assert nt.P <= nh.P + 1e-6 * max(1.0, abs(nt.P), abs(nh.P))
+        assert nt.S <= nh.S + 1e-6 * max(1.0, abs(nt.S), abs(nh.S))
+        if e.kind == "mechanical":
+            assert nt.edge_up == key
+            assert nh.edge_down == key
+        else:
+            assert nt.edge_right == key
+            assert nh.edge_left == key
 
 
 def test_analyze_accepts_injected_solver():
@@ -85,32 +94,33 @@ def test_helium_tp_topology_ts_plot():
     z_edge = 2
     z_pt = 3
 
-    # 机械边（等熵离散链）：绿线
-    for k, e in enumerate(layer.mechanical_edges):
+    mech_k0 = True
+    heat_k0 = True
+    for e in layer.edges.values():
         nt, nh = layer.nodes[e.tail], layer.nodes[e.head]
-        ax.plot(
-            [nt.S, nh.S],
-            [nt.T, nh.T],
-            color="tab:green",
-            linewidth=1.2,
-            alpha=0.85,
-            zorder=z_edge,
-            label="Mechanical edges" if k == 0 else None,
-        )
-
-    # 换热边（等压、温度相邻）：红虚线
-    for k, e in enumerate(layer.heat_edges):
-        nt, nh = layer.nodes[e.tail], layer.nodes[e.head]
-        ax.plot(
-            [nt.S, nh.S],
-            [nt.T, nh.T],
-            color="tab:red",
-            linewidth=1.0,
-            linestyle="--",
-            alpha=0.85,
-            zorder=z_edge,
-            label="Heat edges" if k == 0 else None,
-        )
+        if e.kind == "mechanical":
+            ax.plot(
+                [nt.S, nh.S],
+                [nt.T, nh.T],
+                color="tab:green",
+                linewidth=1.2,
+                alpha=0.85,
+                zorder=z_edge,
+                label="Mechanical edges" if mech_k0 else None,
+            )
+            mech_k0 = False
+        else:
+            ax.plot(
+                [nt.S, nh.S],
+                [nt.T, nh.T],
+                color="tab:red",
+                linewidth=1.0,
+                linestyle="--",
+                alpha=0.85,
+                zorder=z_edge,
+                label="Heat edges" if heat_k0 else None,
+            )
+            heat_k0 = False
 
     ax.scatter(
         [n.S for n in primary],

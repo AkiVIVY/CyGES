@@ -35,7 +35,7 @@ python -m pytest tests/test_tp_topology.py::test_helium_tp_topology_ts_plot -v
 
 | 路径 | 作用 |
 |------|------|
-| [`core/closed_cycle_layer.py`](core/closed_cycle_layer.py) | 闭式循环层：`ClosedCycleLayer`、`ClosedCycleTPInput`、`Node`、`Edge`；`analyze_topology()` 填充 `nodes` 与快照边 |
+| [`core/closed_cycle_layer.py`](core/closed_cycle_layer.py) | 闭式循环层：`ClosedCycleLayer`、`ClosedCycleTPInput`、`Node`、`Edge`；`analyze_topology()` 内部调用 ``build_node_edge_topology`` 填充 `nodes` 与 `edges` |
 | [`core/fluid_property_solver.py`](core/fluid_property_solver.py) | CoolProp `AbstractState("HEOS", fluid)`；统一 `state(pair, x, y)` 返回 `T,P,H,S` 字典 |
 | [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 拓扑与物性相关单元测试及氦气 T–S 可视化 |
 
@@ -64,17 +64,15 @@ python -m pytest tests/test_tp_topology.py::test_helium_tp_topology_ts_plot -v
 ### 拓扑分析
 
 - **`analyze_topology() -> None`**：仅修改层实例，**无返回值**。
-- 写 **`self.nodes: dict[int, Node]`**（键 = 全局 **`index`**，不要求顺序）。
-- **`parent is None`**：一级 TP 网格点；**`parent == 某一级 index`**：二级等熵延伸点。
-- **`self.mechanical_edges`**：等熵离散链上按压力排序的相邻有向边（`tail` → `head`）。
-- **`self.heat_edges`**：全节点按等 **P** 分桶、桶内按 **T** 排序后的相邻换热边。
-- **`Edge.mass_flow`**：快照阶段为 **`None`**，后续业务再赋值；**`kind`** 为 `"mechanical"` / `"heat"`。
+- **`self.nodes: dict[int, Node]`**：键 = 全局 **`index`**，不要求顺序。**`parent is None`** 为一级 TP 网格点；**`parent == 某一级 index`** 为二级等熵延伸点。每个节点另有 **`edge_up` / `edge_down` / `edge_left` / `edge_right`**（值为 **`self.edges`** 中的键或 **`None`**）：机械边写入 **上/下**，换热边写入 **右/左**（与 PS 约定一致）。
+- **`self.edges: dict[str, Edge]`**：拓扑快照，**机械边**键为 **`M1`**, **`M2`**, …，**换热边**键为 **`H1`**, **`H2`**, …，均在同一字典中；**`Edge.kind`** 为 `"mechanical"` / `"heat"`，**`Edge.mass_flow`** 快照阶段为 **`None`**。
+- **PS 平面约定**（与本模块边方向一致）：**P** 由小到大为自下而上，**S** 由小到大为自左而右；有向边 **`tail → head`** 满足 **`P`、`S` 均不减**（机械边沿等熵链 **P** 增大；换热边等 **P**、桶内按 **S** 相邻）。
 
 以上为 **拓扑快照**；后续可在副本或新结构上扩展「用于实际计算的边」。
 
 ## 扩展时建议
 
-1. 改网格/边逻辑：主要动 [`core/closed_cycle_layer.py`](core/closed_cycle_layer.py) 中 `build_grid_nodes`、`expand_isentropic_nodes`、`build_heat_edges`。
+1. 改网格/边逻辑：主要改 [`core/closed_cycle_layer.py`](core/closed_cycle_layer.py) 中的 ``build_node_edge_topology``（及轴采样 ``build_axis`` 若需调整分位策略）。
 2. 改物性后端：实现与 **`FluidPropertySolver`** 协议兼容的类，在 **`ClosedCycleLayer(..., properties=...)`** 注入。
 3. 新测试：沿用 **`PYTHONPATH=.`**；大图可只跑氦气用例以节省时间。
 
