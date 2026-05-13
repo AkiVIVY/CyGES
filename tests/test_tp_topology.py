@@ -86,8 +86,29 @@ def test_non_ideal_cleared_on_analyze():
     assert ni2 is not ni
 
 
-def test_baseline_snapshot_edge_mass_flow_detached():
-    """基准边记录为值拷贝；父层 ``Edge.mass_flow`` 原地修改不改变已拍快照。"""
+def test_simplified_topology_built_on_analyze_and_commit():
+    """``ClosedCycleLayer.simplified`` 在 ``analyze_topology`` 后即生成；``commit_*`` 后会被重建为新对象。"""
+    inp = ClosedCycleTPInput(
+        fluid="He",
+        t_min=100.0,
+        t_max=900.0,
+        p_min=1000.0,
+        p_max=9000.0,
+        t_quantiles=(0.3, 0.7),
+        p_quantiles=(0.3, 0.7),
+        max_mass_flow=10.0,
+    )
+    layer = ClosedCycleLayer(inp)
+    assert layer.simplified is not None
+    simp_before = layer.simplified
+    layer.subcycle_mass_flows[0] = -float(inp.max_mass_flow) * 0.3
+    layer.commit_subcycle_mass_flows_to_topology()
+    assert layer.simplified is not None
+    assert layer.simplified is not simp_before
+
+
+def test_ensure_non_ideal_snapshot_is_current_simplified():
+    """``ensure_non_ideal()`` 直接持有 ``layer.simplified`` 的同一引用（值快照语义）。"""
     inp = ClosedCycleTPInput(
         fluid="He",
         t_min=100.0,
@@ -100,12 +121,7 @@ def test_baseline_snapshot_edge_mass_flow_detached():
     )
     layer = ClosedCycleLayer(inp)
     ni = layer.ensure_non_ideal()
-    rec0 = ni.baseline.edge_records[0]
-    k0 = rec0.key
-    snap_mf = rec0.mass_flow
-    layer.edges[k0].mass_flow = 99999.0 if snap_mf != 99999.0 else 88888.0
-    rec_again = next(r for r in ni.baseline.edge_records if r.key == k0)
-    assert rec_again.mass_flow == snap_mf
+    assert ni.simplified is layer.simplified
 
 
 def test_non_ideal_cleared_after_commit():

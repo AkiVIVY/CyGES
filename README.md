@@ -44,8 +44,8 @@ python -m pytest tests/test_tp_topology.py::test_helium_topology_overview_plot -
 | 路径 | 说明 |
 |------|------|
 | [`config.py`](config.py) | 全局可调数值：子循环初值系数、量化步长、非理想精简边统一效率默认值（见下表） |
-| [`core/closed_cycle_layer.py`](core/closed_cycle_layer.py) | 闭式循环层：`ClosedCycleTPInput`、`Node`、`Edge`、`SubCycle`、`ClosedCycleLayer`；`build_axis`、`build_node_edge_topology`、`build_subcycles` |
-| [`core/non_ideal_closed_cycle_layer.py`](core/non_ideal_closed_cycle_layer.py) | 非理想层：`BaselineTopologySnapshot`、`filter_topology_for_non_ideal`、`build_simplified_topology`、`NonIdealClosedCycleLayer` |
+| [`core/closed_cycle_layer.py`](core/closed_cycle_layer.py) | 闭式循环层：`ClosedCycleTPInput`、`Node`、`Edge`、`SubCycle`、`ClosedCycleLayer`、`SimplifiedEdge` / `SimplifiedTopology`；`build_axis`、`build_node_edge_topology`、`build_subcycles`、`filter_topology_for_non_ideal`、`build_simplified_topology`（每次 `analyze` / `commit` 后由 `ClosedCycleLayer._rebuild_simplified()` 自动同步） |
+| [`core/non_ideal_closed_cycle_layer.py`](core/non_ideal_closed_cycle_layer.py) | 非理想层：`NonIdealClosedCycleLayer`——仅持有理想层 `simplified` 的值快照引用 |
 | [`core/fluid_property_solver.py`](core/fluid_property_solver.py) | `FluidPropertySolver` 协议与 `CoolPropFluidPropertySolver`（`state(pair,x,y)` → `T,P,H,S`） |
 | [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 拓扑与子循环流量相关测试及 PNG 输出 |
 | [`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py) | He：随机子循环流量后 commit 再非理想简化，输出双子图 PNG |
@@ -66,8 +66,8 @@ python -m pytest tests/test_tp_topology.py::test_helium_topology_overview_plot -
 |------|--------|------|
 | `SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX` | `0.1` | `analyze_topology` 后子循环初值：`每项 = 该系数 × max_mass_flow`；`max_mass_flow` 为 `None` 时按 `0` 参与乘法 |
 | `SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT` | `0.01` | `ClosedCycleTPInput` **未显式传入** `subcycle_mass_flow_step_fraction` 时采用；量化步长 `step = subcycle_mass_flow_step_fraction × max_mass_flow` |
-| `NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT` | `0.85` | 非理想精简机械边统一等熵效率 η（临时；后续按边配置） |
-| `NON_IDEAL_HEAT_EFFICIENCY_DEFAULT` | `0.99` | 非理想精简换热边统一压力保留比例（临时；后续按边配置） |
+| `NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT` | `0.85` | 非理想精简机械边统一等熵效率 η（保留供非理想层后续按边挂效率使用，本次重构未读取） |
+| `NON_IDEAL_HEAT_EFFICIENCY_DEFAULT` | `0.99` | 非理想精简换热边统一压力保留比例（保留供非理想层后续按边挂效率使用，本次重构未读取） |
 
 ---
 
@@ -118,9 +118,10 @@ CoolProp 内部为 SI；[`CoolPropFluidPropertySolver`](core/fluid_property_solv
 - **`nodes: dict[int, Node]`**：键为全局 `index`；`parent is None` 为一级 TP 点，`parent` 为一级 `index` 为二级等熵点。
 - **`edges: dict[str, Edge]`**：键 `M1,M2,…`（机械）、`H1,H2,…`（换热）；完成 `analyze_topology`（含构造时默认自动分析）后，`Edge.mass_flow` 由子循环汇聚写入；未分析前为 `None`。
 - **`subcycles: list[SubCycle]`**：最小 4 节点 4 边环；`nodes` 顺序为左下→左上→右上→右下；`edges` 为左、上、右、下；`mass_flow` 由层同步。
-- **`subcycle_mass_flows: list[float]`**：与 `subcycles[i]` 同索引；优化场景下优先改此列表，再 **`commit_subcycle_mass_flows_to_topology()`**（内部：量化 → `sync` → 赋边），或分步 **`quantize_subcycle_mass_flows()`**、**`sync_subcycle_mass_flows_to_subcycles()`**、**`assign_edge_mass_flows_from_subcycles()`**。无子循环时为空列表。再次 **`analyze_topology()`** 会重置拓扑与本列表。**`analyze_topology()`** 与 **`commit_subcycle_mass_flows_to_topology()`** 之后均会清空 **`non_ideal`**，须在理想层稳定后再 **`ensure_non_ideal()`**。
+- **`subcycle_mass_flows: list[float]`**：与 `subcycles[i]` 同索引；优化场景下优先改此列表，再 **`commit_subcycle_mass_flows_to_topology()`**（内部：量化 → `sync` → 赋边 → `_rebuild_simplified`），或分步 **`quantize_subcycle_mass_flows()`**、**`sync_subcycle_mass_flows_to_subcycles()`**、**`assign_edge_mass_flows_from_subcycles()`**。无子循环时为空列表。再次 **`analyze_topology()`** 会重置拓扑与本列表。**`analyze_topology()`** 与 **`commit_subcycle_mass_flows_to_topology()`** 之后均会重建 **`simplified`** 并清空 **`non_ideal`** 快照容器，须在理想层稳定后再 **`ensure_non_ideal()`**。
 - **`skipped_points: list[SkippedPoint]`**：**仅诊断用**，记录 `build_node_edge_topology` 中被 CoolProp 异常静默跳过的候选点（一级 `TP` 或二级 `PS` 阶段），含 `stage / T / P / S / reason`；不参与拓扑与流量计算。每次 **`analyze_topology()`** 重置。
-- **`ensure_non_ideal()`** → [`NonIdealClosedCycleLayer`](core/non_ideal_closed_cycle_layer.py)：挂载 `baseline`（拓扑快照）与 `simplified`（精简 PS 拓扑）。精简前调用 **`filter_topology_for_non_ideal(nodes, edges, subcycles)`**：剔除**不在任何子循环**中的边，以及 **`mass_flow` 为 `None` 或数值为零**的边，并同步清空节点上指向被删边的邻边槽；**不修改**父层 `ClosedCycleLayer` 上的 `nodes` / `edges`。随后再对过滤后的拷贝做链合并；过滤后四邻边槽全空的节点记入 **`simplified.merged_into`**，值为占位常量 **`MERGED_ISOLATED_NODE_EDGE_KEY`**（无对应 `SimplifiedEdge`），且不出现在 **`kept_nodes`** 中。
+- **`simplified: SimplifiedTopology | None`**：精简 PS 拓扑（保留节点 `kept_nodes`、`SimplifiedEdge` 序列、合并占位映射 `merged_into`）。由 **`_rebuild_simplified()`** 在每次 `analyze_topology()` / `commit_subcycle_mass_flows_to_topology()` 末尾自动构建——先 **`filter_topology_for_non_ideal(nodes, edges, subcycles)`** 剔除不在任何子循环中的边及 `mass_flow` 为 `None` / 0 的边并同步清空节点邻边槽（**不修改**父层），再做同类型链合并；过滤后四邻边槽全空的节点记入 `simplified.merged_into`，值为占位常量 **`MERGED_ISOLATED_NODE_EDGE_KEY`**（无对应 `SimplifiedEdge`），且不出现在 `kept_nodes` 中。`len(subcycles) == 0` 时退化为空骨架并发出 **`RuntimeWarning`**。
+- **`ensure_non_ideal()`** → [`NonIdealClosedCycleLayer`](core/non_ideal_closed_cycle_layer.py)：仅持有理想层当前 `simplified` 的引用作为「值快照」（`SimplifiedTopology` 为 `frozen` + tuple/frozenset，本身不可变）。父层 `analyze` / `commit` 之后会清空 `non_ideal`，旧 `ni.simplified` 仍指向 ensure 当时的快照，与父层新生成的 `simplified` 解耦。
 
 ### 子循环流量（B 模式）
 
@@ -143,7 +144,8 @@ CoolProp 内部为 SI；[`CoolPropFluidPropertySolver`](core/fluid_property_solv
 | `test_subcycle_mass_flow_step_fraction_defaults_from_config` | 未传 `subcycle_mass_flow_step_fraction` 时等于 `config` 默认 |
 | `test_auto_analyze_false_then_manual_analyze` | `auto_analyze=False` 后手动 `analyze_topology` |
 | `test_non_ideal_cleared_on_analyze` | `analyze_topology` 后清空 `non_ideal` |
-| `test_baseline_snapshot_edge_mass_flow_detached` | 基准边快照与父层 `Edge` 解耦 |
+| `test_simplified_topology_built_on_analyze_and_commit` | `analyze` 后 `layer.simplified` 即存在，`commit_*` 后被重建为新对象 |
+| `test_ensure_non_ideal_snapshot_is_current_simplified` | `ensure_non_ideal()` 持有 `layer.simplified` 同一引用（值快照语义） |
 | `test_non_ideal_cleared_after_commit` | `commit` 后清空 `non_ideal` |
 | `test_commit_subcycle_mass_flows_len_mismatch_raises` | `commit_subcycle_mass_flows_to_topology` 长度不一致抛错 |
 | `test_helium_topology_overview_plot` | He 宽网格、双子图 PNG |

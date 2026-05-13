@@ -8,12 +8,17 @@ from core.closed_cycle_layer import (
     ClosedCycleLayer,
     ClosedCycleTPInput,
     Edge,
+    MERGED_ISOLATED_NODE_EDGE_KEY,
     Node,
+    SimplifiedEdge,
+    SimplifiedTopology,
     SkippedPoint,
     SubCycle,
     build_axis,
     build_node_edge_topology,
+    build_simplified_topology,
     build_subcycles,
+    filter_topology_for_non_ideal,
 )
 from core.fluid_property_solver import (
     CoolPropFluidPropertySolver,
@@ -22,15 +27,7 @@ from core.fluid_property_solver import (
     ThermoStateTPHS,
 )
 from core.non_ideal_closed_cycle_layer import (
-    BaselineEdgeRecord,
-    BaselineSubCycleRecord,
-    BaselineTopologySnapshot,
-    MERGED_ISOLATED_NODE_EDGE_KEY,
     NonIdealClosedCycleLayer,
-    SimplifiedEdge,
-    SimplifiedTopology,
-    build_simplified_topology,
-    filter_topology_for_non_ideal,
 )
 
 __all__ = [
@@ -47,9 +44,6 @@ __all__ = [
     "FluidPropertySolver",
     "PropertyPair",
     "ThermoStateTPHS",
-    "BaselineEdgeRecord",
-    "BaselineSubCycleRecord",
-    "BaselineTopologySnapshot",
     "MERGED_ISOLATED_NODE_EDGE_KEY",
     "NonIdealClosedCycleLayer",
     "SimplifiedEdge",

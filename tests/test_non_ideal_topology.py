@@ -5,8 +5,11 @@ import random
 
 import pytest
 
-from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput
-from core.non_ideal_closed_cycle_layer import MERGED_ISOLATED_NODE_EDGE_KEY
+from core.closed_cycle_layer import (
+    ClosedCycleLayer,
+    ClosedCycleTPInput,
+    MERGED_ISOLATED_NODE_EDGE_KEY,
+)
 
 
 def test_helium_non_ideal_simplified_topology_plot():
