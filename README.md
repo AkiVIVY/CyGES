@@ -43,10 +43,12 @@ python -m pytest tests/test_tp_topology.py::test_helium_topology_overview_plot -
 
 | 路径 | 说明 |
 |------|------|
-| [`config.py`](config.py) | 全局可调数值：子循环初值系数、量化步长比例默认值（见下表） |
+| [`config.py`](config.py) | 全局可调数值：子循环初值系数、量化步长、非理想精简边统一效率默认值（见下表） |
 | [`core/closed_cycle_layer.py`](core/closed_cycle_layer.py) | 闭式循环层：`ClosedCycleTPInput`、`Node`、`Edge`、`SubCycle`、`ClosedCycleLayer`；`build_axis`、`build_node_edge_topology`、`build_subcycles` |
+| [`core/non_ideal_closed_cycle_layer.py`](core/non_ideal_closed_cycle_layer.py) | 非理想层：`BaselineTopologySnapshot`、`filter_topology_for_non_ideal`、`build_simplified_topology`、`NonIdealClosedCycleLayer` |
 | [`core/fluid_property_solver.py`](core/fluid_property_solver.py) | `FluidPropertySolver` 协议与 `CoolPropFluidPropertySolver`（`state(pair,x,y)` → `T,P,H,S`） |
 | [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 拓扑与子循环流量相关测试及 PNG 输出 |
+| [`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py) | He：随机子循环流量后 commit 再非理想简化，输出双子图 PNG |
 | [`core/__init__.py`](core/__init__.py) | `core` 包说明 |
 
 ### 其他目录（扩展/历史）
@@ -64,6 +66,8 @@ python -m pytest tests/test_tp_topology.py::test_helium_topology_overview_plot -
 |------|--------|------|
 | `SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX` | `0.1` | `analyze_topology` 后子循环初值：`每项 = 该系数 × max_mass_flow`；`max_mass_flow` 为 `None` 时按 `0` 参与乘法 |
 | `SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT` | `0.01` | `ClosedCycleTPInput` **未显式传入** `subcycle_mass_flow_step_fraction` 时采用；量化步长 `step = subcycle_mass_flow_step_fraction × max_mass_flow` |
+| `NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT` | `0.85` | 非理想精简机械边统一等熵效率 η（临时；后续按边配置） |
+| `NON_IDEAL_HEAT_EFFICIENCY_DEFAULT` | `0.99` | 非理想精简换热边统一压力保留比例（临时；后续按边配置） |
 
 ---
 
@@ -116,6 +120,7 @@ CoolProp 内部为 SI；[`CoolPropFluidPropertySolver`](core/fluid_property_solv
 - **`subcycles: list[SubCycle]`**：最小 4 节点 4 边环；`nodes` 顺序为左下→左上→右上→右下；`edges` 为左、上、右、下；`mass_flow` 由层同步。
 - **`subcycle_mass_flows: list[float]`**：与 `subcycles[i]` 同索引；优化场景下优先改此列表，再 **`commit_subcycle_mass_flows_to_topology()`**（内部：量化 → `sync` → 赋边），或分步 **`quantize_subcycle_mass_flows()`**、**`sync_subcycle_mass_flows_to_subcycles()`**、**`assign_edge_mass_flows_from_subcycles()`**。无子循环时为空列表。再次 **`analyze_topology()`** 会重置拓扑与本列表。**`analyze_topology()`** 与 **`commit_subcycle_mass_flows_to_topology()`** 之后均会清空 **`non_ideal`**，须在理想层稳定后再 **`ensure_non_ideal()`**。
 - **`skipped_points: list[SkippedPoint]`**：**仅诊断用**，记录 `build_node_edge_topology` 中被 CoolProp 异常静默跳过的候选点（一级 `TP` 或二级 `PS` 阶段），含 `stage / T / P / S / reason`；不参与拓扑与流量计算。每次 **`analyze_topology()`** 重置。
+- **`ensure_non_ideal()`** → [`NonIdealClosedCycleLayer`](core/non_ideal_closed_cycle_layer.py)：挂载 `baseline`（拓扑快照）与 `simplified`（精简 PS 拓扑）。精简前调用 **`filter_topology_for_non_ideal(nodes, edges, subcycles)`**：剔除**不在任何子循环**中的边，以及 **`mass_flow` 为 `None` 或数值为零**的边，并同步清空节点上指向被删边的邻边槽；**不修改**父层 `ClosedCycleLayer` 上的 `nodes` / `edges`。随后再对过滤后的拷贝做链合并；过滤后四邻边槽全空的节点记入 **`simplified.merged_into`**，值为占位常量 **`MERGED_ISOLATED_NODE_EDGE_KEY`**（无对应 `SimplifiedEdge`），且不出现在 **`kept_nodes`** 中。
 
 ### 子循环流量（B 模式）
 
@@ -142,6 +147,9 @@ CoolProp 内部为 SI；[`CoolPropFluidPropertySolver`](core/fluid_property_solv
 | `test_non_ideal_cleared_after_commit` | `commit` 后清空 `non_ideal` |
 | `test_commit_subcycle_mass_flows_len_mismatch_raises` | `commit_subcycle_mass_flows_to_topology` 长度不一致抛错 |
 | `test_helium_topology_overview_plot` | He 宽网格、双子图 PNG |
+| `test_helium_non_ideal_simplified_topology_plot` | He：随机子循环流量 → commit → 精简拓扑双子图 PNG |
+
+> 完整列表见 [`tests/test_tp_topology.py`](tests/test_tp_topology.py) 与 [`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py)。
 
 ---
 

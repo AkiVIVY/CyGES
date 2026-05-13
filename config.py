@@ -12,3 +12,11 @@ SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX: float = 0.1
 # 子循环质量流量化：步长 = subcycle_mass_flow_step_fraction * max_mass_flow；
 # ``ClosedCycleTPInput`` 未显式传入 ``subcycle_mass_flow_step_fraction`` 时使用本默认值。
 SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT: float = 0.01
+
+# 非理想精简机械边统一效率（等熵效率 η ∈ (0,1]）。
+# 临时配置：所有精简机械边共用该值，后续会按边分别赋值。
+NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT: float = 0.85
+
+# 非理想精简换热边统一效率（沿流向 P_head / P_tail 的压力保留比例 ∈ (0,1]）。
+# 临时配置：所有精简换热边共用该值，后续会按边分别赋值。
+NON_IDEAL_HEAT_EFFICIENCY_DEFAULT: float = 0.99
