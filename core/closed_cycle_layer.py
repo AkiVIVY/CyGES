@@ -11,7 +11,7 @@
 4.机械边和换热边按生成顺序编号，写入 ``edges`` 字典，键名 ``M*`` / ``H*``；
 5.将边键写入节点，具体规则参考PS平面约定。
 
-build_node_edge_topology生成的节点和边为拓扑快照，后续具体计算时可在此基础上再生成用于实际计算的边/流。
+build_node_edge_topology 生成的节点和边为拓扑快照；``assign_subcycle_mass_flows_to_edges`` 将子循环有符号流量按顺时针约定汇聚到各 ``Edge.mass_flow``（``tail → head`` 方向）。
 
 最小 **子循环**（``SubCycle``）为沿 ``edge_up`` → ``edge_right`` → ``edge_down`` → ``edge_left`` 闭合的 **4 节点、4 边** 单元；
 节点顺序为顺时针 **左下 → 左上 → 右上 → 右下**，边顺序为 **左、上、右、下**。
@@ -36,7 +36,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from typing import Literal, Sequence
+from typing import TYPE_CHECKING, Literal, Sequence, Mapping
+
+if TYPE_CHECKING:
+    from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer
 
 import config as cyges_config
 
@@ -95,7 +98,7 @@ class Edge:
 
     - ``kind``：``"mechanical"`` 为等熵链上压力离散相邻；``"heat"`` 为等压线上熵 ``S`` 离散相邻。
     - ``tail`` / ``head``：端点节点序号，方向为尾 → 头。
-    - ``mass_flow``：质量流 [kg/s] 等，初始 ``None``，由后续流程填写。
+    - ``mass_flow``：质量流 [kg/s] 等，初始 ``None``；经 ``assign_subcycle_mass_flows_to_edges`` 后为沿 ``tail → head`` 的代数和（未被子循环覆盖的边保持 ``None``）。
     """
 
     kind: Literal["mechanical", "heat"]
@@ -330,15 +333,67 @@ def build_subcycles(nodes: dict[int, Node], edges: dict[str, Edge]) -> list[SubC
     return out
 
 
+def assign_subcycle_mass_flows_to_edges(
+    edges: Mapping[str, Edge],
+    subcycles: Sequence[SubCycle],
+) -> None:
+    """
+    将各子循环 ``mass_flow`` 汇聚到 ``edges[*].mass_flow``。
+
+    约定：``SubCycle.nodes`` 为顺时针 ``(左下, 左上, 右上, 右下)``；``mass_flow > 0`` 表示沿该顺时针回路，
+    ``< 0`` 表示逆时针。每条拓扑边 ``tail → head`` 上，``mass_flow`` 为沿该方向的代数和；``None`` 子循环按 ``0``。
+
+    若某子循环的边键与顺时针段 ``(u→v)`` 和 ``(tail, head)`` 均不一致，抛出 ``ValueError``。
+    先清空所有边的 ``mass_flow``，再仅对至少出现一次的边写入累加结果（含 ``0.0``）。
+    """
+    for e in edges.values():
+        e.mass_flow = None
+    totals: dict[str, float] = defaultdict(float)
+
+    for sc in subcycles:
+        q = 0.0 if sc.mass_flow is None else float(sc.mass_flow)
+        n0, n1, n2, n3 = sc.nodes
+        segment_edge: tuple[tuple[int, int], str] = (
+            ((n0, n1), sc.edges[0]),
+            ((n1, n2), sc.edges[1]),
+            ((n2, n3), sc.edges[2]),
+            ((n3, n0), sc.edges[3]),
+        )
+        for (u, v), ek in segment_edge:
+            edge = edges[ek]
+            if edge.tail == u and edge.head == v:
+                totals[ek] += q
+            elif edge.tail == v and edge.head == u:
+                totals[ek] -= q
+            else:
+                raise ValueError(
+                    f"子循环边 {ek!r} 的 tail/head {(edge.tail, edge.head)!r} 与顺时针段 {(u, v)!r} 不一致"
+                )
+
+    for ek, tot in totals.items():
+        edges[ek].mass_flow = tot
+
+
 class ClosedCycleLayer:
     """
     闭式循环层。仅依赖 ``ClosedCycleTPInput`` 即可持有工质并创建默认物性后端；
     也可注入 ``properties`` 以便测试或替换实现。
 
-    ``analyze_topology()`` 填充 ``nodes``、``edges``、``subcycles``，以及 ``subcycle_mass_flows``（默认每项为 ``config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * max_mass_flow``）并同步到各 ``SubCycle.mass_flow``。
+    默认 ``auto_analyze=True`` 时，构造末尾会调用一次 ``analyze_topology()``；否则保持空拓扑直至显式调用。
+    外部修改 ``subcycle_mass_flows`` 后若需离散化并写回子循环与边，调用 ``commit_subcycle_mass_flows_to_topology()``。
+    非理想分析通过 ``ensure_non_ideal()`` 得到 ``non_ideal``；每次 ``analyze_topology()`` 或 ``commit_subcycle_mass_flows_to_topology()`` 会清空 ``non_ideal``（闭式循环层稳定后再重建非理想层）。
+
+    ``analyze_topology()`` 填充 ``nodes``、``edges``、``subcycles``，以及 ``subcycle_mass_flows``（默认每项为 ``config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * max_mass_flow``）
+    并同步到各 ``SubCycle.mass_flow``，最后调用 ``assign_subcycle_mass_flows_to_edges`` 写入 ``edges[*].mass_flow``。
     """
 
-    def __init__(self, inp: ClosedCycleTPInput, *, properties: FluidPropertySolver | None = None) -> None:
+    def __init__(
+        self,
+        inp: ClosedCycleTPInput,
+        *,
+        properties: FluidPropertySolver | None = None,
+        auto_analyze: bool = True,
+    ) -> None:
         self.input = inp
         self.fluid = inp.fluid
         self.properties = properties if properties is not None else CoolPropFluidPropertySolver(inp.fluid)
@@ -347,6 +402,9 @@ class ClosedCycleLayer:
         self.edges: dict[str, Edge] = {}
         self.subcycles: list[SubCycle] = []
         self.subcycle_mass_flows: list[float] = []
+        self.non_ideal: NonIdealClosedCycleLayer | None = None
+        if auto_analyze:
+            self.analyze_topology()
 
     def quantize_subcycle_mass_flows(self) -> None:
         """
@@ -354,13 +412,7 @@ class ClosedCycleLayer:
         ``step = subcycle_mass_flow_step_fraction * max_mass_flow``（``subcycle_mass_flow_step_fraction`` 未在输入中指定时由 ``ClosedCycleTPInput`` 使用 ``config.SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT``）。
         列表为空则不做任何事；``max_mass_flow`` 缺失或非正时抛出 ``ValueError``。
         """
-        if not self.subcycle_mass_flows:
-            return
         mf = self.input.max_mass_flow
-        if mf is None or mf <= 0:
-            raise ValueError(
-                "quantize_subcycle_mass_flows 需要 input.max_mass_flow 为正数以计算量化步长"
-            )
         frac = self.input.subcycle_mass_flow_step_fraction
         if frac <= 0:
             raise ValueError("input.subcycle_mass_flow_step_fraction 须为正数")
@@ -369,23 +421,52 @@ class ClosedCycleLayer:
 
     def sync_subcycle_mass_flows_to_subcycles(self) -> None:
         """将 ``subcycle_mass_flows[i]`` 写入 ``subcycles[i].mass_flow``；长度须一致。"""
-        if len(self.subcycle_mass_flows) != len(self.subcycles):
-            raise ValueError(
-                f"subcycle_mass_flows 长度 {len(self.subcycle_mass_flows)} 与 "
-                f"subcycles 长度 {len(self.subcycles)} 不一致"
-            )
         for i, sc in enumerate(self.subcycles):
             sc.mass_flow = self.subcycle_mass_flows[i]
 
+    def assign_edge_mass_flows_from_subcycles(self) -> None:
+        """根据当前 ``subcycles[*].mass_flow`` 汇聚到 ``edges[*].mass_flow``（见 ``assign_subcycle_mass_flows_to_edges``）。"""
+        assign_subcycle_mass_flows_to_edges(self.edges, self.subcycles)
+
+    def commit_subcycle_mass_flows_to_topology(self) -> None:
+        """
+        对 ``subcycle_mass_flows`` 就地量化到步长整数倍，再 ``sync`` 到各 ``SubCycle``，并 ``assign`` 到各边。
+
+        供外部在写入任意浮点初值后、后续分析前保证离散化与拓扑一致。``subcycle_mass_flows`` 与 ``subcycles`` 长度须一致。
+        无子循环时仅将各边 ``mass_flow`` 置为 ``None``（与 ``assign_subcycle_mass_flows_to_edges`` 行为一致），不调用量化。
+        调用开始时清空 ``non_ideal``，与 ``analyze_topology`` 一致，保证仅在理想层流量稳定后再 ``ensure_non_ideal``。
+        """
+        self.non_ideal = None
+        n_sc = len(self.subcycles)
+        n_q = len(self.subcycle_mass_flows)
+        if n_sc != n_q:
+            raise ValueError(f"subcycle_mass_flows 长度 {n_q} 与 subcycles 长度 {n_sc} 不一致")
+        if n_sc == 0:
+            assign_subcycle_mass_flows_to_edges(self.edges, self.subcycles)
+            return
+        self.quantize_subcycle_mass_flows()
+        self.sync_subcycle_mass_flows_to_subcycles()
+        self.assign_edge_mass_flows_from_subcycles()
+
+    def ensure_non_ideal(self) -> NonIdealClosedCycleLayer:
+        """若尚无 ``non_ideal`` 则基于当前层构造并挂载；不修改理想层基准字段。须在 ``analyze_topology`` / ``commit`` 之后、理想层稳定时调用。"""
+        from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer
+
+        if self.non_ideal is None:
+            self.non_ideal = NonIdealClosedCycleLayer.from_closed_cycle_layer(self)
+        return self.non_ideal
+
     def analyze_topology(self) -> None:
-        """构建拓扑与子循环；初始化 ``subcycle_mass_flows``（系数见根目录 ``config``）并同步。"""
+        """构建拓扑与子循环；初始化 ``subcycle_mass_flows``（系数见根目录 ``config``）并同步，再赋边流量。"""
+        self.non_ideal = None
         self.nodes, self.edges = build_node_edge_topology(self.properties, self.input)
         self.subcycles = build_subcycles(self.nodes, self.edges)
         n = len(self.subcycles)
         if n == 0:
             self.subcycle_mass_flows = []
             return
-        mf = self.input.max_mass_flow if self.input.max_mass_flow is not None else 0.0
-        q0 = cyges_config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * mf
+        mf = self.input.max_mass_flow
+        q0 = cyges_config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * (0.0 if mf is None else float(mf))
         self.subcycle_mass_flows = [q0] * n
         self.sync_subcycle_mass_flows_to_subcycles()
+        assign_subcycle_mass_flows_to_edges(self.edges, self.subcycles)

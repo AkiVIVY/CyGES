@@ -102,8 +102,8 @@ CoolProp 内部为 SI；[`CoolPropFluidPropertySolver`](core/fluid_property_solv
 ### 推荐调用顺序
 
 1. 构造 [`ClosedCycleTPInput`](core/closed_cycle_layer.py)：`fluid`、温压上下限、`t_quantiles` / `p_quantiles`（\[0,1\] 分位，调用方保证与端点互不重复）、可选 `max_mass_flow`、可选 `subcycle_mass_flow_step_fraction`（未传则用 [`config.SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT`](config.py)）。
-2. 构造 [`ClosedCycleLayer(inp, properties=...)`](core/closed_cycle_layer.py)；默认 `properties` 为 `CoolPropFluidPropertySolver(inp.fluid)`。
-3. 调用 **`analyze_topology()`**：`build_node_edge_topology` → `build_subcycles` → 初始化 **`subcycle_mass_flows`** 并 **`sync_subcycle_mass_flows_to_subcycles()`**。
+2. 构造 [`ClosedCycleLayer(inp, properties=..., auto_analyze=True)`](core/closed_cycle_layer.py)；默认 `properties` 为 `CoolPropFluidPropertySolver(inp.fluid)`；**默认 `auto_analyze=True`** 时构造末尾自动调用一次 **`analyze_topology()`**（`build_node_edge_topology` → `build_subcycles` → 初始化 **`subcycle_mass_flows`** 并 **`sync_subcycle_mass_flows_to_subcycles()`** → **`assign_subcycle_mass_flows_to_edges`**）。若 `auto_analyze=False`，须随后自行调用 **`analyze_topology()`**。
+3. 需要**重建**拓扑与子循环初值时，再次调用 **`analyze_topology()`**（会覆盖 `nodes` / `edges` / `subcycles` / `subcycle_mass_flows` 等）。
 
 ### PS 平面与有向边
 
@@ -112,15 +112,15 @@ CoolProp 内部为 SI；[`CoolPropFluidPropertySolver`](core/fluid_property_solv
 ### `ClosedCycleLayer` 结果字段
 
 - **`nodes: dict[int, Node]`**：键为全局 `index`；`parent is None` 为一级 TP 点，`parent` 为一级 `index` 为二级等熵点。
-- **`edges: dict[str, Edge]`**：键 `M1,M2,…`（机械）、`H1,H2,…`（换热）；`Edge.mass_flow` 拓扑快照阶段为 `None`。
+- **`edges: dict[str, Edge]`**：键 `M1,M2,…`（机械）、`H1,H2,…`（换热）；完成 `analyze_topology`（含构造时默认自动分析）后，`Edge.mass_flow` 由子循环汇聚写入；未分析前为 `None`。
 - **`subcycles: list[SubCycle]`**：最小 4 节点 4 边环；`nodes` 顺序为左下→左上→右上→右下；`edges` 为左、上、右、下；`mass_flow` 由层同步。
-- **`subcycle_mass_flows: list[float]`**：与 `subcycles[i]` 同索引；优化场景下优先改此列表，再 **`quantize_subcycle_mass_flows()`**、**`sync_subcycle_mass_flows_to_subcycles()`**。无子循环时为空列表。再次 **`analyze_topology()`** 会重置拓扑与本列表。
+- **`subcycle_mass_flows: list[float]`**：与 `subcycles[i]` 同索引；优化场景下优先改此列表，再 **`commit_subcycle_mass_flows_to_topology()`**（内部：量化 → `sync` → 赋边），或分步 **`quantize_subcycle_mass_flows()`**、**`sync_subcycle_mass_flows_to_subcycles()`**、**`assign_edge_mass_flows_from_subcycles()`**。无子循环时为空列表。再次 **`analyze_topology()`** 会重置拓扑与本列表。**`analyze_topology()`** 与 **`commit_subcycle_mass_flows_to_topology()`** 之后均会清空 **`non_ideal`**，须在理想层稳定后再 **`ensure_non_ideal()`**。
 
 ### 子循环流量（B 模式）
 
 - **初值**：存在子循环时，`subcycle_mass_flows` 每项为 **`SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX × max_mass_flow`**（`max_mass_flow` 为 `None` 时按 `0`）。
-- **量化**：`quantize_subcycle_mass_flows` 使用 `step = subcycle_mass_flow_step_fraction × max_mass_flow`，对列表做 `round(x/step)×step`；**若 `max_mass_flow` 缺失或非正会抛出 `ValueError`**（与初值「按 0 乘」不同，量化需要有效步长）。
-- **输入校验**：**不在本层**对 `max_mass_flow` 是否必填做统一强校验；由调用方在业务侧保证。`sync` 仍会校验列表与子循环**长度一致**。
+- **量化与提交**：`quantize_subcycle_mass_flows` 就地舍入，使用 `step = subcycle_mass_flow_step_fraction × max_mass_flow`；**若 `max_mass_flow` 缺失或非正会抛出 `ValueError`**（与初值「按 0 乘」不同，量化需要有效步长）。**`commit_subcycle_mass_flows_to_topology()`** 在后续分析前一次性完成「量化 → 同步子循环 → 赋边」，保证列表与子循环、边一致。
+- **输入校验**：**不在本层**对 `max_mass_flow` 是否必填做统一强校验；由调用方在业务侧保证。**`commit_subcycle_mass_flows_to_topology()`** 要求 ``len(subcycle_mass_flows)==len(subcycles)``，否则抛出 ``ValueError``。
 
 ### 仅拓扑、不经 `ClosedCycleLayer`
 
@@ -134,6 +134,11 @@ CoolProp 内部为 SI；[`CoolPropFluidPropertySolver`](core/fluid_property_solv
 |------|------|
 | `test_subcycle_mass_flow_defaults_zero_when_max_mass_flow_none` | `max_mass_flow` 为 `None` 时初值全 0 |
 | `test_subcycle_mass_flow_step_fraction_defaults_from_config` | 未传 `subcycle_mass_flow_step_fraction` 时等于 `config` 默认 |
+| `test_auto_analyze_false_then_manual_analyze` | `auto_analyze=False` 后手动 `analyze_topology` |
+| `test_non_ideal_cleared_on_analyze` | `analyze_topology` 后清空 `non_ideal` |
+| `test_baseline_snapshot_edge_mass_flow_detached` | 基准边快照与父层 `Edge` 解耦 |
+| `test_non_ideal_cleared_after_commit` | `commit` 后清空 `non_ideal` |
+| `test_commit_subcycle_mass_flows_len_mismatch_raises` | `commit_subcycle_mass_flows_to_topology` 长度不一致抛错 |
 | `test_helium_topology_overview_plot` | He 宽网格、双子图 PNG |
 
 ---
