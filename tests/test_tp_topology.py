@@ -2,9 +2,44 @@
 
 from pathlib import Path
 
+import config
 import pytest
 
 from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput
+
+
+def test_subcycle_mass_flow_defaults_zero_when_max_mass_flow_none():
+    """未给 max_mass_flow 时子循环初值系数与 0 相乘，列表与 SubCycle 均为 0。"""
+    inp = ClosedCycleTPInput(
+        fluid="He",
+        t_min=100.0,
+        t_max=900.0,
+        p_min=1000.0,
+        p_max=9000.0,
+        t_quantiles=(0.3, 0.7),
+        p_quantiles=(0.3, 0.7),
+        max_mass_flow=None,
+    )
+    layer = ClosedCycleLayer(inp)
+    layer.analyze_topology()
+    assert len(layer.subcycles) >= 1
+    assert all(q == 0.0 for q in layer.subcycle_mass_flows)
+    assert all(sc.mass_flow == 0.0 for sc in layer.subcycles)
+
+
+def test_subcycle_mass_flow_step_fraction_defaults_from_config():
+    """未传入 subcycle_mass_flow_step_fraction 时与 config 默认一致。"""
+    inp = ClosedCycleTPInput(
+        fluid="He",
+        t_min=100.0,
+        t_max=900.0,
+        p_min=1000.0,
+        p_max=9000.0,
+        t_quantiles=(0.3, 0.7),
+        p_quantiles=(0.3, 0.7),
+        max_mass_flow=10.0,
+    )
+    assert inp.subcycle_mass_flow_step_fraction == config.SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT
 
 
 def test_helium_topology_overview_plot():
@@ -25,6 +60,7 @@ def test_helium_topology_overview_plot():
         p_max=9000.0,
         t_quantiles=(0.3,  0.7),
         p_quantiles=(0.3,  0.7),
+        max_mass_flow=10.0,
     )
     layer = ClosedCycleLayer(inp)
     layer.analyze_topology()
@@ -32,6 +68,17 @@ def test_helium_topology_overview_plot():
     secondary = [n for n in layer.nodes.values() if n.parent is not None]
     assert len(primary) >= 1
     assert len(layer.subcycles) >= 1
+    n_sc = len(layer.subcycles)
+    assert len(layer.subcycle_mass_flows) == n_sc
+    default_q = config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * inp.max_mass_flow
+    assert all(q == default_q for q in layer.subcycle_mass_flows)
+    assert all(sc.mass_flow == default_q for sc in layer.subcycles)
+    # 量化步长 = 1% * max_mass_flow = 0.1 kg/s
+    layer.subcycle_mass_flows[0] = 1.27
+    layer.quantize_subcycle_mass_flows()
+    assert layer.subcycle_mass_flows[0] == pytest.approx(1.3)
+    layer.sync_subcycle_mass_flows_to_subcycles()
+    assert layer.subcycles[0].mass_flow == pytest.approx(1.3)
 
     fig, (ax_ts, ax_ps) = plt.subplots(1, 2, figsize=(14, 6.5))
     z_edge = 2
