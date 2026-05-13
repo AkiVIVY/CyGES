@@ -162,8 +162,8 @@ def test_helium_topology_overview_plot():
         t_max=900.0,
         p_min=1000.0,
         p_max=9000.0,
-        t_quantiles=(0.3,  0.7),
-        p_quantiles=(0.3,  0.7),
+        t_quantiles=(0.3, 0.7),
+        p_quantiles=(0.3, 0.7),
         max_mass_flow=10.0,
     )
     layer = ClosedCycleLayer(inp)
