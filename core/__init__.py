@@ -28,6 +28,10 @@ from core.fluid_property_solver import (
 )
 from core.non_ideal_closed_cycle_layer import (
     NonIdealClosedCycleLayer,
+    SimplifiedDirectedGroup,
+    build_directed_groups,
+    compute_group_downstream_depth,
+    partition_simplified_edges_by_kind,
 )
 
 __all__ = [
@@ -46,6 +50,10 @@ __all__ = [
     "ThermoStateTPHS",
     "MERGED_ISOLATED_NODE_EDGE_KEY",
     "NonIdealClosedCycleLayer",
+    "SimplifiedDirectedGroup",
+    "build_directed_groups",
+    "compute_group_downstream_depth",
+    "partition_simplified_edges_by_kind",
     "SimplifiedEdge",
     "SimplifiedTopology",
     "build_simplified_topology",

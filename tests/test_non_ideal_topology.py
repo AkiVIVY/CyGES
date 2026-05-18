@@ -1,5 +1,6 @@
 """非理想精简拓扑：He 工况绘图用例（理想层生成后对若干子循环赋随机流量，再 commit 并 ensure_non_ideal 观察简化效果）。"""
 
+from collections import defaultdict
 from pathlib import Path
 import random
 
@@ -19,6 +20,7 @@ def test_helium_non_ideal_simplified_topology_plot():
 
     输出双子图（T–S 与 P–S）：淡色 baseline 边；保留节点 / 链上合并点 / 孤立占位合并点分色；
     精简边粗线，非零 ``mass_flow`` 时箭头沿 tail→head；中点仅标数值流量（无单位前缀），多段合并时另起一行标 ``(×n)``。
+    绘图时每个机械/换热有向组仅高亮深度最大的一个节点（并列时取 ``index`` 最小），金色星形并标注深度。
     """
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg")
@@ -65,6 +67,25 @@ def test_helium_non_ideal_simplified_topology_plot():
     z_base_pt = 2
     z_simp_edge = 3
     z_simp_pt = 4
+    z_upstream = 6
+
+    def _pick_max_depth_node(group) -> int | None:
+        depths = group.depth_dict()
+        if not depths:
+            return None
+        d_max = max(depths.values())
+        return min(v for v, d in depths.items() if d == d_max)
+
+    # 每组只取深度最大的一个节点（并列取 index 最小）
+    upstream_special_info: dict[int, list[tuple[str, int]]] = defaultdict(list)
+    for g in ni.mechanical_groups:
+        idx = _pick_max_depth_node(g)
+        if idx is not None:
+            upstream_special_info[idx].append(("M", g.depth_dict()[idx]))
+    for g in ni.heat_groups:
+        idx = _pick_max_depth_node(g)
+        if idx is not None:
+            upstream_special_info[idx].append(("H", g.depth_dict()[idx]))
 
     def draw_baseline_edges(ax, xkey: str, ykey: str) -> None:
         for _, e in layer.edges.items():
@@ -197,6 +218,46 @@ def test_helium_non_ideal_simplified_topology_plot():
                 zorder=z_simp_edge + 1,
             )
 
+    def draw_upstream_special_nodes(ax, xkey: str, ykey: str) -> None:
+        if not upstream_special_info:
+            return
+        indices = sorted(upstream_special_info)
+        xs = [getattr(layer.nodes[i], xkey) for i in indices]
+        ys = [getattr(layer.nodes[i], ykey) for i in indices]
+        ax.scatter(
+            xs,
+            ys,
+            s=280,
+            marker="*",
+            c="gold",
+            edgecolors="crimson",
+            linewidths=1.4,
+            zorder=z_upstream,
+            label=f"Max-depth per group (n={len(indices)})",
+        )
+        for i in indices:
+            n = layer.nodes[i]
+            x, y = getattr(n, xkey), getattr(n, ykey)
+            parts = [f"{k} depth={d}" for k, d in upstream_special_info[i]]
+            ax.annotate(
+                f"{i}\n" + "\n".join(parts),
+                (x, y),
+                xytext=(6, 6),
+                textcoords="offset points",
+                fontsize=7,
+                color="crimson",
+                fontweight="bold",
+                ha="left",
+                va="bottom",
+                bbox=dict(
+                    boxstyle="round,pad=0.2",
+                    facecolor="lightyellow",
+                    edgecolor="crimson",
+                    alpha=0.92,
+                ),
+                zorder=z_upstream + 1,
+            )
+
     for ax, xk, yk, xl, yl, title in (
         (ax_ts, "S", "T", "S [kJ/(kg·K)]", "T [K]", "T–S"),
         (ax_ps, "S", "P", "S [kJ/(kg·K)]", "P [kPa]", "P–S"),
@@ -204,6 +265,7 @@ def test_helium_non_ideal_simplified_topology_plot():
         draw_baseline_edges(ax, xk, yk)
         draw_baseline_nodes(ax, xk, yk)
         draw_simplified_edges(ax, xk, yk)
+        draw_upstream_special_nodes(ax, xk, yk)
         ax.set_xlabel(xl)
         ax.set_ylabel(yl)
         ax.set_title(title)
@@ -229,7 +291,8 @@ def test_helium_non_ideal_simplified_topology_plot():
     fig.suptitle(
         f"He: random subcycle mass flow on {n_pick}/{n_sc} cells → commit → simplified; "
         f"{len(simp.simplified_edges)} simp. edges, {len(merged_chain)} chain-merged, "
-        f"{len(merged_isolated)} isolated, {len(layer.nodes)} baseline nodes",
+        f"{len(merged_isolated)} isolated, {len(upstream_special_info)} upstream-special, "
+        f"{len(layer.nodes)} baseline nodes",
         fontsize=10.5,
         y=1.06,
     )

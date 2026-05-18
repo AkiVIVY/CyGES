@@ -5,7 +5,8 @@ from pathlib import Path
 import config
 import pytest
 
-from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput
+from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput, SimplifiedEdge
+from core.non_ideal_closed_cycle_layer import compute_group_downstream_depth
 
 
 def test_subcycle_mass_flow_defaults_zero_when_max_mass_flow_none():
@@ -122,6 +123,63 @@ def test_ensure_non_ideal_snapshot_is_current_simplified():
     layer = ClosedCycleLayer(inp)
     ni = layer.ensure_non_ideal()
     assert ni.simplified is layer.simplified
+
+
+def test_non_ideal_simplified_edge_groups_partition_cover_all_keys():
+    """非理想层挂靠时按机械/换热分别划分有向组，边键与同 kind 全集一致、组间不交，且含 node_depth。"""
+    inp = ClosedCycleTPInput(
+        fluid="He",
+        t_min=100.0,
+        t_max=900.0,
+        p_min=1000.0,
+        p_max=9000.0,
+        t_quantiles=(0.3, 0.7),
+        p_quantiles=(0.3, 0.7),
+        max_mass_flow=10.0,
+    )
+    layer = ClosedCycleLayer(inp)
+    ni = layer.ensure_non_ideal()
+    simp = ni.simplified
+    mech_keys = {ek for ek, se in simp.simplified_edges if se.kind == "mechanical"}
+    heat_keys = {ek for ek, se in simp.simplified_edges if se.kind == "heat"}
+    mech_union = set().union(*(g.edge_keys for g in ni.mechanical_groups))
+    heat_union = set().union(*(g.edge_keys for g in ni.heat_groups))
+    assert mech_union == mech_keys
+    assert heat_union == heat_keys
+    mg = [g.edge_keys for g in ni.mechanical_groups]
+    for i in range(len(mg)):
+        for j in range(i + 1, len(mg)):
+            assert mg[i].isdisjoint(mg[j])
+    hg = [g.edge_keys for g in ni.heat_groups]
+    for i in range(len(hg)):
+        for j in range(i + 1, len(hg)):
+            assert hg[i].isdisjoint(hg[j])
+    for g in ni.mechanical_groups:
+        assert g.depth_dict().keys() == g.nodes()
+        assert g.upstream_special_nodes <= g.nodes()
+        if g.node_depth:
+            assert all(d <= g.max_depth for _, d in g.node_depth)
+            assert all(g.depth_dict()[v] == g.max_depth for v in g.upstream_special_nodes)
+
+
+def test_group_downstream_depth_special_node_is_max_h():
+    """A→B→C, A→D, E→D：A 深度为 2 为特殊节点；E、B 深度为 1。"""
+    edges = {
+        "e1": SimplifiedEdge("mechanical", 0, 1, ("e1",), (), 1.0),  # A=0,B=1
+        "e2": SimplifiedEdge("mechanical", 1, 2, ("e2",), (), 1.0),  # B→C, C=2
+        "e3": SimplifiedEdge("mechanical", 0, 3, ("e3",), (), 1.0),  # A→D, D=3
+        "e4": SimplifiedEdge("mechanical", 4, 3, ("e4",), (), 1.0),  # E=4→D
+    }
+    keys = frozenset(edges)
+    depths = compute_group_downstream_depth(edges, keys)
+    assert depths[0] == 2
+    assert depths[1] == 1
+    assert depths[4] == 1
+    assert depths[2] == 0
+    assert depths[3] == 0
+    d_max = max(depths.values())
+    special = {v for v, d in depths.items() if d == d_max}
+    assert special == {0}
 
 
 def test_non_ideal_cleared_after_commit():
