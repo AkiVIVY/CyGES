@@ -250,16 +250,19 @@ def filter_topology_for_non_ideal(
     返回的 ``nodes`` 为 ``Node`` 的浅拷贝字典，邻边槽中指向被剔除边的键置为 ``None``；
     ``edges`` 为仅含保留边的**新**字典，``Edge`` 对象与输入共享引用（只读使用）。
     """
+    # 子循环边键并集：不在任何 4 元环上的边不参与非理想精简
     in_sub = _subcycle_edge_key_set(subcycles)
     kept_keys: set[str] = set()
     for ek in in_sub:
         if ek not in edges:
             continue
+        # 仅保留 mass_flow 有定义且非零的边（零流量视为该过程未激活）
         if _edge_has_nonzero_mass_flow(edges[ek]):
             kept_keys.add(ek)
 
     filtered_edges = {k: edges[k] for k in sorted(kept_keys)}
 
+    # 节点浅拷贝：邻边槽若指向已剔除边则置 None，避免后续链遍历误入死边
     new_nodes: dict[int, Node] = {}
     for i, n in nodes.items():
         eu = n.edge_up if n.edge_up in filtered_edges else None
@@ -279,7 +282,12 @@ def _aggregate_chain_mass_flow(
     edges: dict[str, Edge],
     chain_label: str,
 ) -> float | None:
-    """聚合链上一组原始边的 ``mass_flow``；全 ``None`` 返回 ``None``；存在非 ``None`` 但相互不一致抛 ``ValueError``。"""
+    """
+    聚合链上一组原始边的 ``mass_flow``，供精简边方向规范化使用。
+
+    链上全 ``None`` 则返回 ``None``；出现多个非 ``None`` 且数值不一致时抛 ``ValueError``
+    （同一精简段内原始边流量应已由子循环汇聚一致）。
+    """
     seen: float | None = None
     for ek in chain_edges:
         m = edges[ek].mass_flow
@@ -305,6 +313,7 @@ def _find_typed_chains(
     返回列表，每项为 ``{"nodes": ordered_list, "edges": ordered_list}``：
     ``nodes`` 按 PS 正向排序（机械：``P`` 升；换热：``S`` 升），``edges`` 为相邻节点对之间的边键，长度 ``= len(nodes) - 1``。
     """
+    # 机械链按 P 升序、换热链按 S 升序，与 PS 平面「向上/向右」约定一致
     if kind == "mechanical":
         sort_key = lambda i: nodes[i].P
         slot_a = "edge_up"
@@ -314,6 +323,7 @@ def _find_typed_chains(
         slot_a = "edge_left"
         slot_b = "edge_right"
 
+    # 仅用该 kind 的邻边槽建无向邻接（每条原始边在两端各出现一次）
     adj: dict[int, list[str]] = defaultdict(list)
     for i, n in nodes.items():
         for slot in (slot_a, slot_b):
@@ -326,6 +336,7 @@ def _find_typed_chains(
     for start in nodes:
         if start in visited or not adj[start]:
             continue
+        # 无向 DFS 收集一个连通分量（PS 网格保证为简单链、无分叉）
         component: set[int] = set()
         stack = [start]
         while stack:
@@ -339,6 +350,7 @@ def _find_typed_chains(
                 if other not in component:
                     stack.append(other)
         visited |= component
+        # 按 PS 正向排序后，相邻节点对之间应恰有一条该 kind 的边
         ordered_nodes = sorted(component, key=sort_key)
         chain_edges_in_order: list[str] = []
         for k in range(len(ordered_nodes) - 1):
@@ -378,6 +390,7 @@ def _simplify_chain(
     if len(chain_nodes) < 2:
         return [], [], counter
 
+    # 切分点 = 链端点 + 链内不可合并节点（仍挂两类邻边或孤立，须保留为独立状态点）
     cut_positions: list[int] = [0]
     for k in range(1, len(chain_nodes) - 1):
         if not is_mergeable[chain_nodes[k]]:
@@ -399,6 +412,7 @@ def _simplify_chain(
 
         aggregated_mf = _aggregate_chain_mass_flow(seg_edges_in_ps_order, edges, chain_label)
 
+        # 精简边 tail→head 须沿 PS 正向；负流量则交换端点并取 |ṁ|，同时反转 constituent/merged 顺序
         if aggregated_mf is None or aggregated_mf == 0.0:
             tail = ps_low_idx
             head = ps_high_idx
@@ -464,6 +478,7 @@ def build_simplified_topology(
     """
     nodes_f, edges_f = filter_topology_for_non_ideal(nodes, edges, subcycles)
 
+    # 仅挂一类邻边的中间点可吞并进精简边；两类都有或四邻皆空的点作切分/占位
     is_mech_only: dict[int, bool] = {}
     is_heat_only: dict[int, bool] = {}
     for i, n in nodes_f.items():
@@ -504,6 +519,7 @@ def build_simplified_topology(
         simplified_edges.extend(segs)
         merged_into.extend(mlinks)
 
+    # 过滤后四邻全空、且未上链的节点：记入 merged_into 占位，不出现在 kept_nodes
     merged_idx_so_far = {mn for mn, _ in merged_into}
     for i, n in nodes_f.items():
         if i in merged_idx_so_far:
@@ -542,10 +558,12 @@ def _attach_edges_to_nodes_ps(nodes: dict[int, Node], edges: dict[str, Edge]) ->
         slot[ni][side] = ek
 
     for ek, e in edges.items():
+        # 机械：tail 在 head 下方（P 较低）→ tail.edge_up / head.edge_down
         if e.kind == "mechanical":
             put(e.tail, "up", ek)
             put(e.head, "down", ek)
         else:
+            # 换热：tail 在 head 左侧（S 较低）→ tail.edge_right / head.edge_left
             put(e.tail, "right", ek)
             put(e.head, "left", ek)
 
@@ -562,7 +580,12 @@ def _attach_edges_to_nodes_ps(nodes: dict[int, Node], edges: dict[str, Edge]) ->
 
 
 def build_axis(min_v: float, max_v: float, quantiles: Sequence[float]) -> list[float]:
-    """由单轴上下限与分位生成一维采样序列（两端与各分位内插点排序，不做去重）。"""
+    """
+    由单轴上下限与分位生成一维采样序列。
+
+    取 ``min_v``、``max_v`` 及每个分位在 ``[min_v, max_v]`` 上的线性插值点，排序后返回；
+    调用方须保证分位与端点互不重复（本函数不做去重）。
+    """
     span = max_v - min_v
     pts = [min_v, max_v, *[min_v + q * span for q in quantiles]]
     return sorted(pts)
@@ -587,6 +610,7 @@ def build_node_edge_topology(
         rtol_p: float = 1e-9,
         rtol_s: float = 1e-12,
     ) -> Edge:
+        """在容差下判定 tail→head，使 P、S 沿边非减（PS 平面向上且向右）。"""
         eps_p = rtol_p * max(1.0, abs(na.P), abs(nb.P))
         eps_s = rtol_s * max(1.0, abs(na.S), abs(nb.S))
         a_sw = na.P <= nb.P + eps_p and na.S <= nb.S + eps_s
@@ -602,7 +626,7 @@ def build_node_edge_topology(
 
     skipped_points: list[SkippedPoint] = []
 
-    # —— 一级 TP 网格 ——
+    # —— 一级 TP 网格：每个 (T,P) 闪蒸得 H,S，失败点记入 skipped_points 不建节点 ——
     t_list = build_axis(inp.t_min, inp.t_max, inp.t_quantiles)
     p_list = build_axis(inp.p_min, inp.p_max, inp.p_quantiles)
     grid: list[Node] = []
@@ -619,7 +643,7 @@ def build_node_edge_topology(
             grid.append(Node(index=idx, T=Tk, P=Pk, H=st["H"], S=st["S"], parent=None))
             idx += 1
 
-    # —— 二级等熵 + 机械边 ——
+    # —— 二级等熵 + 机械边：沿每个一级点的 S 在压力轴上延伸，同 parent 的二级点按 P 排序连成 M* ——
     p_axis = build_axis(inp.p_min, inp.p_max, inp.p_quantiles)
     secondary: list[Node] = []
     mechanical: dict[str, Edge] = {}
@@ -653,6 +677,7 @@ def build_node_edge_topology(
             batch.append(node)
             idx += 1
 
+        # 一级 + 其二级子点按 P 排序，相邻对生成一条机械边（压缩或膨胀由 P 大小决定方向）
         chain = sorted([prim, *batch], key=lambda n: (n.P, n.index))
         for k in range(len(chain) - 1):
             a, b = chain[k], chain[k + 1]
@@ -665,7 +690,7 @@ def build_node_edge_topology(
     for n in secondary:
         nodes[n.index] = n
 
-    # —— 换热边 ——
+    # —— 换热边：等压线上按 S 排序，相邻节点连成 H*（沿熵增方向） ——
     by_p: dict[float, list[Node]] = defaultdict(list)
     for n in nodes.values():
         by_p[n.P].append(n)
@@ -679,6 +704,7 @@ def build_node_edge_topology(
             heat[f"H{h}"] = oriented_edge("heat", a, b)
 
     all_edges = {**mechanical, **heat}
+    # 将边键写回各节点 edge_up/down/left/right，供 build_subcycles 沿邻槽走环
     nodes = _attach_edges_to_nodes_ps(nodes, all_edges)
     return nodes, all_edges, skipped_points
 
@@ -694,6 +720,7 @@ def build_subcycles(nodes: dict[int, Node], edges: dict[str, Edge]) -> list[SubC
     out: list[SubCycle] = []
 
     for n0 in nodes.values():
+        # 固定走法：左下 n0 → 上 M → 右上 → 右 M → 右下 → 下 H 回到 n0（与 PS 子循环模板一致）
         ku = n0.edge_up
         if ku is None:
             continue
@@ -728,6 +755,7 @@ def build_subcycles(nodes: dict[int, Node], edges: dict[str, Edge]) -> list[SubC
         if len(set(idxs)) != 4:
             continue
 
+        # 四角集合去重：同一物理单元只输出一个 SubCycle
         cell = frozenset(idxs)
         if cell in seen_cells:
             continue
@@ -846,6 +874,7 @@ class ClosedCycleLayer:
         for sc in self.subcycles:
             q = 0.0 if sc.mass_flow is None else float(sc.mass_flow)
             n0, n1, n2, n3 = sc.nodes
+            # 顺时针四段：(左下→左上)、(左上→右上)、(右上→右下)、(右下→左下)
             segment_edge: tuple[tuple[tuple[int, int], str], ...] = (
                 ((n0, n1), sc.edges[0]),
                 ((n1, n2), sc.edges[1]),
@@ -854,6 +883,7 @@ class ClosedCycleLayer:
             )
             for (u, v), ek in segment_edge:
                 edge = self.edges[ek]
+                # 段方向与 edge tail→head 同向则 +q，反向则 -q（子循环环量叠加）
                 if edge.tail == u and edge.head == v:
                     totals[ek] += q
                 elif edge.tail == v and edge.head == u:
@@ -883,6 +913,7 @@ class ClosedCycleLayer:
             self.assign_edge_mass_flows_from_subcycles()
             self._rebuild_simplified()
             return
+        # 量化 → 写回 SubCycle → 汇聚到 Edge → 按新流量重建 simplified
         self.quantize_subcycle_mass_flows()
         self.sync_subcycle_mass_flows_to_subcycles()
         self.assign_edge_mass_flows_from_subcycles()
@@ -918,6 +949,7 @@ class ClosedCycleLayer:
             self.subcycle_mass_flows = []
             self._rebuild_simplified()
             return
+        # 子循环统一初值（系数×max_mass_flow），再同步并汇聚到边，最后生成 simplified
         mf = self.input.max_mass_flow
         q0 = cyges_config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * (0.0 if mf is None else float(mf))
         self.subcycle_mass_flows = [q0] * n

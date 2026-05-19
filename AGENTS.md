@@ -28,7 +28,7 @@
 cd /path/to/CyGES
 # 必须：项目根在 PYTHONPATH
 $env:PYTHONPATH="."          # PowerShell
-python -m pytest tests/ -q   # 当前约 12 个用例
+python -m pytest tests/ -q   # 当前 3 个绘图用例
 ```
 
 依赖：Python 3.12+、CoolProp、pytest；matplotlib 仅绘图测试需要。
@@ -128,14 +128,9 @@ flowchart TD
 
 **若下游逻辑需要按节点汇总**，建议显式维护例如 `depth_mech` / `depth_heat` 两个字典，或保留组内查询。
 
-### 5.3 绘图与数据模型的差异
+### 5.3 绘图
 
-[`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py) 中：
-
-- **每个有向组**只高亮 **一个** `upstream_special_nodes` 成员（并列时取 **index 最小**）  
-- 数据层 `upstream_special_nodes` 仍为 **全部 reach 最大** 节点  
-
-若产品逻辑要求数据层也「每组仅一个特殊节点」，应改 `build_directed_groups`（例如 `upstream_special_node: int` + tie-break），并同步测试。
+[`tests/test_non_ideal_offsets_plot.py`](tests/test_non_ideal_offsets_plot.py) 在精简拓扑上对比理想 vs 应用 `σ`/`η_is` 偏移后的节点状态；数据层 `upstream_special_nodes` 仍为 **全部 reach 最大** 节点（`frozenset`）。
 
 ---
 
@@ -151,10 +146,8 @@ flowchart TD
 
 | 文件 | 内容 |
 |------|------|
-| [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 子循环流量、analyze/commit、非理想清空、`simplified` 重建、有向组划分、分叉图深度单测、He 全拓扑图 `ts_topology_he.png` |
-| [`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py) | He 随机子循环流量 → commit → ensure_non_ideal → 精简图 `simplified_topology_he.png`（含层号 0 高亮） |
-| [`tests/test_non_ideal_heat_pressure.py`](tests/test_non_ideal_heat_pressure.py) | 换热链层号与 `apply_heat_pressure_offsets` |
-| [`tests/test_non_ideal_mechanical_enthalpy.py`](tests/test_non_ideal_mechanical_enthalpy.py) | 机械等熵焓修正（mock 物性） |
+| [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 理想 He 循环 → `ts_topology_he.png` |
+| [`tests/test_non_ideal_offsets_plot.py`](tests/test_non_ideal_offsets_plot.py) | 非理想偏移（σ、η_is）前后对比 → `non_ideal_offsets_he.png` 等 |
 
 生成 PNG 未纳入 git（可本地 pytest 再生）。
 

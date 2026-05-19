@@ -13,7 +13,7 @@
 | Python | 3.12+（当前验证环境） |
 | [CoolProp](https://www.coolprop.org/) | `import CoolProp.CoolProp`，物性计算必需 |
 | pytest | 单元测试 |
-| matplotlib | 仅 [`tests/test_tp_topology.py`](tests/test_tp_topology.py) 中绘图用例需要 |
+| matplotlib | 仅 `tests/` 下绘图用例需要 |
 
 ```bash
 pip install CoolProp matplotlib pytest
@@ -29,13 +29,22 @@ $env:PYTHONPATH="."       # PowerShell
 python -m pytest tests/ -q
 ```
 
-单独运行氦气拓扑综合图用例：
+单独运行绘图用例：
 
 ```bash
+# 理想循环
 python -m pytest tests/test_tp_topology.py::test_helium_topology_overview_plot -v
+# 非理想（σ、η_is 偏移后）
+python -m pytest tests/test_non_ideal_offsets_plot.py -v
 ```
 
-成功后生成 [`tests/ts_topology_he.png`](tests/ts_topology_he.png)（双子图 **T–S** 与 **P–S**：节点、机械/换热边、子循环多边形及编号）。
+输出 PNG（本地 pytest 生成，未纳入 git）：
+
+| 文件 | 说明 |
+|------|------|
+| [`tests/ts_topology_he.png`](tests/ts_topology_he.png) | 理想层：T–S / P–S，节点、边、子循环 |
+| [`tests/non_ideal_offsets_he.png`](tests/non_ideal_offsets_he.png) | 2×2：理想 vs 非理想（T–S、P–S） |
+| [`tests/non_ideal_offsets_nodes_9_14_35_44.png`](tests/non_ideal_offsets_nodes_9_14_35_44.png) | 指定节点局部放大 |
 
 ---
 
@@ -49,8 +58,8 @@ python -m pytest tests/test_tp_topology.py::test_helium_topology_overview_plot -
 | [`core/closed_cycle_layer.py`](core/closed_cycle_layer.py) | 闭式循环层：`ClosedCycleTPInput`、`Node`、`Edge`、`SubCycle`、`ClosedCycleLayer`、`SimplifiedEdge` / `SimplifiedTopology`；`build_axis`、`build_node_edge_topology`、`build_subcycles`、`filter_topology_for_non_ideal`、`build_simplified_topology`（每次 `analyze` / `commit` 后由 `ClosedCycleLayer._rebuild_simplified()` 自动同步） |
 | [`core/non_ideal_closed_cycle_layer.py`](core/non_ideal_closed_cycle_layer.py) | 非理想层：`NonIdealClosedCycleLayer`（`ideal_nodes`/`nodes`、`apply_heat_pressure_offsets`）、`SimplifiedDirectedGroup`（层号含锚点重算）；`build_directed_groups`、`compute_group_downstream_depth` / `compute_group_downstream_reach` |
 | [`core/fluid_property_solver.py`](core/fluid_property_solver.py) | `FluidPropertySolver` 协议与 `CoolPropFluidPropertySolver`（`state(pair,x,y)` → `T,P,H,S`） |
-| [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 拓扑与子循环流量相关测试及 PNG 输出 |
-| [`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py) | He：随机子循环流量后 commit 再非理想简化，输出双子图 PNG |
+| [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 理想 He 循环绘图 → `ts_topology_he.png` |
+| [`tests/test_non_ideal_offsets_plot.py`](tests/test_non_ideal_offsets_plot.py) | 非理想（换热 σ + 机械 η_is）偏移前后对比绘图 |
 | [`core/__init__.py`](core/__init__.py) | `core` 包说明 |
 
 ### 其他目录（扩展/历史）
@@ -149,24 +158,13 @@ CoolProp 内部为 SI；[`CoolPropFluidPropertySolver`](core/fluid_property_solv
 
 ## 测试一览
 
-| 用例 | 作用 |
-|------|------|
-| `test_subcycle_mass_flow_defaults_zero_when_max_mass_flow_none` | `max_mass_flow` 为 `None` 时初值全 0 |
-| `test_subcycle_mass_flow_step_fraction_defaults_from_config` | 未传 `subcycle_mass_flow_step_fraction` 时等于 `config` 默认 |
-| `test_auto_analyze_false_then_manual_analyze` | `auto_analyze=False` 后手动 `analyze_topology` |
-| `test_non_ideal_cleared_on_analyze` | `analyze_topology` 后清空 `non_ideal` |
-| `test_simplified_topology_built_on_analyze_and_commit` | `analyze` 后 `layer.simplified` 即存在，`commit_*` 后被重建为新对象 |
-| `test_ensure_non_ideal_snapshot_is_current_simplified` | `ensure_non_ideal()` 持有 `layer.simplified` 同一引用（值快照语义） |
-| `test_non_ideal_simplified_edge_groups_partition_cover_all_keys` | 非理想层机械/换热有向组边键划分与全集、不交性、深度与特殊节点 |
-| `test_compute_group_downstream_reach` / `test_group_upstream_layer_branching` | 内部 reach 与公开层号（含 A→B→C, A→D, E→D 分叉） |
-| [`tests/test_non_ideal_heat_pressure.py`](tests/test_non_ideal_heat_pressure.py) | 换热链层号与 `apply_heat_pressure_offsets` |
-| [`tests/test_non_ideal_mechanical_enthalpy.py`](tests/test_non_ideal_mechanical_enthalpy.py) | 机械等熵焓修正与 HP 闭合 |
-| `test_non_ideal_cleared_after_commit` | `commit` 后清空 `non_ideal` |
-| `test_commit_subcycle_mass_flows_len_mismatch_raises` | `commit_subcycle_mass_flows_to_topology` 长度不一致抛错 |
-| `test_helium_topology_overview_plot` | He 宽网格、双子图 PNG |
-| `test_helium_non_ideal_simplified_topology_plot` | He：随机子循环流量 → commit → 精简拓扑双子图 PNG |
+当前 `tests/` 仅保留**绘图**用例（需 CoolProp + matplotlib）：
 
-> 完整列表见 [`tests/test_tp_topology.py`](tests/test_tp_topology.py) 与 [`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py)。
+| 用例 | 输出 |
+|------|------|
+| `test_helium_topology_overview_plot` | `ts_topology_he.png`（理想循环 T–S / P–S） |
+| `test_helium_ideal_and_non_ideal_offsets_topology_plot` | `non_ideal_offsets_he.png`（理想 vs 偏移后 2×2） |
+| `test_helium_focus_nodes_9_14_35_44_offsets_plot` | `non_ideal_offsets_nodes_9_14_35_44.png`（局部节点） |
 
 ---
 

@@ -81,6 +81,7 @@ def partition_simplified_edges_by_kind(
             heat.append((ek, se.tail, se.head))
 
     def _components(items: list[tuple[str, int, int]]) -> tuple[frozenset[str], ...]:
+        """并查集：同一 kind 下 tail/head 无向连通的精简边归为同一组。"""
         if not items:
             return ()
         parent: dict[int, int] = {}
@@ -114,7 +115,12 @@ def partition_simplified_edges_by_kind(
 
 @dataclass(frozen=True)
 class GroupDepthMetrics:
-    """组内有向深度中间量：``reach``（下游延伸）与公开 ``layer``（层号）。"""
+    """
+    组内有向深度中间量。
+
+    - ``reach``：从该点沿 ``tail→head`` 的最长下游路径边数（用于 ``upstream_special_nodes``）。
+    - ``layer``：从任一入度 0 源点到该点的最长上游路径边数（用于换热 ``σ^layer`` 叠乘）。
+    """
 
     reach: dict[int, int]
     layer: dict[int, int]
@@ -124,6 +130,7 @@ def _group_adjacency(
     edges_by_key: dict[str, SimplifiedEdge],
     edge_keys: frozenset[str],
 ) -> tuple[dict[int, list[int]], set[int], list[tuple[int, int]]]:
+    """从一组精简边键构建有向邻接表 ``tail→head``、节点集与有向边列表。"""
     adj: dict[int, list[int]] = defaultdict(list)
     nodes: set[int] = set()
     directed_edges: list[tuple[int, int]] = []
@@ -161,6 +168,7 @@ def compute_group_downstream_reach(
                 f"精简边组 {sorted(edge_keys)!r} 内存在有向环（涉及节点 {v}），无法定义下游深度"
             )
         visiting.add(v)
+        # 记忆化 DFS：沿 tail→head 取最长下游路径；回边检测用于发现组内有向环
         best = 0
         for u in adj.get(v, ()):
             best = max(best, 1 + reach_dfs(u))
@@ -189,6 +197,7 @@ def _compute_group_depth_metrics(
         return GroupDepthMetrics(reach={}, layer={})
 
     adj, _, directed_edges = _group_adjacency(edges_by_key, edge_keys)
+    # 入度 0 的节点 = 组内源点（无上游精简边指向），层号从 0 起算
     in_degree: dict[int, int] = {v: 0 for v in reach}
     for _, w in directed_edges:
         in_degree[w] += 1
@@ -199,6 +208,7 @@ def _compute_group_depth_metrics(
     while q:
         u = q.popleft()
         for w in adj.get(u, ()):
+            # 多源汇入时取最长上游路径：layer[w] = max(经各 u 的 layer[u]+1)
             if layer[u] + 1 > layer[w]:
                 layer[w] = layer[u] + 1
             remaining[w] -= 1
@@ -284,6 +294,7 @@ def build_directed_groups(
     for keys in edge_key_groups:
         metrics = _compute_group_depth_metrics(edges_by_key, keys)
         if metrics.reach:
+            # upstream_special：下游延伸 reach 最大者（机械锚点、绘图高亮用）
             r_max = max(metrics.reach.values())
             special = frozenset(v for v, r in metrics.reach.items() if r == r_max)
             node_depth = tuple(sorted(metrics.layer.items()))
@@ -321,8 +332,10 @@ def _pick_mechanical_anchor(
     group_nodes = group.nodes()
     primaries = sorted(v for v in group_nodes if ideal_nodes[v].parent is None)
     specials = group.upstream_special_nodes
+    # 一级且在 reach 最大集合内 → 熵不动点与网格原点一致
     if primaries and (not specials or primaries[0] in specials):
         return primaries[0]
+    # 分叉组：一级在侧枝末端时，改用下游延伸最长的 special 作锚
     if specials:
         return min(specials)
     if primaries:
@@ -374,6 +387,7 @@ def _mechanical_step_known_to_unknown(
     h_known = n_known.H
     s_known = n_known.S
 
+    # 统一得到边的 P_tail、P_head（与精简边 tail/head 几何一致），用于判压缩/膨胀
     if edge.tail == known and edge.head == unknown:
         p_tail, p_head = n_known.P, n_unknown.P
     elif edge.head == known and edge.tail == unknown:
@@ -387,12 +401,14 @@ def _mechanical_step_known_to_unknown(
     if _pressure_equal(p_tail, p_head):
         h_new = h_known
     else:
+        # 等熵假想：待求端压力下沿用已知端熵（H1）；再按 η_is 偏离到实际焓 H2
         h1 = properties.state("PS", p_unknown, s_known)["H"]
         if p_head > p_tail:
             h_new = (h1 - h_known) / eta_is + h_known
         else:
             h_new = (h1 - h_known) * eta_is + h_known
 
+    # HP 闭合：非理想态 S 一般 ≠ S_known
     st = properties.state("HP", h_new, p_unknown)
     nodes[unknown] = replace(
         n_unknown, T=st["T"], P=st["P"], H=st["H"], S=st["S"]
@@ -414,6 +430,7 @@ def _walk_mechanical_branches(
     锚点处的每个邻居各开启一条支路；在每个新已知节点上若仍有未访问邻居则继续沿链
     （子分叉同理 DFS）。返回处理完毕的节点集合（含锚点）。
     """
+    # 无向邻接：(邻居节点, 连接边键)，便于从锚点向各支路 DFS
     adj: dict[int, list[tuple[int, str]]] = defaultdict(list)
     for ek in sorted(group.edge_keys):
         e = edges_by_key[ek]
@@ -424,6 +441,7 @@ def _walk_mechanical_branches(
     for start_nb, _ in sorted(adj.get(anchor, [])):
         if start_nb in known:
             continue
+        # 每条从锚点出发的支路：栈中 (上一已知点, 待更新点)，只沿远离锚点方向推进
         stack: list[tuple[int, int]] = [(anchor, start_nb)]
         while stack:
             prev, cur = stack.pop()
@@ -531,6 +549,7 @@ class NonIdealClosedCycleLayer:
 
         nodes = self._ensure_nodes()
 
+        # 仅换热组成员按层号叠乘 σ；始终以 ideal P 为底，避免重复偏移
         for group in self.heat_groups:
             layers = group.depth_dict()
             for v in group.nodes():
@@ -538,6 +557,7 @@ class NonIdealClosedCycleLayer:
                 p_new = p_ideal * (eta ** layers[v])
                 nodes[v] = replace(nodes[v], P=p_new)
 
+        # 全表 PS 闭合：P 已变、S 仍理想拷贝，刷新 T,H 供后续机械步使用
         for v in list(nodes.keys()):
             _refresh_node_from_ps(nodes, self.properties, v)
 
