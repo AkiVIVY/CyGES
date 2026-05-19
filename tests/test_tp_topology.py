@@ -5,8 +5,16 @@ from pathlib import Path
 import config
 import pytest
 
-from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput, SimplifiedEdge
-from core.non_ideal_closed_cycle_layer import compute_group_downstream_depth
+from core.closed_cycle_layer import (
+    ClosedCycleLayer,
+    ClosedCycleTPInput,
+    SimplifiedEdge,
+    SimplifiedTopology,
+)
+from core.non_ideal_closed_cycle_layer import (
+    build_directed_groups,
+    compute_group_downstream_reach,
+)
 
 
 def test_subcycle_mass_flow_defaults_zero_when_max_mass_flow_none():
@@ -159,27 +167,48 @@ def test_non_ideal_simplified_edge_groups_partition_cover_all_keys():
         assert g.upstream_special_nodes <= g.nodes()
         if g.node_depth:
             assert all(d <= g.max_depth for _, d in g.node_depth)
-            assert all(g.depth_dict()[v] == g.max_depth for v in g.upstream_special_nodes)
+            reach = compute_group_downstream_reach(simp.edges_dict(), g.edge_keys)
+            reach_max = max(reach.values())
+            for v in g.upstream_special_nodes:
+                assert reach[v] == reach_max
 
 
-def test_group_downstream_depth_special_node_is_max_h():
-    """A→B→C, A→D, E→D：A 深度为 2 为特殊节点；E、B 深度为 1。"""
+def test_compute_group_downstream_reach():
+    """内部 reach：A→B→C, A→D, E→D 时 A reach=2，C/D reach=0。"""
     edges = {
-        "e1": SimplifiedEdge("mechanical", 0, 1, ("e1",), (), 1.0),  # A=0,B=1
-        "e2": SimplifiedEdge("mechanical", 1, 2, ("e2",), (), 1.0),  # B→C, C=2
-        "e3": SimplifiedEdge("mechanical", 0, 3, ("e3",), (), 1.0),  # A→D, D=3
-        "e4": SimplifiedEdge("mechanical", 4, 3, ("e4",), (), 1.0),  # E=4→D
+        "e1": SimplifiedEdge("mechanical", 0, 1, ("e1",), (), 1.0),
+        "e2": SimplifiedEdge("mechanical", 1, 2, ("e2",), (), 1.0),
+        "e3": SimplifiedEdge("mechanical", 0, 3, ("e3",), (), 1.0),
+        "e4": SimplifiedEdge("mechanical", 4, 3, ("e4",), (), 1.0),
     }
-    keys = frozenset(edges)
-    depths = compute_group_downstream_depth(edges, keys)
-    assert depths[0] == 2
-    assert depths[1] == 1
-    assert depths[4] == 1
-    assert depths[2] == 0
-    assert depths[3] == 0
-    d_max = max(depths.values())
-    special = {v for v, d in depths.items() if d == d_max}
-    assert special == {0}
+    reach = compute_group_downstream_reach(edges, frozenset(edges))
+    assert reach[0] == 2
+    assert reach[1] == 1
+    assert reach[4] == 1
+    assert reach[2] == 0
+    assert reach[3] == 0
+
+
+def test_group_upstream_layer_branching():
+    """层号：A=0,B=1,C=2,D=1,E=0；upstream_special_nodes 为 reach 最大的 {A}。"""
+    edges = {
+        "e1": SimplifiedEdge("mechanical", 0, 1, ("e1",), (), 1.0),
+        "e2": SimplifiedEdge("mechanical", 1, 2, ("e2",), (), 1.0),
+        "e3": SimplifiedEdge("mechanical", 0, 3, ("e3",), (), 1.0),
+        "e4": SimplifiedEdge("mechanical", 4, 3, ("e4",), (), 1.0),
+    }
+    topo = SimplifiedTopology(
+        kept_nodes=frozenset({0, 1, 2, 3, 4}),
+        simplified_edges=tuple(sorted(edges.items())),
+        merged_into=(),
+    )
+    groups = build_directed_groups(topo, "mechanical")
+    assert len(groups) == 1
+    g = groups[0]
+    d = g.depth_dict()
+    assert d == {0: 0, 1: 1, 2: 2, 3: 1, 4: 0}
+    assert g.max_depth == 2
+    assert g.upstream_special_nodes == {0}
 
 
 def test_non_ideal_cleared_after_commit():

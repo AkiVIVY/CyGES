@@ -113,9 +113,13 @@ class Edge:
     """
     拓扑快照中的有向边（非物性计算边）。
 
-    - ``kind``：``"mechanical"`` 为等熵链上压力离散相邻；``"heat"`` 为等压线上熵 ``S`` 离散相邻。
-    - ``tail`` / ``head``：端点节点序号，方向为尾 → 头。
+    - ``kind``：过程类型，与 PS 离散方向对应——
+      ``"mechanical"``：**叶轮机械工作过程**（压缩/膨胀等），在 PS 平面上沿压力轴相邻离散；
+      ``"heat"``：**换热过程**（加热/冷却等），在 PS 平面上沿等压线（熵 ``S`` 方向）相邻离散。
+    - ``tail`` / ``head``：端点节点序号，方向为尾 → 头（工质沿此方向流经该过程）。
     - ``mass_flow``：质量流 [kg/s] 等，初始 ``None``；经 ``ClosedCycleLayer.assign_edge_mass_flows_from_subcycles`` 后为沿 ``tail → head`` 的代数和（未被子循环覆盖的边保持 ``None``）。
+
+    非理想修正所用效率见 ``config``（机械边：等熵效率；换热边：总压恢复系数）及非理想层。
     """
 
     kind: Literal["mechanical", "heat"]
@@ -130,7 +134,7 @@ class SubCycle:
     最小子循环（4 节点、4 边）。非 ``frozen``，便于后续写入流量等。
 
     - ``nodes``：``(左下, 左上, 右上, 右下)`` 顺时针，各元素为 ``Node.index``。
-    - ``edges``：``(左, 上, 右, 下)``，各为 ``edges`` 字典键——左/右须为机械边，上/下须为换热边（由 ``build_subcycles`` 走边保证）。
+    - ``edges``：``(左, 上, 右, 下)`` 各为 ``edges`` 字典键；左/右为**机械边**（叶轮机械过程），上/下为**换热边**（换热过程）（由 ``build_subcycles`` 走边保证）。
     - ``mass_flow``：子循环质量流 [kg/s] 等标量，可为负；由 ``ClosedCycleLayer`` 的 ``subcycle_mass_flows`` 同步写入（见 ``sync_subcycle_mass_flows_to_subcycles``）。
     """
 
@@ -164,14 +168,14 @@ class SimplifiedEdge:
     """
     精简边：过滤后子图中，一段**同类型**原始边链合并成的单条有向边。
 
-    - ``kind``：``"mechanical"``（沿 P 的链）或 ``"heat"``（沿 S 的链）。
+    - ``kind``：``"mechanical"``（叶轮机械过程链，沿 P）或 ``"heat"``（换热过程链，沿 S）。
     - ``tail`` / ``head``：保留端点 ``Node.index``；有向为 ``tail → head``。
       由链上 ``mass_flow`` 符号规范化：正值沿 PS 正向（机械 P 升、换热 S 升），负值则反向并取绝对值。
     - ``constituent_edges``：被合并的原始 ``M*`` / ``H*`` 键，按 ``tail → head`` 顺序。
     - ``merged_nodes``：链内被吞并的中间点 index，顺序与 ``constituent_edges`` 一致；``len = len(edges) - 1``。
     - ``mass_flow``：链上聚合流量，**恒非负**（方向已体现在 tail/head）；链上全 ``None`` 则为 ``None``。
 
-    非理想效率等参数不在此结构存储；见 ``config`` 与非理想层后续字段。
+    非理想参数不在此结构存储：机械链用等熵效率、换热链用总压恢复系数，见 ``config.NON_IDEAL_*`` 与非理想层。
     """
 
     kind: Literal["mechanical", "heat"]
@@ -889,7 +893,8 @@ class ClosedCycleLayer:
         创建或返回 ``non_ideal`` 快照层（不修改 ``nodes`` / ``edges`` / ``simplified`` 等理想层字段）。
 
         要求 ``self.simplified`` 已由 ``analyze_topology`` 或 ``commit_*`` 生成。
-        快照内容见 ``NonIdealClosedCycleLayer``（含机械/换热有向组及组内深度）。
+        快照见 ``NonIdealClosedCycleLayer``（``ideal_nodes``、``properties``、机械/换热有向组及层号）。
+        非理想偏移须对返回值另调 ``apply_heat_pressure_offsets()``、``apply_mechanical_isentropic_offsets()``。
         """
         from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer
 

@@ -1,6 +1,8 @@
 # CyGES
 
-闭式循环能源系统相关原型代码。当前主干在 **固定温压包线与分位轴** 上构建 **TP 离散拓扑**：一级 TP 网格、沿压力轴的 **等熵二级节点**、**机械边**（`M*`）与 **换热边**（`H*`），在 PS 约定下枚举 **最小子循环**（4 节点、4 边），并支持 **子循环质量流向量** 与 **量化步长**。物性由 **CoolProp** 经统一 `state` 接口提供。
+闭式循环能源系统相关原型代码。当前主干在 **固定温压包线与分位轴** 上构建 **TP 离散拓扑**：一级 TP 网格、沿压力轴的 **等熵二级节点**、**机械边**（`M*`，叶轮机械工作过程）与 **换热边**（`H*`，换热过程），在 PS 约定下枚举 **最小子循环**（4 节点、4 边），并支持 **子循环质量流向量** 与 **量化步长**。物性由 **CoolProp** 经统一 `state` 接口提供。
+
+拓扑上的「机械 / 换热」是**过程类型**的抽象，而非几何类别本身：非理想修正时，机械边对应**等熵效率** `η_is`，换热边对应**总压恢复系数** `σ`（见 [`config.py`](config.py) 与非理想层）。
 
 ---
 
@@ -45,7 +47,7 @@ python -m pytest tests/test_tp_topology.py::test_helium_topology_overview_plot -
 |------|------|
 | [`config.py`](config.py) | 全局可调数值：子循环初值系数、量化步长、非理想精简边统一效率默认值（见下表） |
 | [`core/closed_cycle_layer.py`](core/closed_cycle_layer.py) | 闭式循环层：`ClosedCycleTPInput`、`Node`、`Edge`、`SubCycle`、`ClosedCycleLayer`、`SimplifiedEdge` / `SimplifiedTopology`；`build_axis`、`build_node_edge_topology`、`build_subcycles`、`filter_topology_for_non_ideal`、`build_simplified_topology`（每次 `analyze` / `commit` 后由 `ClosedCycleLayer._rebuild_simplified()` 自动同步） |
-| [`core/non_ideal_closed_cycle_layer.py`](core/non_ideal_closed_cycle_layer.py) | 非理想层：`NonIdealClosedCycleLayer`、`SimplifiedDirectedGroup`（边组 + `node_depth`/`upstream_special_nodes`）；`build_directed_groups`、`compute_group_downstream_depth` |
+| [`core/non_ideal_closed_cycle_layer.py`](core/non_ideal_closed_cycle_layer.py) | 非理想层：`NonIdealClosedCycleLayer`（`ideal_nodes`/`nodes`、`apply_heat_pressure_offsets`）、`SimplifiedDirectedGroup`（层号含锚点重算）；`build_directed_groups`、`compute_group_downstream_depth` / `compute_group_downstream_reach` |
 | [`core/fluid_property_solver.py`](core/fluid_property_solver.py) | `FluidPropertySolver` 协议与 `CoolPropFluidPropertySolver`（`state(pair,x,y)` → `T,P,H,S`） |
 | [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 拓扑与子循环流量相关测试及 PNG 输出 |
 | [`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py) | He：随机子循环流量后 commit 再非理想简化，输出双子图 PNG |
@@ -66,8 +68,17 @@ python -m pytest tests/test_tp_topology.py::test_helium_topology_overview_plot -
 |------|--------|------|
 | `SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX` | `0.1` | `analyze_topology` 后子循环初值：`每项 = 该系数 × max_mass_flow`；`max_mass_flow` 为 `None` 时按 `0` 参与乘法 |
 | `SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT` | `0.01` | `ClosedCycleTPInput` **未显式传入** `subcycle_mass_flow_step_fraction` 时采用；量化步长 `step = subcycle_mass_flow_step_fraction × max_mass_flow` |
-| `NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT` | `0.85` | 非理想精简机械边统一等熵效率 η（保留供非理想层后续按边挂效率使用，本次重构未读取） |
-| `NON_IDEAL_HEAT_EFFICIENCY_DEFAULT` | `0.99` | 非理想精简换热边统一压力保留比例（保留供非理想层后续按边挂效率使用，本次重构未读取） |
+| `NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT` | `0.85` | 精简**机械边**（`SM*`，叶轮机械过程）统一**等熵效率** `η_is`；`apply_mechanical_isentropic_offsets` 默认读取：以已知端 `S` 在待求端 `P` 下 `PS` 得等熵焓 `H1`，再按 `η_is` 取真实焓 `H2`，最后 `HP` 闭合 |
+| `NON_IDEAL_HEAT_EFFICIENCY_DEFAULT` | `0.99` | 精简**换热边**（`SH*`，换热过程）统一**总压恢复系数** `σ`；`apply_heat_pressure_offsets` 默认读取，`P ← P_ideal × σ^layer`，再对全部节点用 `PS(P,S)` 闭合 `T,H` |
+
+### 边类型与非理想参数（物理含义）
+
+| 拓扑 `kind` | 代表过程 | PS 离散方向 | 非理想参数 | 含义（概要） |
+|-------------|----------|-------------|------------|----------------|
+| `mechanical` / `M*`、`SM*` | 叶轮机械工作（压缩、膨胀等） | 沿压力轴（`edge_up` / `edge_down`） | `η_is` | **等熵效率**：实际过程相对等熵过程的效率 |
+| `heat` / `H*`、`SH*` | 换热（加热、冷却等） | 沿等压线、熵方向（`edge_left` / `edge_right`） | `σ` | **总压恢复系数**：流经该换热过程后工质总压的保留程度 |
+
+当前已实现：换热组内按层号用 `σ` 修正 `P`，并对**所有节点**用 `PS(P,S)` 闭合 `T,H`；机械组在各 `SimplifiedDirectedGroup` 内**从基准点**（优先一级节点，分叉时退化为 `min(upstream_special_nodes)`）**沿无向支路逐边单向**推进，每步由已知端的 `S` 在待求端 `P` 下 `PS` 得等熵 `H1`，再按等熵效率得真实 `H2` 并 `HP` 闭合。建议先换热、后机械。
 
 ---
 
@@ -111,17 +122,17 @@ CoolProp 内部为 SI；[`CoolPropFluidPropertySolver`](core/fluid_property_solv
 
 ### PS 平面与有向边
 
-**P** 自下而上增大，**S** 自左而右增大。边上方向 **`tail → head`**，且 **`P`、`S` 在容差意义下不减**。机械边对应节点 **`edge_up` / `edge_down`**；换热边对应 **`edge_right` / `edge_left`**（值为 `edges` 字典键）。
+**P** 自下而上增大，**S** 自左而右增大。边上方向 **`tail → head`**，且 **`P`、`S` 在容差意义下不减**。**机械边**（叶轮机械过程）对应节点 **`edge_up` / `edge_down`**；**换热边**（换热过程）对应 **`edge_right` / `edge_left`**（值为 `edges` 字典键）。
 
 ### `ClosedCycleLayer` 结果字段
 
 - **`nodes: dict[int, Node]`**：键为全局 `index`；`parent is None` 为一级 TP 点，`parent` 为一级 `index` 为二级等熵点。
-- **`edges: dict[str, Edge]`**：键 `M1,M2,…`（机械）、`H1,H2,…`（换热）；完成 `analyze_topology`（含构造时默认自动分析）后，`Edge.mass_flow` 由子循环汇聚写入；未分析前为 `None`。
+- **`edges: dict[str, Edge]`**：键 `M1,M2,…`（机械 / 叶轮机械过程）、`H1,H2,…`（换热 / 换热过程）；完成 `analyze_topology`（含构造时默认自动分析）后，`Edge.mass_flow` 由子循环汇聚写入；未分析前为 `None`。
 - **`subcycles: list[SubCycle]`**：最小 4 节点 4 边环；`nodes` 顺序为左下→左上→右上→右下；`edges` 为左、上、右、下；`mass_flow` 由层同步。
 - **`subcycle_mass_flows: list[float]`**：与 `subcycles[i]` 同索引；优化场景下优先改此列表，再 **`commit_subcycle_mass_flows_to_topology()`**（内部：量化 → `sync` → 赋边 → `_rebuild_simplified`），或分步 **`quantize_subcycle_mass_flows()`**、**`sync_subcycle_mass_flows_to_subcycles()`**、**`assign_edge_mass_flows_from_subcycles()`**。无子循环时为空列表。再次 **`analyze_topology()`** 会重置拓扑与本列表。**`analyze_topology()`** 与 **`commit_subcycle_mass_flows_to_topology()`** 之后均会重建 **`simplified`** 并清空 **`non_ideal`** 快照容器，须在理想层稳定后再 **`ensure_non_ideal()`**。
 - **`skipped_points: list[SkippedPoint]`**：**仅诊断用**，记录 `build_node_edge_topology` 中被 CoolProp 异常静默跳过的候选点（一级 `TP` 或二级 `PS` 阶段），含 `stage / T / P / S / reason`；不参与拓扑与流量计算。每次 **`analyze_topology()`** 重置。
 - **`simplified: SimplifiedTopology | None`**：精简 PS 拓扑（保留节点 `kept_nodes`、`SimplifiedEdge` 序列、合并占位映射 `merged_into`）。由 **`_rebuild_simplified()`** 在每次 `analyze_topology()` / `commit_subcycle_mass_flows_to_topology()` 末尾自动构建——先 **`filter_topology_for_non_ideal(nodes, edges, subcycles)`** 剔除不在任何子循环中的边及 `mass_flow` 为 `None` / 0 的边并同步清空节点邻边槽（**不修改**父层），再做同类型链合并；过滤后四邻边槽全空的节点记入 `simplified.merged_into`，值为占位常量 **`MERGED_ISOLATED_NODE_EDGE_KEY`**（无对应 `SimplifiedEdge`），且不出现在 `kept_nodes` 中。`len(subcycles) == 0` 时退化为空骨架并发出 **`RuntimeWarning`**。
-- **`ensure_non_ideal()`** → [`NonIdealClosedCycleLayer`](core/non_ideal_closed_cycle_layer.py)：持有理想层当前 `simplified` 的快照，并构建 `mechanical_groups` / `heat_groups`（[`SimplifiedDirectedGroup`](core/non_ideal_closed_cycle_layer.py)：无向连通边组 + 组内沿 ``tail→head`` 的下游深度 + ``upstream_special_nodes``（深度最大者，可并列）），供非理想约束与节点偏移索引。父层 `analyze` / `commit` 之后会清空 `non_ideal`。
+- **`ensure_non_ideal()`** → [`NonIdealClosedCycleLayer`](core/non_ideal_closed_cycle_layer.py)：持有 `simplified`、`ideal_nodes`、`properties`，并构建机械/换热有向组。另调 **`apply_heat_pressure_offsets()`**（`σ`、修正 `P`，再 `PS(P,S)` 全表闭合 `T,H`）与 **`apply_mechanical_isentropic_offsets()`**（`η_is`、从基准沿支路单向 `PS→HP` 闭合）；均写入 `nodes` 拷贝，不改父层。父层 `analyze` / `commit` 之后会清空 `non_ideal`。
 
 ### 子循环流量（B 模式）
 
@@ -147,7 +158,9 @@ CoolProp 内部为 SI；[`CoolPropFluidPropertySolver`](core/fluid_property_solv
 | `test_simplified_topology_built_on_analyze_and_commit` | `analyze` 后 `layer.simplified` 即存在，`commit_*` 后被重建为新对象 |
 | `test_ensure_non_ideal_snapshot_is_current_simplified` | `ensure_non_ideal()` 持有 `layer.simplified` 同一引用（值快照语义） |
 | `test_non_ideal_simplified_edge_groups_partition_cover_all_keys` | 非理想层机械/换热有向组边键划分与全集、不交性、深度与特殊节点 |
-| `test_group_downstream_depth_special_node_is_max_h` | 分叉有向组下游深度与最上游特殊节点（A→B→C 等） |
+| `test_compute_group_downstream_reach` / `test_group_upstream_layer_branching` | 内部 reach 与公开层号（含 A→B→C, A→D, E→D 分叉） |
+| [`tests/test_non_ideal_heat_pressure.py`](tests/test_non_ideal_heat_pressure.py) | 换热链层号与 `apply_heat_pressure_offsets` |
+| [`tests/test_non_ideal_mechanical_enthalpy.py`](tests/test_non_ideal_mechanical_enthalpy.py) | 机械等熵焓修正与 HP 闭合 |
 | `test_non_ideal_cleared_after_commit` | `commit` 后清空 `non_ideal` |
 | `test_commit_subcycle_mass_flows_len_mismatch_raises` | `commit_subcycle_mass_flows_to_topology` 长度不一致抛错 |
 | `test_helium_topology_overview_plot` | He 宽网格、双子图 PNG |

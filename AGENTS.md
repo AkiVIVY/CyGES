@@ -8,12 +8,17 @@
 
 在**给定工质与温压包线**上，自动构建闭式循环的 **PS 平面离散拓扑**（节点、机械边 `M*`、换热边 `H*`、最小 4 节点子循环），支持**子循环质量流**写回边流量，并生成**活跃子图的精简拓扑**（链合并），为非理想修正（效率、节点状态偏移、约束）提供索引结构。
 
+**边类型物理含义**（代码里 `kind` 即过程类型）：
+
+| `kind` | 过程 | 非理想参数（`config`） | 说明 |
+|--------|------|------------------------|------|
+| `mechanical` / `SM*` | 叶轮机械工作（压缩/膨胀等） | `NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT` → **等熵效率** `η_is` | `apply_mechanical_isentropic_offsets`：从基准沿无向支路 DFS 单向推进；每步 `H1 = PS(P_unknown, S_known)` → `η_is` 得 `H2` → `HP` 闭合（须先换热） |
+| `heat` / `SH*` | 换热（加热/冷却等） | `NON_IDEAL_HEAT_EFFICIENCY_DEFAULT` → **总压恢复系数** `σ` | `apply_heat_pressure_offsets`：`P ← P_ideal × σ^layer`；末尾对**全部节点**用 `PS(P,S)` 重算 `T,H` |
+
 **尚未实现**（勿在文档中写成已完成）：
 
-- 非理想条件下的节点偏移与方程/约束装配  
-- 多目标优化器对接  
+- 非理想方程/约束装配、多目标优化器  
 - 换热网络（HEN）与多热源/多冷源边界的耦合  
-- `config.NON_IDEAL_*_EFFICIENCY_DEFAULT` 的读取（常量已保留，代码未用）
 
 ---
 
@@ -81,19 +86,29 @@ flowchart TD
 
 ---
 
-## 5. 有向组与下游深度（重要）
+## 5. 有向组与层号（重要）
 
 ### 5.1 定义
 
 在每个 **`SimplifiedDirectedGroup`**（同一 `kind` 下、无向连通的一组精简边）内：
 
 - 仅用该组边的 **`tail → head`** 建有向图  
-- **深度** = 从节点 `v` 出发的最长有向路径**边数**（无出边为 0）；存于 `node_depth` 的第二个分量  
-- **`max_depth`**：组内深度的最大值（`SimplifiedDirectedGroup` 属性）  
-- **`upstream_special_nodes`** = 组内所有深度等于 `max_depth` 的节点（`frozenset`，**可并列**）  
-- 有向环 → `compute_group_downstream_depth` 抛 `ValueError`
+- **层号**（`node_depth` 第二分量）= 组内**任一入度 0 源点**到该节点的**有向最长路径长度**（边数）；
+  源点 layer=0；每条 `u → v` 满足 `layer[v] = max(layer[v], layer[u] + 1)`。`max_depth` 为组内最大层号  
+- 实现：拓扑序 Kahn + DP，确保多源 DAG（多个独立源点、汇聚节点）下层号反映「上游经过的过程步数」  
+- **`upstream_special_nodes`** = **`reach` 最大**的节点（`frozenset`，可并列；与 `layer==0` 源点集合一般不同，源点集合可能有多个，而 `upstream_special` 取下游延伸最长者）  
+- 有向环 → `compute_group_downstream_reach` 抛 `ValueError`
 
-示例（机械组）：`A→B→C`，`A→D`，`E→D` → A 深度为 2，B/E 为 1，特殊节点仅 `{A}`。
+示例（机械组）：`A→B→C`，`A→D`，`E→D` → 层号 A=0，B=1，C=2，D=1，E=0；special `{A}`。
+
+换热非理想压力（已实现）：`P_non_ideal(v) = P_ideal(v) × σ ** layer(v)`，`σ` 为总压恢复系数（`config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT`）；`apply_heat_pressure_offsets()` 末尾再对**全部 `nodes`** 用 `PS(P_new, S)` 重算 `T,H`，使节点状态与新 `P` 自洽。不自动在 `ensure_non_ideal` 内调用。
+
+机械非理想焓（已实现）：在每个 `SimplifiedDirectedGroup` 内从基准（一级节点或 `min(upstream_special_nodes)`）沿无向支路 DFS 单向推进，对每条精简机械边由已知端推未知端：
+1. `H1 = state("PS", P_unknown, S_known)["H"]`（待求端压力下的等熵焓）；
+2. 按边方向 `H2 = (H1 - H_known) / η_is + H_known`（压缩）或 `× η_is`（膨胀），等压时 `H2 = H_known`；
+3. `state("HP", H2, P_unknown)` 写回完整 `T,P,H,S`。
+
+锚点本身整点不动；调用前须先 `apply_heat_pressure_offsets()` 以让 `P,H` 反映换热后的状态。
 
 ### 5.2 机械 vs 换热：同一节点两套深度？
 
@@ -117,8 +132,8 @@ flowchart TD
 
 [`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py) 中：
 
-- **每个有向组**只高亮 **一个** 深度最大节点（并列时取 **index 最小**）  
-- 数据层 `upstream_special_nodes` 仍为 **全部并列最大深度**  
+- **每个有向组**只高亮 **一个** `upstream_special_nodes` 成员（并列时取 **index 最小**）  
+- 数据层 `upstream_special_nodes` 仍为 **全部 reach 最大** 节点  
 
 若产品逻辑要求数据层也「每组仅一个特殊节点」，应改 `build_directed_groups`（例如 `upstream_special_node: int` + tie-break），并同步测试。
 
@@ -137,7 +152,9 @@ flowchart TD
 | 文件 | 内容 |
 |------|------|
 | [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 子循环流量、analyze/commit、非理想清空、`simplified` 重建、有向组划分、分叉图深度单测、He 全拓扑图 `ts_topology_he.png` |
-| [`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py) | He 随机子循环流量 → commit → ensure_non_ideal → 精简图 `simplified_topology_he.png`（含 max-depth 高亮） |
+| [`tests/test_non_ideal_topology.py`](tests/test_non_ideal_topology.py) | He 随机子循环流量 → commit → ensure_non_ideal → 精简图 `simplified_topology_he.png`（含层号 0 高亮） |
+| [`tests/test_non_ideal_heat_pressure.py`](tests/test_non_ideal_heat_pressure.py) | 换热链层号与 `apply_heat_pressure_offsets` |
+| [`tests/test_non_ideal_mechanical_enthalpy.py`](tests/test_non_ideal_mechanical_enthalpy.py) | 机械等熵焓修正（mock 物性） |
 
 生成 PNG 未纳入 git（可本地 pytest 再生）。
 
@@ -145,10 +162,11 @@ flowchart TD
 
 ## 8. 建议的下一步实现（优先级供参考）
 
-1. **非理想偏移**：按 `SimplifiedDirectedGroup` 以 `upstream_special_nodes`（或改为单点）为锚，沿 `tail→head` 传播；同深度层可共享偏移参数。  
-2. **效率**：从 `config` 读 `NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT` / `NON_IDEAL_HEAT_EFFICIENCY_DEFAULT`，挂到非理想层（不必塞回 `SimplifiedEdge`）。  
+1. **非理想偏移**：换热 `P` + 全表 `PS` 闭合、机械 `PS→η→HP` 已实现；方程装配与机械 `P` 等待做。  
+2. **效率常量**：`σ` / `η_is` 均已从 config 读取；按边分别赋值仍待做。  
 3. **API 收紧**：若确认每组只需一个特殊节点，将 `upstream_special_nodes: frozenset` 改为 `upstream_special_node: int` 并统一 tie-break。  
-4. **机械/换热深度分离**：在偏移模块中按 kind 使用 `depth_dict()`（见 §5.2）。
+4. **机械/换热深度分离**：在偏移模块中按 kind 使用 `depth_dict()`（见 §5.2）。  
+5. **熵单调性诊断**：当前算法不强约束沿机械边 `ΔS ≥ 0`，仅在大多数物理情况下成立；如需硬约束可加偏移后校验或换用 PS→HP 之外的闭合策略。
 
 ---
 

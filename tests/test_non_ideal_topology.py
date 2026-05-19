@@ -69,21 +69,20 @@ def test_helium_non_ideal_simplified_topology_plot():
     z_simp_pt = 4
     z_upstream = 6
 
-    def _pick_max_depth_node(group) -> int | None:
+    def _pick_upstream_special_node(group) -> int | None:
         depths = group.depth_dict()
         if not depths:
             return None
-        d_max = max(depths.values())
-        return min(v for v, d in depths.items() if d == d_max)
+        return min(v for v, d in depths.items() if d == 0)
 
-    # 每组只取深度最大的一个节点（并列取 index 最小）
+    # 每组只取层号 0（最上游）的一个节点（并列取 index 最小）
     upstream_special_info: dict[int, list[tuple[str, int]]] = defaultdict(list)
     for g in ni.mechanical_groups:
-        idx = _pick_max_depth_node(g)
+        idx = _pick_upstream_special_node(g)
         if idx is not None:
             upstream_special_info[idx].append(("M", g.depth_dict()[idx]))
     for g in ni.heat_groups:
-        idx = _pick_max_depth_node(g)
+        idx = _pick_upstream_special_node(g)
         if idx is not None:
             upstream_special_info[idx].append(("H", g.depth_dict()[idx]))
 
@@ -302,3 +301,5 @@ def test_helium_non_ideal_simplified_topology_plot():
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     assert out.is_file()
+
+test_helium_non_ideal_simplified_topology_plot()
