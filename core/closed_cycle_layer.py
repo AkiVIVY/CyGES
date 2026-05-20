@@ -289,6 +289,18 @@ def _aggregate_chain_mass_flow(
     return seen
 
 
+def _chain_neighbor_slots(kind: Literal["mechanical", "heat"]) -> tuple[str, str]:
+    """该 ``kind`` 在 ``Node`` 上用于无向链遍历的一对邻边槽名。"""
+    if kind == "mechanical":
+        return "edge_up", "edge_down"
+    return "edge_left", "edge_right"
+
+
+def _chain_sort_coordinate(nodes: dict[int, Node], kind: Literal["mechanical", "heat"], index: int) -> float:
+    """链上节点按 PS 正向排序用的标量（机械 ``P``、换热 ``S``）。"""
+    return nodes[index].P if kind == "mechanical" else nodes[index].S
+
+
 def _find_typed_chains(
     nodes: dict[int, Node],
     edges: dict[str, Edge],
@@ -300,15 +312,8 @@ def _find_typed_chains(
     键，长度 ``= len(nodes) - 1``。PS 网格保证连通分量均为无分叉简单链；找不到相邻边时抛
     ``RuntimeError``。
     """
-    # 机械链按 P 升序、换热链按 S 升序，与 PS 平面「向上/向右」约定一致
-    if kind == "mechanical":
-        sort_key = lambda i: nodes[i].P
-        slot_a = "edge_up"
-        slot_b = "edge_down"
-    else:
-        sort_key = lambda i: nodes[i].S
-        slot_a = "edge_left"
-        slot_b = "edge_right"
+    slot_a, slot_b = _chain_neighbor_slots(kind)
+    sort_key = lambda i: _chain_sort_coordinate(nodes, kind, i)
 
     # 仅用该 kind 的邻边槽建无向邻接（每条原始边在两端各出现一次）
     adj: dict[int, list[str]] = defaultdict(list)
@@ -357,6 +362,57 @@ def _find_typed_chains(
     return chains
 
 
+def _orient_chain_segment(
+    ps_low_idx: int,
+    ps_high_idx: int,
+    aggregated_mf: float | None,
+    seg_edges_in_ps_order: list[str],
+    seg_merged_in_ps_order: list[int],
+) -> tuple[int, int, float | None, tuple[str, ...], tuple[int, ...]]:
+    """按聚合 ``mass_flow`` 符号确定精简段 ``tail→head`` 与元组顺序（沿 PS 正向或反向）。"""
+    if aggregated_mf is None or aggregated_mf == 0.0 or aggregated_mf > 0:
+        return (
+            ps_low_idx,
+            ps_high_idx,
+            aggregated_mf,
+            tuple(seg_edges_in_ps_order),
+            tuple(seg_merged_in_ps_order),
+        )
+    return (
+        ps_high_idx,
+        ps_low_idx,
+        -aggregated_mf,
+        tuple(reversed(seg_edges_in_ps_order)),
+        tuple(reversed(seg_merged_in_ps_order)),
+    )
+
+
+def _merge_chains_of_kind(
+    chains: list[dict],
+    *,
+    nodes_f: dict[int, Node],
+    edges_f: dict[str, Edge],
+    kind: Literal["mechanical", "heat"],
+    is_mergeable: dict[int, bool],
+    counter: int,
+) -> tuple[list[tuple[str, SimplifiedEdge]], list[tuple[int, str]], int]:
+    """将同 ``kind`` 的全部简单链合并为精简边并累加 ``merged_into`` 条目。"""
+    simplified_edges: list[tuple[str, SimplifiedEdge]] = []
+    merged_into: list[tuple[int, str]] = []
+    for chain in chains:
+        segs, mlinks, counter = _simplify_chain(
+            chain,
+            nodes_f,
+            edges_f,
+            kind=kind,
+            is_mergeable=is_mergeable,
+            counter=counter,
+        )
+        simplified_edges.extend(segs)
+        merged_into.extend(mlinks)
+    return simplified_edges, merged_into, counter
+
+
 def _simplify_chain(
     chain: dict,
     nodes: dict[int, Node],
@@ -397,26 +453,13 @@ def _simplify_chain(
         seg_edges_in_ps_order = chain_edges[i0:i1]
 
         aggregated_mf = _aggregate_chain_mass_flow(seg_edges_in_ps_order, edges, chain_label)
-
-        # 精简边 tail→head 须沿 PS 正向；负流量则交换端点并取 |ṁ|，同时反转 constituent/merged 顺序
-        if aggregated_mf is None or aggregated_mf == 0.0:
-            tail = ps_low_idx
-            head = ps_high_idx
-            mf_out: float | None = aggregated_mf
-            ordered_edges = tuple(seg_edges_in_ps_order)
-            ordered_merged = tuple(seg_merged_in_ps_order)
-        elif aggregated_mf > 0:
-            tail = ps_low_idx
-            head = ps_high_idx
-            mf_out = aggregated_mf
-            ordered_edges = tuple(seg_edges_in_ps_order)
-            ordered_merged = tuple(seg_merged_in_ps_order)
-        else:
-            tail = ps_high_idx
-            head = ps_low_idx
-            mf_out = -aggregated_mf
-            ordered_edges = tuple(reversed(seg_edges_in_ps_order))
-            ordered_merged = tuple(reversed(seg_merged_in_ps_order))
+        tail, head, mf_out, ordered_edges, ordered_merged = _orient_chain_segment(
+            ps_low_idx,
+            ps_high_idx,
+            aggregated_mf,
+            seg_edges_in_ps_order,
+            seg_merged_in_ps_order,
+        )
 
         counter += 1
         simp_key = f"{prefix}{counter}"
@@ -465,37 +508,30 @@ def build_simplified_topology(
         is_mech_only[i] = has_mech and not has_heat
         is_heat_only[i] = has_heat and not has_mech
 
-    mech_chains = _find_typed_chains(nodes_f, edges_f, "mechanical")
-    heat_chains = _find_typed_chains(nodes_f, edges_f, "heat")
-
     simplified_edges: list[tuple[str, SimplifiedEdge]] = []
     merged_into: list[tuple[int, str]] = []
 
-    mech_counter = 0
-    for chain in mech_chains:
-        segs, mlinks, mech_counter = _simplify_chain(
-            chain,
-            nodes_f,
-            edges_f,
-            kind="mechanical",
-            is_mergeable=is_mech_only,
-            counter=mech_counter,
-        )
-        simplified_edges.extend(segs)
-        merged_into.extend(mlinks)
+    mech_segs, mech_mlinks, _ = _merge_chains_of_kind(
+        _find_typed_chains(nodes_f, edges_f, "mechanical"),
+        nodes_f=nodes_f,
+        edges_f=edges_f,
+        kind="mechanical",
+        is_mergeable=is_mech_only,
+        counter=0,
+    )
+    simplified_edges.extend(mech_segs)
+    merged_into.extend(mech_mlinks)
 
-    heat_counter = 0
-    for chain in heat_chains:
-        segs, mlinks, heat_counter = _simplify_chain(
-            chain,
-            nodes_f,
-            edges_f,
-            kind="heat",
-            is_mergeable=is_heat_only,
-            counter=heat_counter,
-        )
-        simplified_edges.extend(segs)
-        merged_into.extend(mlinks)
+    heat_segs, heat_mlinks, _ = _merge_chains_of_kind(
+        _find_typed_chains(nodes_f, edges_f, "heat"),
+        nodes_f=nodes_f,
+        edges_f=edges_f,
+        kind="heat",
+        is_mergeable=is_heat_only,
+        counter=0,
+    )
+    simplified_edges.extend(heat_segs)
+    merged_into.extend(heat_mlinks)
 
     # 过滤后四邻全空、且未上链的节点：记入 merged_into 占位，不出现在 kept_nodes
     merged_idx_so_far = {mn for mn, _ in merged_into}
@@ -895,8 +931,8 @@ class ClosedCycleLayer:
     def ensure_non_ideal(self) -> NonIdealClosedCycleLayer:
         """创建或返回 ``non_ideal`` 快照层；不修改理想层字段。
 
-        要求 ``self.simplified`` 已生成。非理想偏移由调用方在返回值上另调
-        ``apply_heat_pressure_offsets()`` / ``apply_mechanical_isentropic_offsets()``。
+        要求 ``self.simplified`` 已生成。节点偏置待新实现；临时可 import
+        ``core.non_ideal_node_offsets_legacy`` 中的 ``apply_*`` 函数。
         """
         from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer
 

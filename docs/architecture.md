@@ -20,8 +20,8 @@ flowchart TD
     simplified --> ensure[ensure_non_ideal]
     ensure --> ni[NonIdealClosedCycleLayer snapshot]
     ni --> groups["mechanical_groups<br/>heat_groups"]
-    groups --> heatoff["apply_heat_pressure_offsets<br/>(σ + PS 闭合)"]
-    heatoff --> mechoff["apply_mechanical_isentropic_offsets<br/>(PS→η→HP)"]
+    groups --> heatoff["legacy: apply_heat_pressure_offsets<br/>(σ + PS 闭合)"]
+    heatoff --> mechoff["legacy: apply_mechanical_isentropic_offsets<br/>(PS→η→HP)"]
 ```
 
 **失效语义**：`analyze_topology()` 与 `commit_subcycle_mass_flows_to_topology()` 末尾都会重建 `simplified` 并清空 `non_ideal`。非理想分析须在理想层流量稳定后再 `ensure_non_ideal()`。
@@ -141,43 +141,40 @@ flowchart TD
 - 记忆化 DFS；遇有向环抛 `ValueError`。
 - 用于 `upstream_special_nodes = argmax(reach)`（下游延伸最长者，`frozenset`，可并列）。
 
-### 7.3 `layer`：上游最长路径（拓扑序 DP）
+### 7.3 `layer`：主脊分层（最长路径 + 支流对齐）
 [`_compute_group_depth_metrics`](../core/non_ideal_closed_cycle_layer.py)：
 
-- 源点（入度 0）`layer = 0`；每条 `u → v` 满足 `layer[v] = max(layer[v], layer[u] + 1)`。
-- 实现：Kahn 拓扑序 + DP。
-- 多源 DAG 下的层号反映"从任一源点沿组内边累计经过的过程步数"。
-- 用于换热偏移 `σ^layer`。
+1. 在组内 DAG 上求各点 `dist(v)` = 从任一源点到 `v` 的最长有向路径边数（Kahn + DP）。
+2. 在 `dist(end) = max(dist)` 的终点中，沿「仅属于某条最长路径」的反向边回溯，收集所有可能起点；**长度并列时取起点 `index` 最小**者。
+3. 从该起点沿 `dist` 递增、并列下一跳取 `index` 最小，得到**主脊**路径，脊上 `layer = 0,1,…,L`。
+4. 对其余节点迭代松弛（主脊上的点不再改）：
+   - 前向 `u→v`：`layer[v] = max(layer[v], layer[u]+1)`（仅当 `v` 不在主脊上时可抬高 `v`）；
+   - 后向 `u→v`：`layer[u] = min(layer[u], layer[v]-1)`（仅当 `u` 不在主脊上时可降低 `u`）。
 
-**示例**：`A→B→C`, `A→D`, `E→D`
-- `layer`：A=0, B=1, C=2, D=1, E=0。
-- `reach`：A=2, B=1, C=0, D=0, E=1。
-- `upstream_special_nodes = {A}`（`reach` 最大）。
+用于换热偏移 `σ^layer`：层号表示相对主工艺链的「过程步」刻度，而非「每个入度 0 源点各自为 0」。
+
+**示例**（主脊一般为 `A→B→C`）：
+
+| 拓扑 | `layer` |
+|------|---------|
+| `A→B→C`, `A→D`, `E→D` | A=0, B=1, C=2, D=1, E=0 |
+| `A→B→C`, `A→D`, `E→C` | A=0, B=1, C=2, D=1, E=1 |
+
+`reach` 仍按 §7.2 定义（与 `layer` 独立）。`upstream_special_nodes = argmax(reach)`。
+
+单元测试：[`tests/test_group_layer_spine.py`](../tests/test_group_layer_spine.py)。
 
 ### 7.4 同节点两套深度
 
 同一 `Node.index` 可同时位于一个机械组与一个换热组中。两套深度在不同有向子图上计算，数值可以不同。**偏移/约束须按 `kind + 组` 查询 `group.depth_dict()`，不要用全局单表**。
 
-### 7.5 已知问题：`layer` 与「主脊分层」语义不一致（待修正）
-
-**当前实现**（`_compute_group_depth_metrics`）的 `layer(v)` = 从**任一入度 0 源点**到 `v` 的**有向最长路径**（Kahn + `layer[w]=max(layer[w], layer[u]+1)`）。因此**每个入度 0 的节点都会保持 `layer=0`**，且不会被入边抬高。
-
-**期望语义**（换热 `σ^layer` 的物理含义）：在组内先选定一条**边数最多的有向路径**作为**主脊（参考路径）**，沿主脊赋 `0,1,…,L`；**支流与汇流**上的节点层号应对齐这条主脊刻度，而不是把每个源点都当作独立的 0 层。
-
-| 拓扑（主脊一般为 `A→B→C`） | 当前实现 | 期望 |
-|----------------------------|----------|------|
-| `A→B→C`, `A→D`, `E→D` | A=0, E=0, B=1, D=1, C=2 | 与现实现一致（E 汇入 D=1，E=0） |
-| `A→B→C`, `A→D`, `E→C` | A=0, **E=0**, B=1, D=1, C=2 | A=0, **E=1**, B=1, D=1, C=2 |
-
-在 `E→C` 情形下，当前会把支流源点 `E` 当作第二个源点（`layer=0`），导致 `P_non_ideal(E)=P_ideal(E)`（少乘 σ），与「`E` 作为 `C` 的直接上游应和 `B` 同为 1 层」不一致。
-
-**下一步**：重写组内 `layer` 计算（主脊选取 + 支流/汇流对齐），并补充 `E→C` / `E→D` 对照用例。`reach` / `upstream_special_nodes` 与机械锚点逻辑**暂不**随本项一并修改，除非后续确认需要同一套主脊定义。
-
 ---
 
 ## 8. 换热偏移：`σ` + 全表 `PS` 闭合
 
-[`apply_heat_pressure_offsets`](../core/non_ideal_closed_cycle_layer.py)：
+> **实现状态**：下列规则描述**旧版**行为，代码在 [`non_ideal_node_offsets_legacy.py`](../core/non_ideal_node_offsets_legacy.py)，待重写后迁回主非理想层或新模块。
+
+[`apply_heat_pressure_offsets`](../core/non_ideal_node_offsets_legacy.py)：
 
 1. `σ` 取参数 → `self.heat_efficiency` → `config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT`，须在 `(0, 1]`。
 2. 对每个 `heat_groups` 中的节点：
@@ -196,7 +193,9 @@ P_non_ideal(v) = P_ideal(v) × σ ** layer(v)
 
 ## 9. 机械偏移：`PS→η→HP`
 
-[`apply_mechanical_isentropic_offsets`](../core/non_ideal_closed_cycle_layer.py)：
+> **实现状态**：同 §8，旧实现见 legacy 模块。
+
+[`apply_mechanical_isentropic_offsets`](../core/non_ideal_node_offsets_legacy.py)：
 
 - `η_is` 取参数 → `self.mechanical_efficiency` → `config.NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT`，须在 `(0, 1]`。
 - **须先**调用 `apply_heat_pressure_offsets()` 让 `P, H` 反映换热后的状态。
@@ -204,7 +203,7 @@ P_non_ideal(v) = P_ideal(v) × σ ** layer(v)
 
 ### 9.1 机械锚点决策
 
-[`_pick_mechanical_anchor`](../core/non_ideal_closed_cycle_layer.py)，决策树：
+[`_pick_mechanical_anchor`](../core/non_ideal_node_offsets_legacy.py)，决策树：
 
 1. 一级节点（`parent is None`）且 ∈ `upstream_special_nodes` → 该一级（并列时 `index` 最小）。一级本来就是熵不动点，且位于 `reach` 最大处。
 2. 否则若 `upstream_special_nodes` 非空 → `min(upstream_special_nodes)`。分叉组中一级在侧枝时退化。
@@ -216,7 +215,7 @@ P_non_ideal(v) = P_ideal(v) × σ ** layer(v)
 
 ### 9.2 机械步公式
 
-[`_mechanical_step_known_to_unknown`](../core/non_ideal_closed_cycle_layer.py) 沿一条精简机械边由已知端 `k` 推未知端 `u`：
+[`_mechanical_step_known_to_unknown`](../core/non_ideal_node_offsets_legacy.py) 沿一条精简机械边由已知端 `k` 推未知端 `u`：
 
 1. **等熵焓**：在待求端 `P_u` 下沿用已知端熵 `S_k`：
    ```
@@ -230,7 +229,7 @@ P_non_ideal(v) = P_ideal(v) × σ ** layer(v)
 
 ### 9.3 支路传播
 
-[`_walk_mechanical_branches`](../core/non_ideal_closed_cycle_layer.py)：
+[`_walk_mechanical_branches`](../core/non_ideal_node_offsets_legacy.py)：
 
 - 对每个机械组建无向邻接表 `(邻居, 边键)`。
 - 从锚点出发，对每个邻居各开一条 DFS 支路；栈中 `(prev, cur)` 表示"已知 prev → 待更新 cur"，仅沿远离锚点方向推进。

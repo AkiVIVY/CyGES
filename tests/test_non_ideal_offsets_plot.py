@@ -8,6 +8,10 @@ import pytest
 
 from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput, Node, SimplifiedTopology
 from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer
+from core.non_ideal_node_offsets_legacy import (
+    apply_heat_pressure_offsets,
+    apply_mechanical_isentropic_offsets,
+)
 
 FOCUS_NODE_INDICES = frozenset({9, 14, 35, 44})
 
@@ -42,8 +46,8 @@ def _build_offsets_case() -> tuple[ClosedCycleLayer, NonIdealClosedCycleLayer]:
     layer = ClosedCycleLayer(_helium_tp_input())
     _assign_random_subcycle_flows(layer)
     ni = layer.ensure_non_ideal()
-    ni.apply_heat_pressure_offsets()
-    ni.apply_mechanical_isentropic_offsets()
+    apply_heat_pressure_offsets(ni)
+    apply_mechanical_isentropic_offsets(ni)
     assert ni.nodes is not None
     return layer, ni
 

@@ -25,6 +25,10 @@ if str(ROOT) not in sys.path:
 
 from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput, Node, SimplifiedTopology
 from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer
+from core.non_ideal_node_offsets_legacy import (
+    apply_heat_pressure_offsets,
+    apply_mechanical_isentropic_offsets,
+)
 
 
 @dataclass(frozen=True)
@@ -88,8 +92,8 @@ def _build_offsets_case(inp: ClosedCycleTPInput, flow_seed: int) -> tuple[Closed
     layer = ClosedCycleLayer(inp)
     _assign_random_subcycle_flows(layer, seed=flow_seed)
     ni = layer.ensure_non_ideal()
-    ni.apply_heat_pressure_offsets()
-    ni.apply_mechanical_isentropic_offsets()
+    apply_heat_pressure_offsets(ni)
+    apply_mechanical_isentropic_offsets(ni)
     assert ni.nodes is not None
     return layer, ni
 
