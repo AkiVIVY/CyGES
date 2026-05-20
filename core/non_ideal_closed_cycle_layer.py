@@ -1,47 +1,15 @@
-"""
-非理想闭式循环层：理想层 ``simplified`` 的**只读快照** + 按过程类型划分的**有向连通组**索引。
+"""闭式循环**非理想层**：理想 ``simplified`` 快照 + 按 ``kind`` 划分的有向连通组与组内深度。
 
-边类型的物理含义
-----------------
-精简边 ``kind`` 与理想层 ``Edge`` 一致，表示不同的热力过程单元：
+由 ``ClosedCycleLayer.ensure_non_ideal()`` 构造，**不修改**父层 ``nodes`` / ``edges``。父层
+``analyze_topology()`` / ``commit_*`` 时 ``layer.non_ideal`` 被置 ``None``，已生成的实例仍指向
+ensure 时刻的快照。
 
-- ``mechanical``（``SM*``）：**叶轮机械工作过程**（压缩/膨胀等）。非理想参数为**等熵效率**
-  ``η_is``（``config.NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT``）；``apply_mechanical_isentropic_offsets``
-  沿组内边修正焓并以 ``HP`` 闭合 ``T,P,H,S``。
-- ``heat``（``SH*``）：**换热过程**（加热/冷却等）。非理想参数为**总压恢复系数**
-  ``σ``（``config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT``），表示沿过程流向的总压保留程度；当前已实现
-  按组内层号对节点压力 ``P`` 的偏移 ``P ← P_ideal × σ^layer``，并在所有节点上以 ``PS(P_new, S)``
-  闭合 ``T,H``（``apply_heat_pressure_offsets``）。
+节点状态：``ideal_nodes`` 为 ensure 时刻对父层 ``nodes`` 的只读引用；``nodes`` 在首次偏移
+方法调用时整表拷贝，再写修正量，理想层不变。同一 ``Node.index`` 可同时属于一个机械组与一个
+换热组，深度按组查询（``group.depth_dict()``）。
 
-与理想层的分工
---------------
-- **理想层**（``closed_cycle_layer``）：生成/更新 ``SimplifiedTopology``（过滤、链合并、``SM*``/``SH*``）。
-- **本模块**：在 ``ClosedCycleLayer.ensure_non_ideal()`` 时拷贝引用并**派生**组内结构，供后续
-  非理想效率、节点状态偏移、约束装配使用；**不**回写父层 ``nodes`` / ``edges``。
-
-挂载与失效
-----------
-- ``from_closed_cycle_layer`` 要求 ``layer.simplified`` 已存在。
-- 父层 ``analyze_topology()`` / ``commit_subcycle_mass_flows_to_topology()`` 将 ``layer.non_ideal = None``；
-  旧 ``NonIdealClosedCycleLayer`` 实例及其 ``simplified`` 引用仍指向 ensure 时刻，与父层新 ``simplified`` 解耦。
-
-组内深度（重要）
-----------------
-在每个 ``SimplifiedDirectedGroup`` 内，**仅使用该组、该 kind** 的精简边（``tail→head``）建有向图：
-
-- **层号**（``node_depth`` 第二分量）：最上游为 ``0``，沿流向递增；由 ``reach``、锚点顺流
-  BFS 与逆流补全得到相对深度 ``rel`` 后，``layer(v) = max(rel) - rel(v)``。
-- ``upstream_special_nodes`` = ``reach`` 最大的节点（下游延伸最长，``frozenset`` 可并列）。
-
-同一 ``Node.index`` 可同时出现在一个机械组与一个换热组中，此时有两套独立的
-深度，数值可以不同。偏移应通过 ``group.depth_dict()`` 按组查询，
-勿用全局 ``node_index → 深度`` 单表混用。详见项目 ``AGENTS.md`` §5。
-
-节点状态
---------
-- ``ideal_nodes``：ensure 时刻对 ``layer.nodes`` 的只读引用（理想 ``T,P,H,S``）。
-- ``nodes``：首次偏移方法调用时整表拷贝，再写修正量；理想层不变。
-- ``properties``：与理想层相同的物性求解器，机械偏移用 ``HP`` 闭合状态。
+算法细节（``reach`` / ``layer`` 定义、换热 σ 偏移、机械锚点决策、机械步公式）见
+``docs/architecture.md``。
 """
 
 from __future__ import annotations
@@ -57,20 +25,18 @@ from core.closed_cycle_layer import Node, SimplifiedEdge, SimplifiedTopology
 from core.fluid_property_solver import FluidPropertySolver
 
 
+# ============================================================
+# §1. 分组与有向邻接（按 kind 拆分 + 并查集求无向连通分量）
+# ============================================================
+
+
 def partition_simplified_edges_by_kind(
     topology: SimplifiedTopology,
 ) -> tuple[tuple[frozenset[str], ...], tuple[frozenset[str], ...]]:
-    """
-    将 ``topology.simplified_edges`` 按 ``SimplifiedEdge.kind`` 拆成机械、换热两套边表，再各自求**无向**连通分量。
+    """按 ``kind`` 拆分精简边，再各自求**无向**连通分量。
 
-    无向连通：每条精简边连接 ``tail`` 与 ``head``，忽略 ``tail→head`` 方向；**不**改变边的有向语义。
-
-    返回
-    ----
-    ``(mechanical_edge_groups, heat_edge_groups)``，元素为边键 ``frozenset``。
-    组顺序稳定：按组内最小边键字符串排序。
-
-    后续 ``build_directed_groups`` 对每个边键集合再算组内有向层号。
+    返回 ``(mechanical_edge_groups, heat_edge_groups)``，元素为边键 ``frozenset``；组顺序按
+    组内最小边键字符串排序稳定化。不改变边的有向语义。
     """
     mech: list[tuple[str, int, int]] = []
     heat: list[tuple[str, int, int]] = []
@@ -113,10 +79,16 @@ def partition_simplified_edges_by_kind(
     return _components(mech), _components(heat)
 
 
+# ============================================================
+# §2. 组内深度（reach 下游最长路径 / layer 拓扑序 DP 最长上游路径）
+# ----------------------------------------------------------------
+# 定义与示例详见 docs/architecture.md §有向组与深度。
+# ============================================================
+
+
 @dataclass(frozen=True)
 class GroupDepthMetrics:
-    """
-    组内有向深度中间量。
+    """组内有向深度的中间结果。
 
     - ``reach``：从该点沿 ``tail→head`` 的最长下游路径边数（用于 ``upstream_special_nodes``）。
     - ``layer``：从任一入度 0 源点到该点的最长上游路径边数（用于换热 ``σ^layer`` 叠乘）。
@@ -147,11 +119,9 @@ def compute_group_downstream_reach(
     edges_by_key: dict[str, SimplifiedEdge],
     edge_keys: frozenset[str],
 ) -> dict[int, int]:
-    """
-    在**单一有向连通组**上计算各端点的**下游可达边数** ``reach``。
+    """计算组内各端点的**下游最长路径边数** ``reach``。
 
-    ``reach(v)`` = 从 ``v`` 出发沿 ``tail→head`` 能延伸的最长路径边数（无出边为 ``0``）。
-    组内有向环时抛出 ``ValueError``。
+    ``reach(v) = 0`` 表示 ``v`` 无出边。组内存在有向环时抛 ``ValueError``。
     """
     if not edge_keys:
         return {}
@@ -183,14 +153,10 @@ def _compute_group_depth_metrics(
     edges_by_key: dict[str, SimplifiedEdge],
     edge_keys: frozenset[str],
 ) -> GroupDepthMetrics:
-    """
-    ``reach``：下游最长有向路径（边数）；
-    ``layer``：组内**任一**入度 0 源点到 ``v`` 的有向**最长路径**（边数），即 ``v`` 上游
-    沿组内边累计经过的过程步数。
+    """同时计算组内 ``reach`` 与 ``layer``。
 
-    在多源 DAG 上等价于「拓扑序 DP」：源点 ``layer=0``，对每条 ``u→v`` 有
-    ``layer[v] = max(layer[v], layer[u] + 1)``。``compute_group_downstream_reach``
-    已经保证组内无有向环。
+    ``layer`` 用拓扑序 DP（Kahn）：源点 ``layer=0``，每条 ``u→v`` 满足
+    ``layer[v] = max(layer[v], layer[u] + 1)``。``reach`` 的计算已保证组内无有向环。
     """
     reach = compute_group_downstream_reach(edges_by_key, edge_keys)
     if not reach:
@@ -222,37 +188,30 @@ def compute_group_downstream_depth(
     edges_by_key: dict[str, SimplifiedEdge],
     edge_keys: frozenset[str],
 ) -> dict[int, int]:
-    """
-    在**单一有向连通组**上计算各端点**层号** ``layer``（``node_depth`` 公开语义）。
+    """计算组内各端点 ``layer``（``node_depth`` 公开语义）。
 
-    ``layer(v)`` = 组内任一入度 0 源点到 ``v`` 的**有向最长路径**长度（边数）；
-    源点本身 ``layer = 0``。基于拓扑序 DP：对每条 ``u → v`` 有
-    ``layer[v] = max(layer[v], layer[u] + 1)``。
-
-    示例：``A→B``、``B→C``、``A→D``、``E→D`` 时层号为 A=0,B=1,C=2,D=1,E=0
-    （源点 A 与 E 同为 0，``D`` 取入边来源中最大的 layer 后 +1）。
+    定义与示例详见 ``docs/architecture.md §有向组与深度``。
     """
     return _compute_group_depth_metrics(edges_by_key, edge_keys).layer
 
 
+# ============================================================
+# §3. 有向组数据类与构造
+# ============================================================
+
+
 @dataclass(frozen=True)
 class SimplifiedDirectedGroup:
-    """
-    同 ``kind`` 精简边的一个**无向连通分量** + 组内**有向**层号与最上游特殊节点。
+    """同 ``kind`` 精简边的一个**无向连通分量**与组内有向层号、最上游特殊节点。
 
     字段
     ----
-    - ``kind``：``"mechanical"``（叶轮机械过程组）或 ``"heat"``（换热过程组），与 ``SimplifiedEdge.kind`` 一致。
-    - ``edge_keys``：本组 ``SM*`` / ``SH*`` 边键集合。
-    - ``node_depth``：``(node_index, 层号)``，按 index 升序；最上游为 ``0``，最下游为 ``max_depth``。
+    - ``kind`` / ``edge_keys``：组类型与本组 ``SM*`` / ``SH*`` 边键集合。
+    - ``node_depth``：``(node_index, layer)`` 元组，按 index 升序；最上游 ``0``，最下游
+      ``max_depth``。
     - ``upstream_special_nodes``：``reach`` 最大的节点（``frozenset``，允许并列）。
 
-    查询
-    ----
-    - ``depth_dict()``：``index → 层号``，仅限本组语义。
-    - ``nodes()`` / ``max_depth``：组内节点集与最大层号。
-
-    注意：另一 ``kind`` 的组对同一 ``index`` 可能有不同层号，须分表使用。
+    另一 ``kind`` 的组对同一 ``Node.index`` 可能有不同层号；查询请用 ``depth_dict()``。
     """
 
     kind: Literal["mechanical", "heat"]
@@ -280,11 +239,10 @@ def build_directed_groups(
     topology: SimplifiedTopology,
     kind: Literal["mechanical", "heat"],
 ) -> tuple[SimplifiedDirectedGroup, ...]:
-    """
-    对 ``topology`` 中指定 ``kind`` 的全部精简边：先无向连通划分，再逐组换算层号与 ``upstream_special_nodes``。
+    """按 ``kind`` 切分 → 逐组算层号与 ``upstream_special_nodes``，输出完整 ``SimplifiedDirectedGroup``。
 
-    与 ``partition_simplified_edges_by_kind`` 的关系：后者只分边键；本函数产出完整的
-    ``SimplifiedDirectedGroup``（含层号与特殊节点），供 ``NonIdealClosedCycleLayer`` 持有。
+    ``partition_simplified_edges_by_kind`` 只分边键；本函数另带层号与特殊节点，供
+    ``NonIdealClosedCycleLayer`` 持有。
     """
     mech_keys, heat_keys = partition_simplified_edges_by_kind(topology)
     edge_key_groups = mech_keys if kind == "mechanical" else heat_keys
@@ -312,7 +270,15 @@ def build_directed_groups(
     return tuple(out)
 
 
+# ============================================================
+# §4. 偏移实现（机械锚点 / 机械步公式 / 支路 DFS / 换热 σ + PS 闭合）
+# ----------------------------------------------------------------
+# 详见 docs/architecture.md §换热偏移、§机械偏移。
+# ============================================================
+
+
 def _pressure_equal(P0: float, P1: float) -> bool:
+    """两个压力是否在相对/绝对容差下视为相等。"""
     tol = max(1e-9, 1e-6 * max(abs(P0), abs(P1)))
     return abs(P1 - P0) <= tol
 
@@ -321,13 +287,11 @@ def _pick_mechanical_anchor(
     group: SimplifiedDirectedGroup,
     ideal_nodes: Mapping[int, Node],
 ) -> int:
-    """
-    机械组基准节点（整点状态不再修改）：
+    """机械组基准节点选择（锚点整点状态不再修改）。
 
-    1. 若一级节点（``parent is None``）同时位于 ``upstream_special_nodes``，取该一级节点
-       （并列时 index 最小）——一级节点本就是熵不动点。
-    2. 否则使用 ``min(upstream_special_nodes)``——分叉组中一级位于侧枝时的熵不动点退化。
-    3. 否则使用任一一级节点；再否则取层号 0（index 最小）。
+    决策树：一级 ∈ ``upstream_special_nodes`` → 该一级（index 最小）→
+    ``min(upstream_special_nodes)`` → 任一一级 → ``min(layer==0)``。详见
+    ``docs/architecture.md §机械锚点决策``。
     """
     group_nodes = group.nodes()
     primaries = sorted(v for v in group_nodes if ideal_nodes[v].parent is None)
@@ -352,7 +316,7 @@ def _refresh_node_from_ps(
     properties: FluidPropertySolver,
     index: int,
 ) -> None:
-    """以当前 ``P,S`` 通过 ``PS`` 闪蒸刷新节点的 ``T,H``（``P,S`` 回写以求解器返回值为准）。"""
+    """以当前 ``(P, S)`` 通过 ``PS`` 闪蒸刷新节点 ``T,H``（``P,S`` 以求解器返回值为准）。"""
     n = nodes[index]
     st = properties.state("PS", n.P, n.S)
     nodes[index] = replace(n, T=st["T"], P=st["P"], H=st["H"], S=st["S"])
@@ -367,19 +331,11 @@ def _mechanical_step_known_to_unknown(
     edge: SimplifiedEdge,
     eta_is: float,
 ) -> None:
-    """
-    沿精简机械边 ``tail→head`` 对**待求端点**做一步非理想求解：
+    """沿精简机械边由 ``known`` 推 ``unknown`` 一步：``PS→η→HP``。
 
-    1. 取已知端熵 ``S_known``，与待求端压力 ``P_unknown`` 一起做 ``PS`` 闪蒸，得**等熵焓** ``H1``；
-    2. 按等熵效率 ``η_is`` 与边方向（``P_head`` vs ``P_tail``）取真实焓：
-
-       - 压缩（``P_head > P_tail``）：``H2 = (H1 - H_known) / η_is + H_known``
-       - 膨胀（``P_head < P_tail``）：``H2 = (H1 - H_known) × η_is + H_known``
-       - 等压：``H2 = H_known``（等熵假设下 ``H1 ≡ H_known``）；
-
-    3. 用 ``HP(H2, P_unknown)`` 写回待求端的完整 ``T,P,H,S``（``S`` 一般不再等于 ``S_known``）。
-
-    本函数仅修改 ``nodes[unknown]``。
+    ``H1 = state("PS", P_unknown, S_known)["H"]``；按边方向（压缩 ``/η_is``、膨胀 ``×η_is``、
+    等压保持）算 ``H2``；``state("HP", H2, P_unknown)`` 写回 ``T,P,H,S``。仅修改
+    ``nodes[unknown]``。公式细节见 ``docs/architecture.md §机械步公式``。
     """
     n_known = nodes[known]
     n_unknown = nodes[unknown]
@@ -424,11 +380,9 @@ def _walk_mechanical_branches(
     anchor: int,
     eta_is: float,
 ) -> set[int]:
-    """
-    从锚点出发，沿无向邻接逐条支路单向 DFS 推进；每条边只从已知端推到未知端。
+    """从锚点沿无向邻接 DFS，逐条支路单向推进（每条边只从已知端推到未知端）。
 
-    锚点处的每个邻居各开启一条支路；在每个新已知节点上若仍有未访问邻居则继续沿链
-    （子分叉同理 DFS）。返回处理完毕的节点集合（含锚点）。
+    返回处理完毕的节点集合（含锚点）。与锚点无向不连通的节点不会被更新，由调用方决定如何告警。
     """
     # 无向邻接：(邻居节点, 连接边键)，便于从锚点向各支路 DFS
     adj: dict[int, list[tuple[int, str]]] = defaultdict(list)
@@ -466,25 +420,20 @@ def _walk_mechanical_branches(
 
 @dataclass
 class NonIdealClosedCycleLayer:
-    """
-    非理想分析容器（可变 dataclass，便于在本对象上挂载偏移结果）。
+    """非理想分析容器（可变 dataclass，便于挂载偏移结果）。
 
     字段
     ----
-    - ``simplified``：与 ``ensure_non_ideal()`` 时刻 ``layer.simplified`` **同一引用**
-      （``SimplifiedTopology`` 为 frozen，内容不可变）。
-    - ``mechanical_groups`` / ``heat_groups``：按 kind 划分的 ``SimplifiedDirectedGroup`` 元组
-      （含 ``node_depth``、``max_depth``、``upstream_special_nodes``）。
-    - ``ideal_nodes``：ensure 时刻 ``layer.nodes`` 的只读映射（理想状态）。
-    - ``nodes``：非理想节点表；``apply_heat_pressure_offsets()`` 首次调用时从 ``ideal_nodes`` 拷贝。
-    - ``heat_efficiency``：最近一次换热压力偏移使用的总压恢复系数 ``σ``；未偏移时为 ``None``。
-    - ``properties``：物性求解器（与 ``ClosedCycleLayer.properties`` 相同引用）。
-    - ``mechanical_efficiency``：最近一次机械等熵偏移使用的 ``η_is``；未偏移时为 ``None``。
+    - ``simplified``：ensure 时刻 ``layer.simplified`` 的同一引用（frozen，不可变）。
+    - ``mechanical_groups`` / ``heat_groups``：按 ``kind`` 划分的 ``SimplifiedDirectedGroup`` 元组。
+    - ``ideal_nodes``：ensure 时刻 ``layer.nodes`` 的只读映射。
+    - ``nodes``：非理想节点表，首次偏移调用时从 ``ideal_nodes`` 拷贝。
+    - ``properties``：与父层相同的物性求解器。
+    - ``heat_efficiency`` / ``mechanical_efficiency``：最近一次偏移采用的系数；未偏移时为
+      ``None``。
 
-    构造
-    ----
-    仅通过 ``from_closed_cycle_layer`` 或 ``ClosedCycleLayer.ensure_non_ideal()`` 创建。
-    换热 / 机械偏移须分别调用 ``apply_heat_pressure_offsets()``、``apply_mechanical_isentropic_offsets()``。
+    仅由 ``from_closed_cycle_layer`` / ``ClosedCycleLayer.ensure_non_ideal()`` 创建。偏移须分别
+    调用 ``apply_heat_pressure_offsets()`` / ``apply_mechanical_isentropic_offsets()``。
     """
 
     simplified: SimplifiedTopology
@@ -498,10 +447,9 @@ class NonIdealClosedCycleLayer:
 
     @classmethod
     def from_closed_cycle_layer(cls, layer) -> NonIdealClosedCycleLayer:
-        """
-        读取理想层当前 ``simplified`` 与 ``nodes``，构建机械/换热有向组快照。
+        """读取理想层 ``simplified`` / ``nodes``，构建机械/换热有向组快照。
 
-        前置条件：``layer.simplified is not None``（已 ``analyze_topology`` 或 ``commit_*``）。
+        前置：``layer.simplified is not None``（已 ``analyze_topology`` 或 ``commit_*``）。
         """
         if layer.simplified is None:
             raise RuntimeError(
@@ -525,18 +473,11 @@ class NonIdealClosedCycleLayer:
         self,
         heat_efficiency: float | None = None,
     ) -> NonIdealClosedCycleLayer:
-        """
-        按**换热过程**有向组层号修正节点压力，并对全部节点用 ``PS`` 重新闭合 ``T,H``。
+        """按换热组层号修正 ``P``：``P ← P_ideal × σ^layer``，再对全部节点 ``PS(P,S)`` 闭合 ``T,H``。
 
-        换热边表示换热过程；``σ``（``heat_efficiency`` 参数）为**总压恢复系数**，
-        ``P_non_ideal(v) = P_ideal(v) × σ ** layer(v)``（``layer`` 见 ``heat_groups`` 的 ``depth_dict``）。
-
-        ``P`` 写完后，对 ``self.nodes`` 中**所有**节点用当前 ``(P, S)`` 调用 ``state("PS", P, S)``
-        得到一致的 ``T,H``；这样后续机械步可在新 ``P`` 下直接使用各节点的 ``S``。
-
-        - ``σ`` 默认 ``config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT``；可用参数或 ``self.heat_efficiency`` 覆盖。
-        - 以各节点 **理想** ``P`` 为底，避免重复叠加。
-        - 不修改 ``ideal_nodes`` 与父层 ``ClosedCycleLayer.nodes``。
+        ``σ`` 取参数 → ``self.heat_efficiency`` → ``config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT``；
+        须在 ``(0, 1]`` 内。始终以理想 ``P`` 为底，避免重复叠加；不修改 ``ideal_nodes`` 与父层。
+        细节见 ``docs/architecture.md §换热偏移``。
         """
         if heat_efficiency is not None:
             eta = heat_efficiency
@@ -568,24 +509,14 @@ class NonIdealClosedCycleLayer:
         self,
         mechanical_efficiency: float | None = None,
     ) -> NonIdealClosedCycleLayer:
-        """
-        按**叶轮机械过程**有向组，从基准点出发沿每条支路**单向**逐边推进非理想偏置。
+        """在每个机械组从锚点 DFS 单向推进 ``PS→η→HP``；锚点整点状态不变。
 
-        基准节点（整点状态不再修改）：见 :func:`_pick_mechanical_anchor`，简言之优先一级节点；
-        若一级位于侧枝（不在 ``upstream_special_nodes``），退化为 ``min(upstream_special_nodes)``。
+        ``η_is`` 取参数 → ``self.mechanical_efficiency`` →
+        ``config.NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT``；须在 ``(0, 1]`` 内。**须先**调用
+        ``apply_heat_pressure_offsets()`` 让 ``P,H`` 反映换热后状态。不修改 ``ideal_nodes`` 与
+        父层。机械组中与锚点无向不连通的节点 → ``RuntimeWarning``。
 
-        每一步沿一条精简机械边由已知端 ``k`` 推未知端 ``u``：
-
-        1. 取 ``S_k``，在 ``P_u`` 下做 ``PS`` 闪蒸得**等熵焓** ``H1``；
-        2. 按边方向（``P_head`` vs ``P_tail``）以 ``η_is`` 得真实焓 ``H2``
-           （压缩 ``/η_is``、膨胀 ``×η_is``、等压保持）；
-        3. ``HP(H2, P_u)`` 写回 ``T,P,H,S``。
-
-        组内传播采用「从基准向每个邻居各开一条支路，沿无向链 DFS 远离基准单向推进」的方式，
-        每条精简边只被使用一次。
-
-        **须先** ``apply_heat_pressure_offsets()`` 再调用本方法（``P`` 与 ``H`` 用换热后值）。
-        不修改 ``ideal_nodes`` 与父层 ``nodes``。
+        锚点决策与机械步公式详见 ``docs/architecture.md §机械锚点决策、§机械步公式``。
         """
         if mechanical_efficiency is not None:
             eta = mechanical_efficiency

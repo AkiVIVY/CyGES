@@ -1,44 +1,18 @@
 """
 闭式循环**理想层**：离散 TP/PS 拓扑、子循环流量、活跃子图精简，并为非理想层提供基准。
 
-职责划分
---------
-- **本模块**：``ClosedCycleLayer`` 持有完整基准拓扑（``nodes`` / ``edges`` / ``subcycles``）及
-  ``simplified``（过滤 + 链合并后的 ``SimplifiedTopology``）；不实现非理想效率或状态偏移。
-- **``core.non_ideal_closed_cycle_layer``**：在 ``ensure_non_ideal()`` 时对 ``simplified`` 做快照，
-  并派生机械/换热有向连通组与组内下游深度（见该模块文档）。
+``ClosedCycleLayer`` 持有 ``nodes`` / ``edges`` / ``subcycles`` 与 ``simplified``；不实现非理想效率
+或状态偏移，后者由 :mod:`core.non_ideal_closed_cycle_layer` 在 ``ensure_non_ideal()`` 时快照
+``simplified`` 后承接。
 
-典型调用链
-----------
-``ClosedCycleTPInput`` → ``ClosedCycleLayer`` → ``analyze_topology()`` →（改 ``subcycle_mass_flows``）
-→ ``commit_subcycle_mass_flows_to_topology()`` → ``ensure_non_ideal()``。
+失效语义：``analyze_topology()`` 与 ``commit_subcycle_mass_flows_to_topology()`` 会重建
+``simplified`` 并清空 ``non_ideal``；非理想分析须在理想层稳定后再 ``ensure_non_ideal()``。
 
-单位约定（字段名不缀单位）：T[K]、P[kPa]、H[kJ/kg]、S[kJ/(kg·K)]。
-分位序列由调用方保证互不重复；本模块不对 ``ClosedCycleTPInput`` 做防御性校验。
+单位约定（字段名不缀单位）：T[K]、P[kPa]、H[kJ/kg]、S[kJ/(kg·K)]。分位序列由调用方保证
+互不重复；本模块不对 ``ClosedCycleTPInput`` 做防御性校验。
 
-拓扑生成（``build_node_edge_topology``）
----------------------------------------
-1. 温压轴与分位生成一级 TP 节点；
-2. 沿压力轴对一级点等熵延伸得二级节点，相邻同熵链上生成机械边 ``M*``；
-3. 等压线上按 ``S`` 排序连接换热边 ``H*``；
-4. ``_attach_edges_to_nodes_ps`` 将边键写入各节点四邻槽。
-
-子循环与边流量
---------------
-- 最小子循环：``edge_up`` → ``edge_right`` → ``edge_down`` → ``edge_left`` 闭合的 4 节点 4 边；
-  节点顺序顺时针 **左下→左上→右上→右下**，边顺序 **左、上、右、下**。
-- ``subcycle_mass_flows`` 为优化器主控向量；``commit_*`` 内量化后 ``assign_edge_mass_flows_from_subcycles``
-  按顺时针约定汇聚到 ``Edge.mass_flow``（``tail→head`` 代数和）。
-
-精简拓扑（``build_simplified_topology`` / ``_rebuild_simplified``）
---------------------------------------------------------------------
-在「属于某子循环且边流量非零」的活跃子图上，将仅挂一类邻边的中间点合并为 ``SimplifiedEdge``（``SM*`` / ``SH*``）。
-每次 ``analyze_topology`` / ``commit_*`` 末尾更新 ``layer.simplified``；同时清空 ``layer.non_ideal``。
-
-PS 平面约定
------------
-``P`` 自下而上增大，``S`` 自左而右增大；边仅 **向上** 且 **向右**（``tail`` 的 P、S 在容差下 ≤ ``head``）。
-机械边：``tail.edge_up`` / ``head.edge_down``；换热边：``tail.edge_right`` / ``head.edge_left``。
+算法细节（PS 平面约定、拓扑流水线、子循环模板、链合并规则、流量汇聚）见
+``docs/architecture.md``。
 """
 
 from __future__ import annotations
@@ -59,8 +33,13 @@ import config as cyges_config
 from core.fluid_property_solver import CoolPropFluidPropertySolver, FluidPropertySolver
 
 
+# ============================================================
+# §1. 数据模型（输入 / 节点 / 边 / 子循环 / 精简拓扑）
+# ============================================================
+
 MERGED_ISOLATED_NODE_EDGE_KEY = "__CyGES_ISOLATED__"
-"""精简拓扑中四邻边槽全空、且未上链的节点占位键：在 ``SimplifiedTopology.merged_into`` 中作为「不参与活跃子图」的标记，无对应 ``SimplifiedEdge``。"""
+"""精简拓扑中四邻边槽全空、且未上链的节点占位键：在 ``SimplifiedTopology.merged_into`` 中
+作为「不参与活跃子图」的标记，无对应 ``SimplifiedEdge``。"""
 
 
 @dataclass(frozen=True)
@@ -212,8 +191,14 @@ class SimplifiedTopology:
         return dict(self.merged_into)
 
 
+# ============================================================
+# §2. 流量与边小工具（容差比较、子循环边集、链上 mass_flow 聚合）
+# ============================================================
+
+
 def _mass_flow_close(a: float | None, b: float | None) -> bool:
-    """链上 ``mass_flow`` 一致性比较：``None`` 视为缺测，与任意值兼容；两个非 ``None`` 用 ``math.isclose``。"""
+    """链上 ``mass_flow`` 一致性比较：``None`` 视为缺测，与任意值兼容；两个非 ``None`` 用
+    ``math.isclose``。"""
     if a is None or b is None:
         return True
     return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
@@ -235,20 +220,22 @@ def _edge_has_nonzero_mass_flow(e: Edge) -> bool:
     return not math.isclose(float(e.mass_flow), 0.0, rel_tol=0.0, abs_tol=1e-12)
 
 
+# ============================================================
+# §3. 精简拓扑算法（过滤 + 同类型链合并 + 占位）
+# ----------------------------------------------------------------
+# 详见 docs/architecture.md §精简拓扑：过滤规则、切分点、方向规范化与 MERGED_ISOLATED_NODE_EDGE_KEY。
+# ============================================================
+
+
 def filter_topology_for_non_ideal(
     nodes: dict[int, Node],
     edges: dict[str, Edge],
     subcycles: Sequence[SubCycle],
 ) -> tuple[dict[int, Node], dict[str, Edge]]:
-    """
-    在合并精简拓扑**之前**使用的拓扑拷贝：不修改传入的 ``nodes`` / ``edges``。
+    """剔除不在任何子循环或 ``mass_flow`` 为 ``None`` / 零的边，返回拷贝（**不修改入参**）。
 
-    保留的边须**同时**满足：
-    1. 至少出现在一个 ``SubCycle.edges`` 中（不在任何子循环中的边剔除）；
-    2. ``mass_flow`` 非 ``None`` 且在容差意义下非零（无流量边剔除）。
-
-    返回的 ``nodes`` 为 ``Node`` 的浅拷贝字典，邻边槽中指向被剔除边的键置为 ``None``；
-    ``edges`` 为仅含保留边的**新**字典，``Edge`` 对象与输入共享引用（只读使用）。
+    返回 ``(nodes, edges)``：``nodes`` 为 ``Node`` 浅拷贝且邻边槽指向被剔除边时置 ``None``；
+    ``edges`` 为仅含保留边的新字典，``Edge`` 对象与输入共享引用。
     """
     # 子循环边键并集：不在任何 4 元环上的边不参与非理想精简
     in_sub = _subcycle_edge_key_set(subcycles)
@@ -307,11 +294,11 @@ def _find_typed_chains(
     edges: dict[str, Edge],
     kind: Literal["mechanical", "heat"],
 ) -> list[dict]:
-    """
-    按 ``kind`` 找出该类型原始边形成的所有连通分量（每个分量是一条简单链，无分叉——PS 网格保证）。
+    """返回 ``kind`` 类型边的全部简单链，每项 ``{"nodes": [...], "edges": [...]}``。
 
-    返回列表，每项为 ``{"nodes": ordered_list, "edges": ordered_list}``：
-    ``nodes`` 按 PS 正向排序（机械：``P`` 升；换热：``S`` 升），``edges`` 为相邻节点对之间的边键，长度 ``= len(nodes) - 1``。
+    ``nodes`` 按 PS 正向（机械 ``P`` 升，换热 ``S`` 升）排序；``edges`` 为相邻节点对之间的边
+    键，长度 ``= len(nodes) - 1``。PS 网格保证连通分量均为无分叉简单链；找不到相邻边时抛
+    ``RuntimeError``。
     """
     # 机械链按 P 升序、换热链按 S 升序，与 PS 平面「向上/向右」约定一致
     if kind == "mechanical":
@@ -378,11 +365,10 @@ def _simplify_chain(
     is_mergeable: dict[int, bool],
     counter: int,
 ) -> tuple[list[tuple[str, SimplifiedEdge]], list[tuple[int, str]], int]:
-    """
-    将 ``_find_typed_chains`` 得到的一条简单链切分为若干 ``SimplifiedEdge``。
+    """将一条简单链按「不可合并节点」切分为若干 ``SimplifiedEdge``，并返回 ``merged_into`` 条目。
 
-    切分点（保留端点）= 链两端 + 链上**不可合并**的节点（``is_mergeable`` 为 False，即仍挂两类邻边或孤立）。
-    相邻切分点之间：原始边串合并为一条精简边；中间 **可合并** 节点写入 ``merged_into``（值为其精简边键）。
+    切分点 = 链两端 + 链上 ``is_mergeable[v] is False`` 的节点；切分点之间的原始边串合并为
+    一条精简边，方向由聚合 ``mass_flow`` 规范化（详见 ``docs/architecture.md §精简拓扑``）。
     """
     chain_nodes: list[int] = chain["nodes"]
     chain_edges: list[str] = chain["edges"]
@@ -458,23 +444,15 @@ def build_simplified_topology(
     edges: dict[str, Edge],
     subcycles: Sequence[SubCycle],
 ) -> SimplifiedTopology:
-    """
-    在拓扑产物上构建精简图（**不修改入参**）。
+    """在过滤后的子图上做同类型链合并，返回 ``SimplifiedTopology``（**不修改入参**）。
 
-    **步骤 0**：先 ``filter_topology_for_non_ideal(nodes, edges, subcycles)`` ——
-    剔除不在任何子循环中的边，以及 ``mass_flow`` 为 ``None`` 或数值为零的边；并同步清空节点上指向被删边的邻边槽。
+    流程：``filter_topology_for_non_ideal`` → 标记仅挂一类邻边的可合并中间点 →
+    ``_find_typed_chains`` 拆链 → ``_simplify_chain`` 切段并规范方向 → 四邻全空且未上链的节点
+    记入 ``MERGED_ISOLATED_NODE_EDGE_KEY`` 占位。``kept_nodes`` 为 ``nodes_f`` 中不在
+    ``merged_into`` 键集合里的节点。
 
-    **步骤 1**（链合并）：
-    - 节点的 ``edge_up`` 与 ``edge_down`` 均为 ``None``（仅挂换热邻边） → 合并到换热链。
-    - 节点的 ``edge_left`` 与 ``edge_right`` 均为 ``None``（仅挂机械邻边） → 合并到机械链。
-    - 其余节点（含两类邻边都有、或都没有的孤立点）作为切分点或链端保留。
-    - 精简边方向（``tail → head``）：聚合该精简边覆盖的所有原始 ``Edge.mass_flow``——非 ``None`` 值要求互相一致
-      （``math.isclose``），否则抛 ``ValueError``；正值 → 沿 PS 正向，负值 → 反向并取正绝对值，全 ``None`` / 全 ``0`` → 沿 PS 正向且 ``mass_flow`` 保持原状。
-
-    **步骤 2**：对过滤后 **四邻边槽全空** 且尚未出现在 ``merged_into`` 中的节点，追加
-    ``(index, MERGED_ISOLATED_NODE_EDGE_KEY)``——不删 ``nodes_f`` 中的键，但使其不出现在 ``kept_nodes`` 中（与链上 ``merged_nodes`` 一并可经 ``merged_dict`` 查询）。
-
-    **步骤 3**：``kept_nodes = { i ∈ nodes_f | i 不在 merged_into 的任一条目键中 }``。
+    精简边方向、流量聚合、占位语义详见 ``docs/architecture.md §精简拓扑``。同精简段内原始边
+    ``mass_flow`` 不一致时抛 ``ValueError``。
     """
     nodes_f, edges_f = filter_topology_for_non_ideal(nodes, edges, subcycles)
 
@@ -542,10 +520,16 @@ def build_simplified_topology(
     )
 
 
+# ============================================================
+# §4. 基础拓扑构建（轴、节点、定向边、邻槽回写）
+# ============================================================
+
+
 def _attach_edges_to_nodes_ps(nodes: dict[int, Node], edges: dict[str, Edge]) -> dict[int, Node]:
-    """
-    机械边视为沿 **P** 向上：``tail`` 的 ``edge_up``、``head`` 的 ``edge_down``。
-    换热边视为沿 **S** 向右：``tail`` 的 ``edge_right``、``head`` 的 ``edge_left``。
+    """将边键写回各节点 PS 四邻槽。
+
+    机械边沿 P 向上：``tail.edge_up`` / ``head.edge_down``；换热边沿 S 向右：
+    ``tail.edge_right`` / ``head.edge_left``。同槽重复时抛 ``ValueError``。
     """
     slot: dict[int, dict[str, str | None]] = {
         i: {"up": None, "down": None, "left": None, "right": None} for i in nodes
@@ -580,11 +564,9 @@ def _attach_edges_to_nodes_ps(nodes: dict[int, Node], edges: dict[str, Edge]) ->
 
 
 def build_axis(min_v: float, max_v: float, quantiles: Sequence[float]) -> list[float]:
-    """
-    由单轴上下限与分位生成一维采样序列。
+    """由 ``[min_v, max_v]`` 及分位线性插值生成排序后的采样点序列。
 
-    取 ``min_v``、``max_v`` 及每个分位在 ``[min_v, max_v]`` 上的线性插值点，排序后返回；
-    调用方须保证分位与端点互不重复（本函数不做去重）。
+    调用方须保证 ``quantiles`` 与端点互不重复；本函数不做去重。
     """
     span = max_v - min_v
     pts = [min_v, max_v, *[min_v + q * span for q in quantiles]]
@@ -595,11 +577,10 @@ def build_node_edge_topology(
     solver: FluidPropertySolver,
     inp: ClosedCycleTPInput,
 ) -> tuple[dict[int, Node], dict[str, Edge], list[SkippedPoint]]:
-    """
-    节点与边拓扑的一次性生成：一级 TP 网格、等熵二级与机械边（键 ``M*``）、
-    全节点等压分桶换热边（键 ``H*``），边方向满足 PS 向上/向右约定；最后将边键写回各 ``Node`` 的 ``edge_*`` 字段。
+    """一次性生成基础拓扑：一级 TP 网格 → 等熵二级点 → 机械边 ``M*`` → 等压换热边 ``H*`` → 邻槽回写。
 
-    返回 ``(nodes, edges, skipped_points)``；``skipped_points`` 收集物性求解器异常静默跳过的候选点，仅供诊断。
+    返回 ``(nodes, edges, skipped_points)``；``skipped_points`` 仅供诊断。流水线细节见
+    ``docs/architecture.md §拓扑构建流水线``。
     """
 
     def oriented_edge(
@@ -709,12 +690,16 @@ def build_node_edge_topology(
     return nodes, all_edges, skipped_points
 
 
-def build_subcycles(nodes: dict[int, Node], edges: dict[str, Edge]) -> list[SubCycle]:
-    """
-    枚举最小子循环：对每个起始节点尝试 ``edge_up`` → 对端 ``edge_right`` → 对端 ``edge_down``（取该边 ``tail``）
-    → 对端 ``edge_left``（取该边 ``tail``）须回到起始节点；四节点互异。
+# ============================================================
+# §5. 子循环枚举（最小 4 节点环 / 顺时针模板）
+# ============================================================
 
-    使用 ``frozenset`` 对四角去重，每个物理单元至多输出一次。不对 ``P``/``S`` 几何做一致性校验。
+
+def build_subcycles(nodes: dict[int, Node], edges: dict[str, Edge]) -> list[SubCycle]:
+    """枚举所有最小 4 节点子循环；同物理单元至多输出一次。
+
+    走法：``edge_up`` → ``edge_right`` → ``edge_down``（取该边 ``tail``） → ``edge_left``（取
+    ``tail``）须回到起点。模板细节见 ``docs/architecture.md §子循环模板``。
     """
     seen_cells: set[frozenset[int]] = set()
     out: list[SubCycle] = []
@@ -771,28 +756,24 @@ def build_subcycles(nodes: dict[int, Node], edges: dict[str, Edge]) -> list[SubC
     return out
 
 
+# ============================================================
+# §6. 入口类 ClosedCycleLayer
+# ============================================================
+
+
 class ClosedCycleLayer:
-    """
-    闭式循环**理想层**入口：拓扑构建、子循环流量、精简图 ``simplified``，以及非理想快照挂载点。
+    """闭式循环**理想层**入口：拓扑构建、子循环流量、精简图与非理想快照挂载点。
 
-    构造
+    字段
     ----
-    仅需 ``ClosedCycleTPInput``；默认 ``properties=CoolPropFluidPropertySolver(fluid)``。
-    ``auto_analyze=True``（默认）时构造末尾执行一次 ``analyze_topology()``。
-
-    实例字段
-    --------
     - ``nodes`` / ``edges``：完整基准拓扑（``M*`` / ``H*``）。
     - ``subcycles`` / ``subcycle_mass_flows``：最小 4 元环及其流量向量（优化器优先改后者）。
     - ``skipped_points``：物性失败点，仅诊断。
     - ``simplified``：最近一次 analyze/commit 后的 ``SimplifiedTopology``；无子循环时为空骨架。
     - ``non_ideal``：``ensure_non_ideal()`` 挂载的快照层；analyze/commit 时置 ``None``。
 
-    失效与快照
-    ----------
-    ``analyze_topology()`` 与 ``commit_subcycle_mass_flows_to_topology()`` 会重建拓扑或边流量、
-    调用 ``_rebuild_simplified()``，并 ``_invalidate_non_ideal()``。非理想分析须在理想层稳定后
-    再 ``ensure_non_ideal()``；旧 ``non_ideal`` 内数据仍指向 ensure 时刻，不会随父层自动更新。
+    构造仅需 ``ClosedCycleTPInput``；默认 ``properties=CoolPropFluidPropertySolver(fluid)``，
+    ``auto_analyze=True`` 时构造末尾执行一次 ``analyze_topology()``。
     """
 
     def __init__(
@@ -820,12 +801,9 @@ class ClosedCycleLayer:
         self.non_ideal = None
 
     def _rebuild_simplified(self) -> None:
-        """
-        基于当前 ``nodes`` / ``edges`` / ``subcycles`` 重建 ``self.simplified``。
+        """基于当前 ``nodes`` / ``edges`` / ``subcycles`` 重建 ``self.simplified``。
 
-        子循环为空时不再调用 ``build_simplified_topology`` —— 直接置为空骨架
-        ``SimplifiedTopology(kept_nodes=frozenset(), simplified_edges=(), merged_into=())``，
-        并通过 ``warnings.warn`` 发出 ``RuntimeWarning`` 提示拓扑里没有子循环。
+        ``subcycles`` 为空时直接置空骨架并发出 ``RuntimeWarning``。
         """
         if not self.subcycles:
             warnings.warn(
@@ -842,10 +820,10 @@ class ClosedCycleLayer:
         self.simplified = build_simplified_topology(self.nodes, self.edges, self.subcycles)
 
     def quantize_subcycle_mass_flows(self) -> None:
-        """
-        将 ``subcycle_mass_flows`` 就地舍入到 ``step`` 的整数倍：
-        ``step = subcycle_mass_flow_step_fraction * max_mass_flow``（``subcycle_mass_flow_step_fraction`` 未在输入中指定时由 ``ClosedCycleTPInput`` 使用 ``config.SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT``）。
-        列表为空则不做任何事；调用方应保证 ``max_mass_flow`` 与 ``subcycle_mass_flow_step_fraction`` 在此前为有效正数，本层不再做防御性校验。
+        """将 ``subcycle_mass_flows`` 就地舍入到 ``step`` 整数倍。
+
+        ``step = subcycle_mass_flow_step_fraction × max_mass_flow``；调用方须保证两者为有效
+        正数（本层不做防御校验）。列表为空时直接返回。
         """
         mf = self.input.max_mass_flow
         frac = self.input.subcycle_mass_flow_step_fraction
@@ -858,14 +836,11 @@ class ClosedCycleLayer:
             sc.mass_flow = self.subcycle_mass_flows[i]
 
     def assign_edge_mass_flows_from_subcycles(self) -> None:
-        """
-        将各子循环 ``mass_flow`` 汇聚到 ``self.edges[*].mass_flow``。
+        """按顺时针约定将子循环环量代数汇聚到各边 ``mass_flow``。
 
-        约定：``SubCycle.nodes`` 为顺时针 ``(左下, 左上, 右上, 右下)``；``mass_flow > 0`` 表示沿该顺时针回路，
-        ``< 0`` 表示逆时针。每条拓扑边 ``tail → head`` 上，``mass_flow`` 为沿该方向的代数和；``None`` 子循环按 ``0``。
-
-        若某子循环的边键与顺时针段 ``(u→v)`` 和 ``(tail, head)`` 均不一致，抛出 ``ValueError``。
-        先清空所有边的 ``mass_flow``，再仅对至少出现一次的边写入累加结果（含 ``0.0``）。
+        ``mass_flow > 0`` 沿顺时针回路、``< 0`` 沿逆时针、``None`` 按 ``0`` 计；先清空所有边
+        再仅对至少出现一次的边写入累加结果。子循环边方向与顺时针段不一致时抛 ``ValueError``。
+        汇聚规则详见 ``docs/architecture.md §边流量汇聚``。
         """
         for e in self.edges.values():
             e.mass_flow = None
@@ -897,12 +872,10 @@ class ClosedCycleLayer:
             self.edges[ek].mass_flow = tot
 
     def commit_subcycle_mass_flows_to_topology(self) -> None:
-        """
-        对 ``subcycle_mass_flows`` 就地量化到步长整数倍，再 ``sync`` 到各 ``SubCycle``，并 ``assign`` 到各边。
+        """量化 → 写回 ``SubCycle`` → 汇聚到边 → 重建 ``simplified`` 一气呵成，并清空 ``non_ideal``。
 
-        供外部在写入任意浮点初值后、后续分析前保证离散化与拓扑一致。``subcycle_mass_flows`` 与 ``subcycles`` 长度须一致。
-        无子循环时仅将各边 ``mass_flow`` 置为 ``None``（与 ``assign_edge_mass_flows_from_subcycles`` 行为一致），不调用量化。
-        调用开始时清空 ``non_ideal``，与 ``analyze_topology`` 一致，保证仅在理想层流量稳定后再 ``ensure_non_ideal``。
+        ``len(subcycle_mass_flows)`` 与 ``len(subcycles)`` 不一致时抛 ``ValueError``。无子循环
+        时仅清空各边 ``mass_flow`` 并重建空骨架 ``simplified``。
         """
         self._invalidate_non_ideal()
         n_sc = len(self.subcycles)
@@ -920,12 +893,10 @@ class ClosedCycleLayer:
         self._rebuild_simplified()
 
     def ensure_non_ideal(self) -> NonIdealClosedCycleLayer:
-        """
-        创建或返回 ``non_ideal`` 快照层（不修改 ``nodes`` / ``edges`` / ``simplified`` 等理想层字段）。
+        """创建或返回 ``non_ideal`` 快照层；不修改理想层字段。
 
-        要求 ``self.simplified`` 已由 ``analyze_topology`` 或 ``commit_*`` 生成。
-        快照见 ``NonIdealClosedCycleLayer``（``ideal_nodes``、``properties``、机械/换热有向组及层号）。
-        非理想偏移须对返回值另调 ``apply_heat_pressure_offsets()``、``apply_mechanical_isentropic_offsets()``。
+        要求 ``self.simplified`` 已生成。非理想偏移由调用方在返回值上另调
+        ``apply_heat_pressure_offsets()`` / ``apply_mechanical_isentropic_offsets()``。
         """
         from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer
 
@@ -934,12 +905,12 @@ class ClosedCycleLayer:
         return self.non_ideal
 
     def analyze_topology(self) -> None:
-        """
-        重建完整拓扑：``build_node_edge_topology`` → ``build_subcycles`` → 初值 ``subcycle_mass_flows``
-        → 同步子循环与边流量 → ``_rebuild_simplified()``。
+        """重建完整拓扑并初始化子循环流量。
 
-        覆盖既有 ``nodes`` / ``edges`` / ``subcycles``；清空 ``non_ideal``。
-        无子循环时 ``subcycle_mass_flows`` 为空列表，``simplified`` 仍置空骨架并 ``warn``。
+        ``build_node_edge_topology`` → ``build_subcycles`` → 初值 ``subcycle_mass_flows``
+        （``SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX × max_mass_flow``） → 同步与汇聚 →
+        ``_rebuild_simplified()``。覆盖既有拓扑并清空 ``non_ideal``；无子循环时 ``simplified``
+        为空骨架并 ``warn``。
         """
         self._invalidate_non_ideal()
         self.nodes, self.edges, self.skipped_points = build_node_edge_topology(self.properties, self.input)
