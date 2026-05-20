@@ -33,6 +33,7 @@ from core.non_ideal_closed_cycle_layer import (
     GroupDepthMetrics,
     NonIdealClosedCycleLayer,
     SimplifiedDirectedGroup,
+    apply_combined_offsets,
     build_directed_groups,
     compute_group_downstream_depth,
     compute_group_downstream_reach,
@@ -65,4 +66,5 @@ __all__ = [
     "SimplifiedTopology",
     "build_simplified_topology",
     "filter_topology_for_non_ideal",
+    "apply_combined_offsets",
 ]

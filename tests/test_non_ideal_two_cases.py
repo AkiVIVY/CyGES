@@ -1,13 +1,17 @@
-"""
-生成两组不同理想循环输入条件下的非理想偏置对比图（2×2：理想 vs 非理想，T–S / P–S）。
+"""非理想偏置两工况对比图（2×2：理想 vs 非理想，T–S / P–S）。
 
-用法（仓库根目录）：
-    set PYTHONPATH=.
-    python tests/plot_non_ideal_two_cases.py
+pytest（仓库根、``PYTHONPATH=.``）::
 
-输出：
-    tests/non_ideal_offsets_case_a_he_wide.png
-    tests/non_ideal_offsets_case_b_he_mid_fine.png
+    pytest tests/test_non_ideal_two_cases.py -q
+
+或直接运行::
+
+    python tests/test_non_ideal_two_cases.py
+
+输出 PNG（不纳入 git）：
+
+- ``tests/non_ideal_offsets_case_a_he_wide.png``
+- ``tests/non_ideal_offsets_case_b_he_mid_fine.png``
 """
 
 from __future__ import annotations
@@ -18,17 +22,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+import pytest
+
 TESTS_DIR = Path(__file__).resolve().parent
 ROOT = TESTS_DIR.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput, Node, SimplifiedTopology
-from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer
-from core.non_ideal_node_offsets_legacy import (
-    apply_heat_pressure_offsets,
-    apply_mechanical_isentropic_offsets,
-)
+from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer, apply_combined_offsets
 
 
 @dataclass(frozen=True)
@@ -43,7 +45,7 @@ class PlotCase:
 
 CASES: tuple[PlotCase, ...] = (
     PlotCase(
-        name="Case A: He wide T/P (like default plot)",
+        name="Case A: He wide T/P",
         inp=ClosedCycleTPInput(
             fluid="He",
             t_min=100.0,
@@ -92,8 +94,7 @@ def _build_offsets_case(inp: ClosedCycleTPInput, flow_seed: int) -> tuple[Closed
     layer = ClosedCycleLayer(inp)
     _assign_random_subcycle_flows(layer, seed=flow_seed)
     ni = layer.ensure_non_ideal()
-    apply_heat_pressure_offsets(ni)
-    apply_mechanical_isentropic_offsets(ni)
+    apply_combined_offsets(ni)
     assert ni.nodes is not None
     return layer, ni
 
@@ -210,17 +211,24 @@ def _plot_case(case: PlotCase, out_dir: Path) -> Path:
     return out
 
 
-def main() -> None:
-    out_dir = TESTS_DIR
-    written: list[Path] = []
-    for case in CASES:
-        path = _plot_case(case, out_dir)
-        written.append(path)
-        print(f"Wrote {path}")
+def test_non_ideal_offsets_case_a_he_wide() -> None:
+    """Case A：宽温压 He；输出 ``non_ideal_offsets_case_a_he_wide.png``。"""
+    pytest.importorskip("matplotlib")
+    out = _plot_case(CASES[0], TESTS_DIR)
+    assert out.is_file()
 
-    print("\nCases:")
+
+def test_non_ideal_offsets_case_b_he_mid_fine() -> None:
+    """Case B：中等温压；输出 ``non_ideal_offsets_case_b_he_mid_fine.png``。"""
+    pytest.importorskip("matplotlib")
+    out = _plot_case(CASES[1], TESTS_DIR)
+    assert out.is_file()
+
+
+def main() -> None:
     for case in CASES:
-        print(f"  - {case.name} -> {case.outfile}")
+        path = _plot_case(case, TESTS_DIR)
+        print(f"Wrote {path}")
 
 
 if __name__ == "__main__":

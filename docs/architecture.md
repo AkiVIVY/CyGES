@@ -1,8 +1,8 @@
 # CyGES 架构与算法细节
 
-本文档是 CyGES 主干算法的**单一信息源**。代码 docstring、[`README.md`](../README.md)、[`AGENTS.md`](../AGENTS.md) 在涉及具体规则时统一引用本文件，避免多处描述漂移。
+本文档是 CyGES 主干算法的**单一信息源**。[`README.md`](../README.md) 面向用户；[`AGENTS.md`](../AGENTS.md) 面向 Agent；代码 docstring 只写契约并引用本文件。
 
-> 单位约定：`T[K]`、`P[kPa]`、`H[kJ/kg]`、`S[kJ/(kg·K)]`，字段名不缀单位。
+> 单位：`T[K]`、`P[kPa]`、`H[kJ/kg]`、`S[kJ/(kg·K)]`，字段名不缀单位。
 
 ---
 
@@ -13,18 +13,23 @@ flowchart TD
     inp[ClosedCycleTPInput] --> layer[ClosedCycleLayer]
     layer --> analyze[analyze_topology]
     analyze --> topo[nodes / edges / subcycles]
-    topo --> mf["subcycle_mass_flows<br/>+ assign_edge_mass_flows"]
+    topo --> mf[subcycle_mass_flows + assign_edge_mass_flows]
     mf --> commit[commit_subcycle_mass_flows_to_topology]
     commit --> simp[_rebuild_simplified]
-    simp --> simplified[SimplifiedTopology on layer]
+    simp --> simplified[SimplifiedTopology]
     simplified --> ensure[ensure_non_ideal]
-    ensure --> ni[NonIdealClosedCycleLayer snapshot]
-    ni --> groups["mechanical_groups<br/>heat_groups"]
-    groups --> heatoff["legacy: apply_heat_pressure_offsets<br/>(σ + PS 闭合)"]
-    heatoff --> mechoff["legacy: apply_mechanical_isentropic_offsets<br/>(PS→η→HP)"]
+    ensure --> ni[NonIdealClosedCycleLayer]
+    ni --> off[apply_combined_offsets]
 ```
 
-**失效语义**：`analyze_topology()` 与 `commit_subcycle_mass_flows_to_topology()` 末尾都会重建 `simplified` 并清空 `non_ideal`。非理想分析须在理想层流量稳定后再 `ensure_non_ideal()`。
+**失效语义**：`analyze_topology()` 与 `commit_subcycle_mass_flows_to_topology()` 末尾重建 `simplified` 并置 `non_ideal = None`。须在理想层流量稳定后再 `ensure_non_ideal()`。
+
+**代码分节**（与阅读顺序一致）：
+
+| 模块 | 分节 |
+|------|------|
+| [`closed_cycle_layer.py`](../core/closed_cycle_layer.py) | §1 模型 → §2 小工具 → §3 拓扑构建 → §4 子循环 → §5 精简 → §6 入口类 |
+| [`non_ideal_closed_cycle_layer.py`](../core/non_ideal_closed_cycle_layer.py) | §1 分组 → §2 数据类 → §3 深度 → §4 组构造 → §5 容器 → §6 偏置 |
 
 ---
 
@@ -35,30 +40,31 @@ flowchart TD
 | `P` | 自下而上增大 |
 | `S` | 自左而右增大 |
 
-每条边方向 `tail → head` 在容差意义下满足 `P_tail ≤ P_head` 且 `S_tail ≤ S_head`（即"向上且向右"）。
-- **机械边**（叶轮机械工作）沿 P：`tail.edge_up` / `head.edge_down`。
-- **换热边**（换热过程）沿 S：`tail.edge_right` / `head.edge_left`。
+边 `tail → head` 在容差下满足 `P_tail ≤ P_head` 且 `S_tail ≤ S_head`。
 
-边定向由 [`oriented_edge`](../core/closed_cycle_layer.py) 在容差下判定，无法判定时抛 `RuntimeError`。
+- **机械边**（`mechanical`）：沿 P，`tail.edge_up` / `head.edge_down`。
+- **换热边**（`heat`）：沿 S，`tail.edge_right` / `head.edge_left`。
+
+[`build_node_edge_topology`](../core/closed_cycle_layer.py) 内嵌 `oriented_edge` 判定方向；无法判定则 `RuntimeError`。
 
 ---
 
 ## 3. 拓扑构建流水线
 
-[`build_node_edge_topology`](../core/closed_cycle_layer.py)：
+[`build_node_edge_topology`](../core/closed_cycle_layer.py)（理想层 §3）：
 
-1. `build_axis(t_min, t_max, t_quantiles)` 与 `build_axis(p_min, p_max, p_quantiles)` 生成温压一维采样。
-2. **一级 TP 网格**：每个 `(T, P)` 调用 `state("TP", T, P)` 得 `H, S`；CoolProp 异常静默跳过并记入 `skipped_points`（仅诊断）。
-3. **二级等熵延伸**：以每个一级点的 `S` 在 `p_axis` 上调用 `state("PS", P, S)`；落在 `[t_min, t_max]` 之外或异常的点丢弃。
-4. **机械边 `M*`**：一级及其二级子点按 `P` 升序，相邻对生成 `mechanical`；方向由 `oriented_edge` 决定。
-5. **换热边 `H*`**：所有节点按 `P` 分桶后按 `S` 升序，相邻节点生成 `heat`。
-6. `_attach_edges_to_nodes_ps` 将边键回写到各 `Node.edge_{up,down,left,right}` 槽。
+1. `build_axis` 生成温、压一维采样。
+2. **一级 TP 网格**：`state("TP", T, P)` → `H, S`；CoolProp 异常记入 `skipped_points`。
+3. **二级等熵延伸**：沿一级点 `S` 在 `p_axis` 上 `state("PS", P, S)`；超 `[t_min,t_max]` 或异常则丢弃。
+4. **机械边 `M*`**：每个一级点及其二级子点按 `P` 升序相邻成链。
+5. **换热边 `H*`**：等压桶内按 `S` 升序相邻成链。
+6. `_attach_edges_to_nodes_ps` 回写四邻槽。
 
 ---
 
 ## 4. 子循环模板
 
-[`build_subcycles`](../core/closed_cycle_layer.py) 枚举最小 4 节点环：
+[`build_subcycles`](../core/closed_cycle_layer.py)（理想层 §4）枚举最小 4 节点环：
 
 ```
 左上 ─上(H)─ 右上
@@ -68,11 +74,10 @@ flowchart TD
 左下 ─下(H)─ 右下
 ```
 
-走法：从 `n0`（左下）出发 `edge_up → 左上` → `edge_right → 右上` → `edge_down`（取该边 `tail` 为右下）→ `edge_left`（取 `tail`）须回到 `n0`，四节点互异。`frozenset({n0,n1,n2,n3})` 去重，每个物理单元至多输出一次。
+走法：左下 `n0` → `edge_up` → `edge_right` → `edge_down`（取 `tail`）→ `edge_left`（取 `tail`）回到 `n0`；四角互异；`frozenset` 去重。
 
-约定：
 - `SubCycle.nodes = (左下, 左上, 右上, 右下)` 顺时针。
-- `SubCycle.edges = (左, 上, 右, 下)`；左/右为机械边，上/下为换热边。
+- `SubCycle.edges = (左, 上, 右, 下)`；左/右机械，上/下换热。
 
 ---
 
@@ -80,167 +85,123 @@ flowchart TD
 
 [`assign_edge_mass_flows_from_subcycles`](../core/closed_cycle_layer.py)：
 
-- `SubCycle.mass_flow > 0` 表示工质沿顺时针 `(左下→左上→右上→右下→左下)` 流动；`< 0` 表示逆时针；`None` 按 `0` 计。
-- 每条边的 `mass_flow` 是其穿过的所有子循环沿 `tail → head` 的代数和：
-  - 顺时针段方向与 `Edge.tail→head` **同向** → `+q`。
-  - **反向** → `-q`。
-  - 顺时针段方向与 `(tail, head)` 不匹配 → 抛 `ValueError`（算法不变量被破坏）。
-- 流程：先把所有边 `mass_flow` 置 `None`，再仅对至少出现一次的边写入累加结果（含 `0.0`）。
+- `SubCycle.mass_flow > 0`：顺时针 `(左下→左上→右上→右下→左下)`；`< 0` 逆时针；`None` 按 `0`。
+- 边 `mass_flow` = 穿过该边的子循环代数和：段与 `tail→head` 同向 `+q`，反向 `-q`。
+- 段与边端点不一致 → `ValueError`。
 
 ---
 
 ## 6. 精简拓扑
 
-[`build_simplified_topology`](../core/closed_cycle_layer.py)：在活跃子图（"属于某子循环且边流量非零"）上做同类型链合并。
+[`build_simplified_topology`](../core/closed_cycle_layer.py)（理想层 §5）：在活跃子图（属于某子循环且边流量非零）上合并同类型链。
 
 ### 6.1 过滤
+
 [`filter_topology_for_non_ideal`](../core/closed_cycle_layer.py)：
 
-- 同时满足 (1) 至少出现在一个 `SubCycle.edges` 中 (2) `mass_flow` 非 `None` 且容差非零，才保留。
-- 节点的邻边槽若指向被剔除边，置 `None`（避免后续链遍历误入死边）。
+- 保留：出现在某 `SubCycle.edges` 且 `mass_flow` 非 `None`、容差非零。
+- 剔除边的邻接槽置 `None`。
 
-### 6.2 链合并切分
+### 6.2 链合并
 
-- 节点可合并性：
-  - `edge_up = edge_down = None`（仅挂换热边） → 可并入换热链。
-  - `edge_left = edge_right = None`（仅挂机械边） → 可并入机械链。
-  - 否则（两类邻边都有，或四邻全空） → 作为切分点 / 链端 / 占位。
-- `_find_typed_chains` 按 `kind` DFS 出每个连通分量为简单链；`_simplify_chain` 切分点之间合并为一条 `SimplifiedEdge`。
+- 仅挂换热邻边 → 可并入换热链；仅挂机械邻边 → 可并入机械链；否则为切分点/端点。
+- `_find_typed_chains`：按 `kind` DFS 简单链；`_simplify_chain`：切分点间合并为 `SimplifiedEdge`。
 
 ### 6.3 方向规范化
 
-精简边 `tail → head` 按聚合 `mass_flow` 决定：
+| 聚合 `mass_flow` | `tail→head` | 输出 `mass_flow` |
+|------------------|-------------|------------------|
+| `None` / `0` / `> 0` | PS 正向 | 原值或 `None` |
+| `< 0` | **反向** | `abs(原值)` |
 
-| 聚合 `mass_flow` | `tail` / `head` | 输出 `mass_flow` | `constituent_edges` / `merged_nodes` 顺序 |
-|------------------|------------------|------------------|------------------------------------------|
-| `None` / `0` | 沿 PS 正向 | 原值 | PS 正向 |
-| `> 0` | 沿 PS 正向 | 原值 | PS 正向 |
-| `< 0` | **反向** | `abs(原值)` | 反转 |
+段内原始边流量不一致 → `ValueError`。
 
-同一精简段内原始边 `mass_flow` 不一致（`math.isclose`）时抛 `ValueError`。
+### 6.4 占位
 
-### 6.4 占位语义
-
-过滤后四邻边槽**全空**且尚未上链的节点，追加 `(index, MERGED_ISOLATED_NODE_EDGE_KEY)` 至 `merged_into`。这些节点不出现在 `kept_nodes`，也没有对应的 `SimplifiedEdge`，可经 `merged_dict()` 查询。
-
-`kept_nodes` = `nodes_f` 中**不**在 `merged_into` 任一条目键里的节点。
+四邻全空且未上链的节点 → `merged_into` 记 `MERGED_ISOLATED_NODE_EDGE_KEY`；不在 `kept_nodes`。
 
 ---
 
 ## 7. 有向组与深度
 
-[`SimplifiedDirectedGroup`](../core/non_ideal_closed_cycle_layer.py) 是同 `kind`、**无向连通**的一组精简边。组内才有"深度"概念，组之间互不影响。
+[`SimplifiedDirectedGroup`](../core/non_ideal_closed_cycle_layer.py)（非理想层 §2）：同 `kind`、无向连通的一组精简边。深度只在组内有意义。
 
-### 7.1 邻接
-[`_group_adjacency`](../core/non_ideal_closed_cycle_layer.py) 用组内边的 `tail → head` 构建有向邻接表（用于深度），无向连通则交给并查集（[`partition_simplified_edges_by_kind`](../core/non_ideal_closed_cycle_layer.py)）。
+### 7.1 分组与邻接
 
-### 7.2 `reach`：下游最长路径
-[`compute_group_downstream_reach`](../core/non_ideal_closed_cycle_layer.py)：
+- [`partition_simplified_edges_by_kind`](../core/non_ideal_closed_cycle_layer.py)（§1）：并查集按无向连通分量分组。
+- [`_group_adjacency`](../core/non_ideal_closed_cycle_layer.py)（§3）：组内 `tail→head` 有向邻接。
 
-- `reach(v)` = 从 `v` 沿 `tail → head` 能到达的最长路径边数；无出边 → `0`。
-- 记忆化 DFS；遇有向环抛 `ValueError`。
-- 用于 `upstream_special_nodes = argmax(reach)`（下游延伸最长者，`frozenset`，可并列）。
+### 7.2 `reach`
 
-### 7.3 `layer`：主脊分层（最长路径 + 支流对齐）
-[`_compute_group_depth_metrics`](../core/non_ideal_closed_cycle_layer.py)：
+[`compute_group_downstream_reach`](../core/non_ideal_closed_cycle_layer.py)：`reach(v)` = 沿 `tail→head` 最长下游路径边数；无出边为 `0`；有向环 → `ValueError`。`upstream_special_nodes = argmax(reach)`（`frozenset`，可并列）。
 
-1. 在组内 DAG 上求各点 `dist(v)` = 从任一源点到 `v` 的最长有向路径边数（Kahn + DP）。
-2. 在 `dist(end) = max(dist)` 的终点中，沿「仅属于某条最长路径」的反向边回溯，收集所有可能起点；**长度并列时取起点 `index` 最小**者。
-3. 从该起点沿 `dist` 递增、并列下一跳取 `index` 最小，得到**主脊**路径，脊上 `layer = 0,1,…,L`。
-4. 对其余节点迭代松弛（主脊上的点不再改）：
-   - 前向 `u→v`：`layer[v] = max(layer[v], layer[u]+1)`（仅当 `v` 不在主脊上时可抬高 `v`）；
-   - 后向 `u→v`：`layer[u] = min(layer[u], layer[v]-1)`（仅当 `u` 不在主脊上时可降低 `u`）。
+### 7.3 `layer`：主脊分层
 
-用于换热偏移 `σ^layer`：层号表示相对主工艺链的「过程步」刻度，而非「每个入度 0 源点各自为 0」。
+[`_compute_layer_by_spine`](../core/non_ideal_closed_cycle_layer.py)（§3）：
 
-**示例**（主脊一般为 `A→B→C`）：
+1. Kahn + DP 得 `dist(v)` = 从任一源点到 `v` 的最长有向路径边数。
+2. 在 `dist(end)=max(dist)` 的终点上回溯最长路径起点；**并列取 index 最小**。
+3. 沿 `dist` 递增建主脊；脊上后继须属于「能延续到 `max_d`」的节点集（避免误选短支流）。
+4. 脊上 `layer = 0…L`；其余节点前向 `max`、后向 `min` 对齐（主脊节点不再改）。
+
+示例：
 
 | 拓扑 | `layer` |
 |------|---------|
 | `A→B→C`, `A→D`, `E→D` | A=0, B=1, C=2, D=1, E=0 |
 | `A→B→C`, `A→D`, `E→C` | A=0, B=1, C=2, D=1, E=1 |
 
-`reach` 仍按 §7.2 定义（与 `layer` 独立）。`upstream_special_nodes = argmax(reach)`。
-
-单元测试：[`tests/test_group_layer_spine.py`](../tests/test_group_layer_spine.py)。
-
 ### 7.4 同节点两套深度
 
-同一 `Node.index` 可同时位于一个机械组与一个换热组中。两套深度在不同有向子图上计算，数值可以不同。**偏移/约束须按 `kind + 组` 查询 `group.depth_dict()`，不要用全局单表**。
+机械组与换热组各自独立；查询用 `group.depth_dict()`，勿用全局单表。
 
 ---
 
-## 8. 换热偏移：`σ` + 全表 `PS` 闭合
+## 8. 非理想节点偏置
 
-> **实现状态**：下列规则描述**旧版**行为，代码在 [`non_ideal_node_offsets_legacy.py`](../core/non_ideal_node_offsets_legacy.py)，待重写后迁回主非理想层或新模块。
+[`apply_combined_offsets`](../core/non_ideal_closed_cycle_layer.py)（非理想层 §6）：单步完成换热 `σ` 与机械 `η_is`。
 
-[`apply_heat_pressure_offsets`](../core/non_ideal_node_offsets_legacy.py)：
+### 8.1 步骤 1：换热 `P`（不闭合）
 
-1. `σ` 取参数 → `self.heat_efficiency` → `config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT`，须在 `(0, 1]`。
-2. 对每个 `heat_groups` 中的节点：
+[`_apply_heat_pressure`](../core/non_ideal_closed_cycle_layer.py)：
 
 ```
-P_non_ideal(v) = P_ideal(v) × σ ** layer(v)
+P_new(v) = P_ideal(v) × σ ** heat_group.layer(v)
 ```
 
-`layer` 由 `group.depth_dict()` 提供；始终以**理想** `P` 为底，避免重复偏移。
+- `σ`：参数 → `layer.heat_efficiency` → `config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT`，`(0, 1]`。
+- **仅写 `P`**；`T/H/S` 保留理想值（步骤 2 需理想 `T`）。
+- 始终以 `ideal_nodes[v].P` 为底。
 
-3. 末尾对 `self.nodes` 中**所有**节点调用 `state("PS", P_new, S)`，把 `T, H` 与新 `P` 自洽（`P,S` 以求解器返回值为准）。
+### 8.2 步骤 2 / 3：机械组
 
-不修改 `ideal_nodes` 与父层 `nodes`。建议先换热、后机械。
+[`_apply_mechanical_group`](../core/non_ideal_closed_cycle_layer.py) 对每个机械组：
 
----
+1. **anchor + `S_base`**（[`_pick_anchor_and_sbase`](../core/non_ideal_closed_cycle_layer.py)）：
+   - 组节点含一级（`parent is None`）→ **步骤 2**：`anchor = min(primaries)`，`S_base = state("TP", T_ideal_anchor, P_new_anchor)["S"]`。
+   - 否则 → **步骤 3**：`anchor = min(layer==0)`，`S_base = nodes[anchor].S`。
+2. **组内 PS 重置**：`state("PS", P_v, S_base)` → 写回 `T,H,S`。
+3. **DFS 机械步**（[`_walk_mechanical_branches`](../core/non_ideal_closed_cycle_layer.py)）：锚点整点不变；不连通节点 `RuntimeWarning`。
 
-## 9. 机械偏移：`PS→η→HP`
+### 8.3 机械步公式
 
-> **实现状态**：同 §8，旧实现见 legacy 模块。
+[`_mechanical_step_known_to_unknown`](../core/non_ideal_closed_cycle_layer.py) 由已知端 `k` 推未知端 `u`：
 
-[`apply_mechanical_isentropic_offsets`](../core/non_ideal_node_offsets_legacy.py)：
+```
+H1 = state("PS", P_u, S_k)["H"]
+```
 
-- `η_is` 取参数 → `self.mechanical_efficiency` → `config.NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT`，须在 `(0, 1]`。
-- **须先**调用 `apply_heat_pressure_offsets()` 让 `P, H` 反映换热后的状态。
-- 对每个机械组：选锚点 → 从锚点 DFS 沿无向支路单向推进 → 每条精简边由已知端推未知端。
+- 压缩（`P_head > P_tail`）：`H2 = (H1 - H_k) / η_is + H_k`
+- 膨胀（`P_head < P_tail`）：`H2 = (H1 - H_k) × η_is + H_k`
+- 等压：`H2 = H_k`
 
-### 9.1 机械锚点决策
-
-[`_pick_mechanical_anchor`](../core/non_ideal_node_offsets_legacy.py)，决策树：
-
-1. 一级节点（`parent is None`）且 ∈ `upstream_special_nodes` → 该一级（并列时 `index` 最小）。一级本来就是熵不动点，且位于 `reach` 最大处。
-2. 否则若 `upstream_special_nodes` 非空 → `min(upstream_special_nodes)`。分叉组中一级在侧枝时退化。
-3. 否则任一一级节点（`index` 最小）。
-4. 否则 `min(v | layer(v) == 0)`。
-5. 仍找不到 → `ValueError`（理论不可达）。
-
-锚点**整点状态不变**。
-
-### 9.2 机械步公式
-
-[`_mechanical_step_known_to_unknown`](../core/non_ideal_node_offsets_legacy.py) 沿一条精简机械边由已知端 `k` 推未知端 `u`：
-
-1. **等熵焓**：在待求端 `P_u` 下沿用已知端熵 `S_k`：
-   ```
-   H1 = state("PS", P_u, S_k)["H"]
-   ```
-2. **真实焓**：按边方向（`P_head` vs `P_tail`，与精简边几何一致）：
-   - 压缩（`P_head > P_tail`）：`H2 = (H1 - H_k) / η_is + H_k`
-   - 膨胀（`P_head < P_tail`）：`H2 = (H1 - H_k) × η_is + H_k`
-   - 等压（容差内相等）：`H2 = H_k`（等熵假设下 `H1 ≡ H_k`）
-3. **闭合**：`state("HP", H2, P_u)` 写回 `T, P, H, S`。非理想状态下 `S` 一般 `≠ S_k`。
-
-### 9.3 支路传播
-
-[`_walk_mechanical_branches`](../core/non_ideal_node_offsets_legacy.py)：
-
-- 对每个机械组建无向邻接表 `(邻居, 边键)`。
-- 从锚点出发，对每个邻居各开一条 DFS 支路；栈中 `(prev, cur)` 表示"已知 prev → 待更新 cur"，仅沿远离锚点方向推进。
-- 每条精简边只被使用一次。
-- 与锚点无向不连通的节点不会被更新，调用方发 `RuntimeWarning`。
+`state("HP", H2, P_u)` 写回；非理想下 `S ≠ S_k`。
 
 ---
 
-## 10. 待办与约束（备忘）
+## 9. 待办与约束（备忘）
 
-- 非理想方程/约束装配、多目标优化器：未实现。
-- 换热网络（HEN）与多热源/多冷源边界耦合：未实现。
-- 当前算法不强约束沿机械边 `ΔS ≥ 0`；大多数物理情况下成立。如需硬约束，可加偏移后校验或切换闭合策略。
-- 每条精简边的效率目前共用 `config` 默认值；按边/按组分别赋值尚未做。
+- 非理想方程/约束装配、优化器：未实现。
+- HEN 边界：未实现。
+- 不强约束机械边 `ΔS ≥ 0`（多数情况自然成立）。
+- `σ` / `η_is` 目前全局默认，未按边/组分别赋值。

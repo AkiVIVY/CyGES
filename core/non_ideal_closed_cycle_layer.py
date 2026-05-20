@@ -1,21 +1,26 @@
-"""闭式循环**非理想层**：理想 ``simplified`` 快照 + 按 ``kind`` 划分的有向连通组与组内深度。
+"""闭式循环**非理想层**：理想 ``simplified`` 快照、有向组、组内深度，以及**单步**节点偏置。
 
 由 ``ClosedCycleLayer.ensure_non_ideal()`` 构造，**不修改**父层 ``nodes`` / ``edges``。父层
 ``analyze_topology()`` / ``commit_*`` 时 ``layer.non_ideal`` 被置 ``None``，已生成的实例仍指向
 ensure 时刻的快照。
 
-``ideal_nodes`` 为 ensure 时刻对父层 ``nodes`` 的只读引用；``nodes`` / 偏移系数字段预留给
-后续新偏移实现。旧版换热/机械节点偏置已迁至
-``core.non_ideal_node_offsets_legacy``（待重写，勿作长期 API）。
+``ideal_nodes`` 为 ensure 时刻对父层 ``nodes`` 的只读引用；首次调用 :func:`apply_combined_offsets`
+时整表拷贝到 ``nodes`` 再写修正量（理想层不变）。
 
-``reach`` / ``layer`` 定义见 ``docs/architecture.md``。
+模块分节：§1 分组 → §2 有向组数据类 → §3 深度 → §4 有向组构造 → §5 快照容器
+``NonIdealClosedCycleLayer`` → §6 节点偏置 ``apply_combined_offsets``。
+
+``reach`` / ``layer`` / 换热 σ / 机械 η_is 公式见 ``docs/architecture.md``。
 """
 
 from __future__ import annotations
 
+import warnings
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Mapping
+
+import config as cyges_config
 
 from core.closed_cycle_layer import Node, SimplifiedEdge, SimplifiedTopology
 from core.fluid_property_solver import FluidPropertySolver
@@ -74,9 +79,46 @@ def partition_simplified_edges_by_kind(
 
     return _components(mech), _components(heat)
 
-
 # ============================================================
-# §2. 组内深度（reach 下游最长路径 / layer 主脊分层）
+# §2. 有向组数据类 `SimplifiedDirectedGroup`
+# ============================================================
+
+
+@dataclass(frozen=True)
+class SimplifiedDirectedGroup:
+    """同 ``kind`` 精简边的一个**无向连通分量**与组内有向层号、最上游特殊节点。
+
+    字段
+    ----
+    - ``kind`` / ``edge_keys``：组类型与本组 ``SM*`` / ``SH*`` 边键集合。
+    - ``node_depth``：``(node_index, layer)`` 元组，按 index 升序；最上游 ``0``，最下游
+      ``max_depth``。
+    - ``upstream_special_nodes``：``reach`` 最大的节点（``frozenset``，允许并列）。
+
+    另一 ``kind`` 的组对同一 ``Node.index`` 可能有不同层号；查询请用 ``depth_dict()``。
+    """
+
+    kind: Literal["mechanical", "heat"]
+    edge_keys: frozenset[str]
+    node_depth: tuple[tuple[int, int], ...]
+    upstream_special_nodes: frozenset[int]
+
+    def depth_dict(self) -> dict[int, int]:
+        """本组内 ``node_index → 层号``（勿与另一 kind 的组混用）。"""
+        return dict(self.node_depth)
+
+    def nodes(self) -> frozenset[int]:
+        """组内作为精简边端点出现的所有 ``Node.index``。"""
+        return frozenset(i for i, _ in self.node_depth)
+
+    @property
+    def max_depth(self) -> int:
+        """组内层号的最大值（最下游）；``node_depth`` 为空时为 ``0``。"""
+        if not self.node_depth:
+            return 0
+        return max(d for _, d in self.node_depth)
+# ============================================================
+# §3. 组内深度（reach 下游最长路径 / layer 主脊分层）
 # ----------------------------------------------------------------
 # 定义与示例详见 docs/architecture.md §有向组与深度。
 # ============================================================
@@ -87,7 +129,7 @@ class GroupDepthMetrics:
     """组内有向深度的中间结果。
 
     - ``reach``：从该点沿 ``tail→head`` 的最长下游路径边数（用于 ``upstream_special_nodes``）。
-    - ``layer``：主脊分层刻度，见 ``docs/architecture.md §7.3``（新偏移实现可复用）。
+    - ``layer``：主脊分层刻度，见 ``docs/architecture.md §7.3``（换热 ``σ^layer`` 等偏置使用）。
     """
 
     reach: dict[int, int]
@@ -208,10 +250,27 @@ def _compute_layer_by_spine(
     if best_start is None:
         best_start = min(nodes)
 
+    # 「能延续到 dist == max_d」的节点集合：仅这些节点是合法的脊路径中继点
+    on_longest: set[int] = set()
+    rev_stack: list[int] = [v for v in nodes if dist[v] == max_d]
+    while rev_stack:
+        v = rev_stack.pop()
+        if v in on_longest:
+            continue
+        on_longest.add(v)
+        for u in rev.get(v, ()):
+            if u not in on_longest:
+                rev_stack.append(u)
+
     spine: list[int] = [best_start]
     cur = best_start
     while dist[cur] < max_d:
-        nxt = min(w for w in adj[cur] if dist[w] == dist[cur] + 1)
+        # 必须挑既递增一层、又能继续走到 max_d 的后继（避免选到岔出的支流）
+        nxt = min(
+            w
+            for w in adj[cur]
+            if dist[w] == dist[cur] + 1 and w in on_longest
+        )
         spine.append(nxt)
         cur = nxt
 
@@ -277,44 +336,8 @@ def compute_group_downstream_depth(
 
 
 # ============================================================
-# §3. 有向组数据类与构造
+# §4. 有向组构造（build_directed_groups*）
 # ============================================================
-
-
-@dataclass(frozen=True)
-class SimplifiedDirectedGroup:
-    """同 ``kind`` 精简边的一个**无向连通分量**与组内有向层号、最上游特殊节点。
-
-    字段
-    ----
-    - ``kind`` / ``edge_keys``：组类型与本组 ``SM*`` / ``SH*`` 边键集合。
-    - ``node_depth``：``(node_index, layer)`` 元组，按 index 升序；最上游 ``0``，最下游
-      ``max_depth``。
-    - ``upstream_special_nodes``：``reach`` 最大的节点（``frozenset``，允许并列）。
-
-    另一 ``kind`` 的组对同一 ``Node.index`` 可能有不同层号；查询请用 ``depth_dict()``。
-    """
-
-    kind: Literal["mechanical", "heat"]
-    edge_keys: frozenset[str]
-    node_depth: tuple[tuple[int, int], ...]
-    upstream_special_nodes: frozenset[int]
-
-    def depth_dict(self) -> dict[int, int]:
-        """本组内 ``node_index → 层号``（勿与另一 kind 的组混用）。"""
-        return dict(self.node_depth)
-
-    def nodes(self) -> frozenset[int]:
-        """组内作为精简边端点出现的所有 ``Node.index``。"""
-        return frozenset(i for i, _ in self.node_depth)
-
-    @property
-    def max_depth(self) -> int:
-        """组内层号的最大值（最下游）；``node_depth`` 为空时为 ``0``。"""
-        if not self.node_depth:
-            return 0
-        return max(d for _, d in self.node_depth)
-
 
 def _directed_groups_from_edge_keys(
     kind: Literal["mechanical", "heat"],
@@ -366,27 +389,29 @@ def build_directed_groups_both(
         _directed_groups_from_edge_keys("mechanical", mech_keys, edges_by_key),
         _directed_groups_from_edge_keys("heat", heat_keys, edges_by_key),
     )
-
-
 # ============================================================
-# §4. 非理想分析容器（节点偏置实现见 non_ideal_node_offsets_legacy）
+# §5. 非理想分析容器
+# ----------------------------------------------------------------
+# 仅持有快照与分组；状态偏移由 §6 :func:`apply_combined_offsets` 完成。
 # ============================================================
 
 
 @dataclass
 class NonIdealClosedCycleLayer:
-    """非理想分析容器（分组/深度快照；节点偏置待新实现）。
+    """非理想分析容器（可变 dataclass，便于挂载偏移结果）。
 
     字段
     ----
     - ``simplified``：ensure 时刻 ``layer.simplified`` 的同一引用（frozen，不可变）。
     - ``mechanical_groups`` / ``heat_groups``：按 ``kind`` 划分的 ``SimplifiedDirectedGroup`` 元组。
     - ``ideal_nodes``：ensure 时刻 ``layer.nodes`` 的只读映射。
-    - ``nodes`` / ``heat_efficiency`` / ``mechanical_efficiency``：预留给新偏移管线。
+    - ``nodes``：首次 :func:`apply_combined_offsets` 时从 ``ideal_nodes`` 拷贝；写非理想状态。
+    - ``heat_efficiency`` / ``mechanical_efficiency``：最近一次偏置采用的 ``σ`` / ``η_is``；
+      未偏置时为 ``None``。
     - ``properties``：与父层相同的物性求解器。
 
-    由 ``from_closed_cycle_layer`` / ``ClosedCycleLayer.ensure_non_ideal()`` 创建。
-    临时沿用旧偏移请 import ``core.non_ideal_node_offsets_legacy``。
+    由 ``from_closed_cycle_layer`` / ``ClosedCycleLayer.ensure_non_ideal()`` 创建；偏置请调用
+    本模块 :func:`apply_combined_offsets`。
     """
 
     simplified: SimplifiedTopology
@@ -417,3 +442,241 @@ class NonIdealClosedCycleLayer:
             ideal_nodes=layer.nodes,
             properties=layer.properties,
         )
+# ============================================================
+# §6. 节点偏置（单步：换热 σ → 机械组 PS 重置 → DFS ``PS→η→HP``）
+# ----------------------------------------------------------------
+# 公式与 anchor 决策见 ``docs/architecture.md`` §8。
+# ============================================================
+
+
+def _pressure_equal(P0: float, P1: float) -> bool:
+    """两个压力是否在相对/绝对容差下视为相等。"""
+    tol = max(1e-9, 1e-6 * max(abs(P0), abs(P1)))
+    return abs(P1 - P0) <= tol
+
+
+def _resolve_efficiency(
+    param: float | None,
+    stored: float | None,
+    default: float,
+    label: str,
+) -> float:
+    """参数 → 实例字段 → config 默认；校验 ``(0, 1]``。"""
+    eta = param if param is not None else (stored if stored is not None else default)
+    if not (0.0 < eta <= 1.0):
+        raise ValueError(f"{label} 须在 (0, 1] 内，收到 {eta!r}")
+    return eta
+
+
+def _ensure_nodes(layer: NonIdealClosedCycleLayer) -> dict[int, Node]:
+    """首次调用时由 ``ideal_nodes`` 整表拷贝出可写 ``nodes`` 表。"""
+    if layer.nodes is None:
+        layer.nodes = {i: replace(n) for i, n in layer.ideal_nodes.items()}
+    return layer.nodes
+
+
+def _apply_heat_pressure(layer: NonIdealClosedCycleLayer, sigma: float) -> None:
+    """**步骤 1**：换热组内 ``P_new = P_ideal × σ ** layer``；仅写 P。
+
+    始终以 ``ideal_nodes[v].P`` 为底，避免重复偏移；不调用 PS 闪蒸，``T/H/S`` 保留理想值，
+    供步骤 2 取一级节点理想 ``T``。
+    """
+    nodes = _ensure_nodes(layer)
+    for group in layer.heat_groups:
+        layers = group.depth_dict()
+        for v in group.nodes():
+            p_ideal = layer.ideal_nodes[v].P
+            p_new = p_ideal * (sigma ** layers[v])
+            nodes[v] = replace(nodes[v], P=p_new)
+
+
+def _pick_anchor_and_sbase(
+    layer: NonIdealClosedCycleLayer,
+    group: SimplifiedDirectedGroup,
+) -> tuple[int, float]:
+    """含一级 → 步骤 2；否则 → 步骤 3。返回 ``(anchor, S_base)``。"""
+    nodes = _ensure_nodes(layer)
+    group_nodes = group.nodes()
+    primaries = sorted(v for v in group_nodes if layer.ideal_nodes[v].parent is None)
+    if primaries:
+        anchor = primaries[0]
+        s_base = layer.properties.state(
+            "TP", layer.ideal_nodes[anchor].T, nodes[anchor].P
+        )["S"]
+        return anchor, s_base
+
+    depths = group.depth_dict()
+    zeros = sorted(v for v in group_nodes if depths.get(v, -1) == 0)
+    if zeros:
+        anchor = zeros[0]
+        return anchor, nodes[anchor].S
+
+    raise ValueError(
+        f"机械有向组 {sorted(group.edge_keys)!r} 既无一级节点也无 layer==0 节点，无法确定 anchor"
+    )
+
+
+def _reset_group_to_base_entropy(
+    layer: NonIdealClosedCycleLayer,
+    group: SimplifiedDirectedGroup,
+    s_base: float,
+) -> None:
+    """**步骤 2/3 共用**：组内每个节点 ``state("PS", P_v, S_base)`` 重置 ``T,H,S``。"""
+    nodes = _ensure_nodes(layer)
+    for v in group.nodes():
+        st = layer.properties.state("PS", nodes[v].P, s_base)
+        nodes[v] = replace(nodes[v], T=st["T"], P=st["P"], H=st["H"], S=st["S"])
+
+
+def _mechanical_step_known_to_unknown(
+    *,
+    nodes: dict[int, Node],
+    properties: FluidPropertySolver,
+    known: int,
+    unknown: int,
+    edge: SimplifiedEdge,
+    eta_is: float,
+) -> None:
+    """沿一条精简机械边由 ``known`` 推 ``unknown``：``PS→η→HP``（见 architecture §8）。"""
+    n_known = nodes[known]
+    n_unknown = nodes[unknown]
+    p_unknown = n_unknown.P
+    h_known = n_known.H
+    s_known = n_known.S
+
+    if edge.tail == known and edge.head == unknown:
+        p_tail, p_head = n_known.P, n_unknown.P
+    elif edge.head == known and edge.tail == unknown:
+        p_tail, p_head = n_unknown.P, n_known.P
+    else:
+        raise ValueError(
+            f"机械边 {edge!r} 的端点 (tail={edge.tail}, head={edge.head}) 与"
+            f"已知/待求 ({known}, {unknown}) 不匹配"
+        )
+
+    if _pressure_equal(p_tail, p_head):
+        h_new = h_known
+    else:
+        h1 = properties.state("PS", p_unknown, s_known)["H"]
+        if p_head > p_tail:
+            h_new = (h1 - h_known) / eta_is + h_known
+        else:
+            h_new = (h1 - h_known) * eta_is + h_known
+
+    st = properties.state("HP", h_new, p_unknown)
+    nodes[unknown] = replace(
+        n_unknown, T=st["T"], P=st["P"], H=st["H"], S=st["S"]
+    )
+
+
+def _walk_mechanical_branches(
+    *,
+    layer: NonIdealClosedCycleLayer,
+    group: SimplifiedDirectedGroup,
+    edges_by_key: dict[str, SimplifiedEdge],
+    anchor: int,
+    eta_is: float,
+) -> set[int]:
+    """从 anchor 沿组内无向邻接 DFS，每条精简边由已知端推未知端。"""
+    nodes = _ensure_nodes(layer)
+    adj: dict[int, list[tuple[int, str]]] = defaultdict(list)
+    for ek in sorted(group.edge_keys):
+        e = edges_by_key[ek]
+        adj[e.tail].append((e.head, ek))
+        adj[e.head].append((e.tail, ek))
+
+    known: set[int] = {anchor}
+    for start_nb, _ in sorted(adj.get(anchor, [])):
+        if start_nb in known:
+            continue
+        stack: list[tuple[int, int]] = [(anchor, start_nb)]
+        while stack:
+            prev, cur = stack.pop()
+            if cur in known:
+                continue
+            edge_key = next(ek for nb, ek in adj[prev] if nb == cur)
+            edge = edges_by_key[edge_key]
+            _mechanical_step_known_to_unknown(
+                nodes=nodes,
+                properties=layer.properties,
+                known=prev,
+                unknown=cur,
+                edge=edge,
+                eta_is=eta_is,
+            )
+            known.add(cur)
+            for nb, _ in sorted(adj[cur]):
+                if nb not in known:
+                    stack.append((cur, nb))
+    return known
+
+
+def _apply_mechanical_group(
+    layer: NonIdealClosedCycleLayer,
+    group: SimplifiedDirectedGroup,
+    edges_by_key: dict[str, SimplifiedEdge],
+    eta_is: float,
+) -> None:
+    """单机械组：选 anchor + ``S_base`` → 组内 PS 重置 → 从 anchor DFS 非理想机械步。"""
+    if not group.edge_keys:
+        return
+    anchor, s_base = _pick_anchor_and_sbase(layer, group)
+    _reset_group_to_base_entropy(layer, group, s_base)
+    known = _walk_mechanical_branches(
+        layer=layer,
+        group=group,
+        edges_by_key=edges_by_key,
+        anchor=anchor,
+        eta_is=eta_is,
+    )
+    missing = group.nodes() - known
+    if missing:
+        warnings.warn(
+            f"机械有向组 {sorted(group.edge_keys)!r} 中节点 {sorted(missing)} "
+            f"与 anchor {anchor} 在无向意义上不连通，已跳过非理想机械步",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def apply_combined_offsets(
+    layer: NonIdealClosedCycleLayer,
+    *,
+    sigma: float | None = None,
+    eta_is: float | None = None,
+) -> NonIdealClosedCycleLayer:
+    """单步骤非理想节点偏置：换热 σ 改 P → 机械组 PS 重置 → 从 anchor DFS 非理想机械步。
+
+    参数
+    ----
+    - ``sigma``：换热总压恢复系数；``None`` → ``layer.heat_efficiency`` →
+      ``config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT``。须在 ``(0, 1]``。
+    - ``eta_is``：机械等熵效率；``None`` → ``layer.mechanical_efficiency`` →
+      ``config.NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT``。须在 ``(0, 1]``。
+
+    返回 ``layer`` 自身（``nodes`` 已写入新状态；``heat_efficiency`` /
+    ``mechanical_efficiency`` 记录本次 ``σ`` / ``η_is``）。不修改 ``ideal_nodes`` 与父层。
+    """
+    sigma_v = _resolve_efficiency(
+        sigma,
+        layer.heat_efficiency,
+        float(cyges_config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT),
+        "换热总压恢复系数 σ",
+    )
+    eta_v = _resolve_efficiency(
+        eta_is,
+        layer.mechanical_efficiency,
+        float(cyges_config.NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT),
+        "机械等熵效率 η_is",
+    )
+
+    _ensure_nodes(layer)
+    _apply_heat_pressure(layer, sigma_v)
+
+    edges_by_key = layer.simplified.edges_dict()
+    for group in layer.mechanical_groups:
+        _apply_mechanical_group(layer, group, edges_by_key, eta_v)
+
+    layer.heat_efficiency = sigma_v
+    layer.mechanical_efficiency = eta_v
+    return layer

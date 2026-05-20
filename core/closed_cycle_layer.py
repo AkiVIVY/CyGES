@@ -13,6 +13,10 @@
 
 算法细节（PS 平面约定、拓扑流水线、子循环模板、链合并规则、流量汇聚）见
 ``docs/architecture.md``。
+
+**分节顺序**与 ``analyze_topology`` 流水线一致：数据模型 → 小工具 → 基础拓扑构建
+（``build_node_edge_topology``）→ 子循环（``build_subcycles``）→ 精简拓扑
+（``build_simplified_topology``）→ ``ClosedCycleLayer``。
 """
 
 from __future__ import annotations
@@ -221,7 +225,243 @@ def _edge_has_nonzero_mass_flow(e: Edge) -> bool:
 
 
 # ============================================================
-# §3. 精简拓扑算法（过滤 + 同类型链合并 + 占位）
+# §3. 基础拓扑构建（轴、节点、定向边、邻槽回写）
+# ============================================================
+
+
+def _attach_edges_to_nodes_ps(nodes: dict[int, Node], edges: dict[str, Edge]) -> dict[int, Node]:
+    """将边键写回各节点 PS 四邻槽。
+
+    机械边沿 P 向上：``tail.edge_up`` / ``head.edge_down``；换热边沿 S 向右：
+    ``tail.edge_right`` / ``head.edge_left``。同槽重复时抛 ``ValueError``。
+    """
+    slot: dict[int, dict[str, str | None]] = {
+        i: {"up": None, "down": None, "left": None, "right": None} for i in nodes
+    }
+
+    def put(ni: int, side: str, ek: str) -> None:
+        cur = slot[ni][side]
+        if cur is not None:
+            raise ValueError(f"node {ni} duplicate {side} edge: {cur!r} and {ek!r}")
+        slot[ni][side] = ek
+
+    for ek, e in edges.items():
+        # 机械：tail 在 head 下方（P 较低）→ tail.edge_up / head.edge_down
+        if e.kind == "mechanical":
+            put(e.tail, "up", ek)
+            put(e.head, "down", ek)
+        else:
+            # 换热：tail 在 head 左侧（S 较低）→ tail.edge_right / head.edge_left
+            put(e.tail, "right", ek)
+            put(e.head, "left", ek)
+
+    return {
+        i: replace(
+            n,
+            edge_up=slot[i]["up"],
+            edge_down=slot[i]["down"],
+            edge_left=slot[i]["left"],
+            edge_right=slot[i]["right"],
+        )
+        for i, n in nodes.items()
+    }
+
+
+def build_axis(min_v: float, max_v: float, quantiles: Sequence[float]) -> list[float]:
+    """由 ``[min_v, max_v]`` 及分位线性插值生成排序后的采样点序列。
+
+    调用方须保证 ``quantiles`` 与端点互不重复；本函数不做去重。
+    """
+    span = max_v - min_v
+    pts = [min_v, max_v, *[min_v + q * span for q in quantiles]]
+    return sorted(pts)
+
+
+def build_node_edge_topology(
+    solver: FluidPropertySolver,
+    inp: ClosedCycleTPInput,
+) -> tuple[dict[int, Node], dict[str, Edge], list[SkippedPoint]]:
+    """一次性生成基础拓扑：一级 TP 网格 → 等熵二级点 → 机械边 ``M*`` → 等压换热边 ``H*`` → 邻槽回写。
+
+    返回 ``(nodes, edges, skipped_points)``；``skipped_points`` 仅供诊断。流水线细节见
+    ``docs/architecture.md §拓扑构建流水线``。
+    """
+
+    def oriented_edge(
+        kind: Literal["mechanical", "heat"],
+        na: Node,
+        nb: Node,
+        *,
+        rtol_p: float = 1e-9,
+        rtol_s: float = 1e-12,
+    ) -> Edge:
+        """在容差下判定 tail→head，使 P、S 沿边非减（PS 平面向上且向右）。"""
+        eps_p = rtol_p * max(1.0, abs(na.P), abs(nb.P))
+        eps_s = rtol_s * max(1.0, abs(na.S), abs(nb.S))
+        a_sw = na.P <= nb.P + eps_p and na.S <= nb.S + eps_s
+        b_sw = nb.P <= na.P + eps_p and nb.S <= na.S + eps_s
+        if a_sw and not b_sw:
+            return Edge(kind=kind, tail=na.index, head=nb.index, mass_flow=None)
+        if b_sw and not a_sw:
+            return Edge(kind=kind, tail=nb.index, head=na.index, mass_flow=None)
+        raise RuntimeError(
+            f"PS 方向不可判定：节点 {na.index!r}/{nb.index!r} 互不严格小于；"
+            "上游算法（机械边按 P 升序成链、换热边按 S 升序分桶）不应抵达此分支"
+        )
+
+    skipped_points: list[SkippedPoint] = []
+
+    # —— 一级 TP 网格：每个 (T,P) 闪蒸得 H,S，失败点记入 skipped_points 不建节点 ——
+    t_list = build_axis(inp.t_min, inp.t_max, inp.t_quantiles)
+    p_list = build_axis(inp.p_min, inp.p_max, inp.p_quantiles)
+    grid: list[Node] = []
+    idx = 0
+    for Tk in t_list:
+        for Pk in p_list:
+            try:
+                st = solver.state("TP", Tk, Pk)
+            except Exception as exc:
+                skipped_points.append(
+                    SkippedPoint(stage="primary_TP", T=Tk, P=Pk, S=None, reason=repr(exc))
+                )
+                continue
+            grid.append(Node(index=idx, T=Tk, P=Pk, H=st["H"], S=st["S"], parent=None))
+            idx += 1
+
+    # —— 二级等熵 + 机械边：沿每个一级点的 S 在压力轴上延伸，同 parent 的二级点按 P 排序连成 M* ——
+    p_axis = build_axis(inp.p_min, inp.p_max, inp.p_quantiles)
+    secondary: list[Node] = []
+    mechanical: dict[str, Edge] = {}
+    m = 0
+    idx = len(grid)
+
+    for prim in grid:
+        batch: list[Node] = []
+        for p2 in p_axis:
+            if abs(p2 - prim.P) < 1e-9 * max(1.0, abs(p2)):
+                continue
+            try:
+                st = solver.state("PS", p2, prim.S)
+                t2 = st["T"]
+            except Exception as exc:
+                skipped_points.append(
+                    SkippedPoint(stage="secondary_PS", T=None, P=p2, S=prim.S, reason=repr(exc))
+                )
+                continue
+            if not (inp.t_min <= t2 <= inp.t_max):
+                continue
+            node = Node(
+                index=idx,
+                T=t2,
+                P=p2,
+                H=st["H"],
+                S=prim.S,
+                parent=prim.index,
+            )
+            secondary.append(node)
+            batch.append(node)
+            idx += 1
+
+        # 一级 + 其二级子点按 P 排序，相邻对生成一条机械边（压缩或膨胀由 P 大小决定方向）
+        chain = sorted([prim, *batch], key=lambda n: (n.P, n.index))
+        for k in range(len(chain) - 1):
+            a, b = chain[k], chain[k + 1]
+            m += 1
+            mechanical[f"M{m}"] = oriented_edge("mechanical", a, b)
+
+    nodes: dict[int, Node] = {}
+    for n in grid:
+        nodes[n.index] = n
+    for n in secondary:
+        nodes[n.index] = n
+
+    # —— 换热边：等压线上按 S 排序，相邻节点连成 H*（沿熵增方向） ——
+    by_p: dict[float, list[Node]] = defaultdict(list)
+    for n in nodes.values():
+        by_p[n.P].append(n)
+    heat: dict[str, Edge] = {}
+    h = 0
+    for lst in by_p.values():
+        lst.sort(key=lambda n: (n.S, n.index))
+        for k in range(len(lst) - 1):
+            a, b = lst[k], lst[k + 1]
+            h += 1
+            heat[f"H{h}"] = oriented_edge("heat", a, b)
+
+    all_edges = {**mechanical, **heat}
+    # 将边键写回各节点 edge_up/down/left/right，供 build_subcycles 沿邻槽走环
+    nodes = _attach_edges_to_nodes_ps(nodes, all_edges)
+    return nodes, all_edges, skipped_points
+
+
+# ============================================================
+# §4. 子循环枚举（最小 4 节点环 / 顺时针模板）
+# ============================================================
+
+
+def build_subcycles(nodes: dict[int, Node], edges: dict[str, Edge]) -> list[SubCycle]:
+    """枚举所有最小 4 节点子循环；同物理单元至多输出一次。
+
+    走法：``edge_up`` → ``edge_right`` → ``edge_down``（取该边 ``tail``） → ``edge_left``（取
+    ``tail``）须回到起点。模板细节见 ``docs/architecture.md §子循环模板``。
+    """
+    seen_cells: set[frozenset[int]] = set()
+    out: list[SubCycle] = []
+
+    for n0 in nodes.values():
+        # 固定走法：左下 n0 → 上 M → 右上 → 右 M → 右下 → 下 H 回到 n0（与 PS 子循环模板一致）
+        ku = n0.edge_up
+        if ku is None:
+            continue
+        e_left = edges[ku]
+        if e_left.kind != "mechanical":
+            continue
+        n1 = nodes[e_left.head]
+        kr = n1.edge_right
+        if kr is None:
+            continue
+        e_top = edges[kr]
+        if e_top.kind != "heat":
+            continue
+        n2 = nodes[e_top.head]
+        kd = n2.edge_down
+        if kd is None:
+            continue
+        e_right = edges[kd]
+        if e_right.kind != "mechanical":
+            continue
+        n3 = nodes[e_right.tail]
+        kl = n3.edge_left
+        if kl is None:
+            continue
+        e_bottom = edges[kl]
+        if e_bottom.kind != "heat":
+            continue
+        if e_bottom.tail != n0.index:
+            continue
+
+        idxs = (n0.index, n1.index, n2.index, n3.index)
+        if len(set(idxs)) != 4:
+            continue
+
+        # 四角集合去重：同一物理单元只输出一个 SubCycle
+        cell = frozenset(idxs)
+        if cell in seen_cells:
+            continue
+        seen_cells.add(cell)
+
+        out.append(
+            SubCycle(
+                nodes=(n0.index, n1.index, n2.index, n3.index),
+                edges=(ku, kr, kd, kl),
+            )
+        )
+
+    return out
+
+
+# ============================================================
+# §5. 精简拓扑算法（过滤 + 同类型链合并 + 占位）
 # ----------------------------------------------------------------
 # 详见 docs/architecture.md §精简拓扑：过滤规则、切分点、方向规范化与 MERGED_ISOLATED_NODE_EDGE_KEY。
 # ============================================================
@@ -556,243 +796,6 @@ def build_simplified_topology(
     )
 
 
-# ============================================================
-# §4. 基础拓扑构建（轴、节点、定向边、邻槽回写）
-# ============================================================
-
-
-def _attach_edges_to_nodes_ps(nodes: dict[int, Node], edges: dict[str, Edge]) -> dict[int, Node]:
-    """将边键写回各节点 PS 四邻槽。
-
-    机械边沿 P 向上：``tail.edge_up`` / ``head.edge_down``；换热边沿 S 向右：
-    ``tail.edge_right`` / ``head.edge_left``。同槽重复时抛 ``ValueError``。
-    """
-    slot: dict[int, dict[str, str | None]] = {
-        i: {"up": None, "down": None, "left": None, "right": None} for i in nodes
-    }
-
-    def put(ni: int, side: str, ek: str) -> None:
-        cur = slot[ni][side]
-        if cur is not None:
-            raise ValueError(f"node {ni} duplicate {side} edge: {cur!r} and {ek!r}")
-        slot[ni][side] = ek
-
-    for ek, e in edges.items():
-        # 机械：tail 在 head 下方（P 较低）→ tail.edge_up / head.edge_down
-        if e.kind == "mechanical":
-            put(e.tail, "up", ek)
-            put(e.head, "down", ek)
-        else:
-            # 换热：tail 在 head 左侧（S 较低）→ tail.edge_right / head.edge_left
-            put(e.tail, "right", ek)
-            put(e.head, "left", ek)
-
-    return {
-        i: replace(
-            n,
-            edge_up=slot[i]["up"],
-            edge_down=slot[i]["down"],
-            edge_left=slot[i]["left"],
-            edge_right=slot[i]["right"],
-        )
-        for i, n in nodes.items()
-    }
-
-
-def build_axis(min_v: float, max_v: float, quantiles: Sequence[float]) -> list[float]:
-    """由 ``[min_v, max_v]`` 及分位线性插值生成排序后的采样点序列。
-
-    调用方须保证 ``quantiles`` 与端点互不重复；本函数不做去重。
-    """
-    span = max_v - min_v
-    pts = [min_v, max_v, *[min_v + q * span for q in quantiles]]
-    return sorted(pts)
-
-
-def build_node_edge_topology(
-    solver: FluidPropertySolver,
-    inp: ClosedCycleTPInput,
-) -> tuple[dict[int, Node], dict[str, Edge], list[SkippedPoint]]:
-    """一次性生成基础拓扑：一级 TP 网格 → 等熵二级点 → 机械边 ``M*`` → 等压换热边 ``H*`` → 邻槽回写。
-
-    返回 ``(nodes, edges, skipped_points)``；``skipped_points`` 仅供诊断。流水线细节见
-    ``docs/architecture.md §拓扑构建流水线``。
-    """
-
-    def oriented_edge(
-        kind: Literal["mechanical", "heat"],
-        na: Node,
-        nb: Node,
-        *,
-        rtol_p: float = 1e-9,
-        rtol_s: float = 1e-12,
-    ) -> Edge:
-        """在容差下判定 tail→head，使 P、S 沿边非减（PS 平面向上且向右）。"""
-        eps_p = rtol_p * max(1.0, abs(na.P), abs(nb.P))
-        eps_s = rtol_s * max(1.0, abs(na.S), abs(nb.S))
-        a_sw = na.P <= nb.P + eps_p and na.S <= nb.S + eps_s
-        b_sw = nb.P <= na.P + eps_p and nb.S <= na.S + eps_s
-        if a_sw and not b_sw:
-            return Edge(kind=kind, tail=na.index, head=nb.index, mass_flow=None)
-        if b_sw and not a_sw:
-            return Edge(kind=kind, tail=nb.index, head=na.index, mass_flow=None)
-        raise RuntimeError(
-            f"PS 方向不可判定：节点 {na.index!r}/{nb.index!r} 互不严格小于；"
-            "上游算法（机械边按 P 升序成链、换热边按 S 升序分桶）不应抵达此分支"
-        )
-
-    skipped_points: list[SkippedPoint] = []
-
-    # —— 一级 TP 网格：每个 (T,P) 闪蒸得 H,S，失败点记入 skipped_points 不建节点 ——
-    t_list = build_axis(inp.t_min, inp.t_max, inp.t_quantiles)
-    p_list = build_axis(inp.p_min, inp.p_max, inp.p_quantiles)
-    grid: list[Node] = []
-    idx = 0
-    for Tk in t_list:
-        for Pk in p_list:
-            try:
-                st = solver.state("TP", Tk, Pk)
-            except Exception as exc:
-                skipped_points.append(
-                    SkippedPoint(stage="primary_TP", T=Tk, P=Pk, S=None, reason=repr(exc))
-                )
-                continue
-            grid.append(Node(index=idx, T=Tk, P=Pk, H=st["H"], S=st["S"], parent=None))
-            idx += 1
-
-    # —— 二级等熵 + 机械边：沿每个一级点的 S 在压力轴上延伸，同 parent 的二级点按 P 排序连成 M* ——
-    p_axis = build_axis(inp.p_min, inp.p_max, inp.p_quantiles)
-    secondary: list[Node] = []
-    mechanical: dict[str, Edge] = {}
-    m = 0
-    idx = len(grid)
-
-    for prim in grid:
-        batch: list[Node] = []
-        for p2 in p_axis:
-            if abs(p2 - prim.P) < 1e-9 * max(1.0, abs(p2)):
-                continue
-            try:
-                st = solver.state("PS", p2, prim.S)
-                t2 = st["T"]
-            except Exception as exc:
-                skipped_points.append(
-                    SkippedPoint(stage="secondary_PS", T=None, P=p2, S=prim.S, reason=repr(exc))
-                )
-                continue
-            if not (inp.t_min <= t2 <= inp.t_max):
-                continue
-            node = Node(
-                index=idx,
-                T=t2,
-                P=p2,
-                H=st["H"],
-                S=prim.S,
-                parent=prim.index,
-            )
-            secondary.append(node)
-            batch.append(node)
-            idx += 1
-
-        # 一级 + 其二级子点按 P 排序，相邻对生成一条机械边（压缩或膨胀由 P 大小决定方向）
-        chain = sorted([prim, *batch], key=lambda n: (n.P, n.index))
-        for k in range(len(chain) - 1):
-            a, b = chain[k], chain[k + 1]
-            m += 1
-            mechanical[f"M{m}"] = oriented_edge("mechanical", a, b)
-
-    nodes: dict[int, Node] = {}
-    for n in grid:
-        nodes[n.index] = n
-    for n in secondary:
-        nodes[n.index] = n
-
-    # —— 换热边：等压线上按 S 排序，相邻节点连成 H*（沿熵增方向） ——
-    by_p: dict[float, list[Node]] = defaultdict(list)
-    for n in nodes.values():
-        by_p[n.P].append(n)
-    heat: dict[str, Edge] = {}
-    h = 0
-    for lst in by_p.values():
-        lst.sort(key=lambda n: (n.S, n.index))
-        for k in range(len(lst) - 1):
-            a, b = lst[k], lst[k + 1]
-            h += 1
-            heat[f"H{h}"] = oriented_edge("heat", a, b)
-
-    all_edges = {**mechanical, **heat}
-    # 将边键写回各节点 edge_up/down/left/right，供 build_subcycles 沿邻槽走环
-    nodes = _attach_edges_to_nodes_ps(nodes, all_edges)
-    return nodes, all_edges, skipped_points
-
-
-# ============================================================
-# §5. 子循环枚举（最小 4 节点环 / 顺时针模板）
-# ============================================================
-
-
-def build_subcycles(nodes: dict[int, Node], edges: dict[str, Edge]) -> list[SubCycle]:
-    """枚举所有最小 4 节点子循环；同物理单元至多输出一次。
-
-    走法：``edge_up`` → ``edge_right`` → ``edge_down``（取该边 ``tail``） → ``edge_left``（取
-    ``tail``）须回到起点。模板细节见 ``docs/architecture.md §子循环模板``。
-    """
-    seen_cells: set[frozenset[int]] = set()
-    out: list[SubCycle] = []
-
-    for n0 in nodes.values():
-        # 固定走法：左下 n0 → 上 M → 右上 → 右 M → 右下 → 下 H 回到 n0（与 PS 子循环模板一致）
-        ku = n0.edge_up
-        if ku is None:
-            continue
-        e_left = edges[ku]
-        if e_left.kind != "mechanical":
-            continue
-        n1 = nodes[e_left.head]
-        kr = n1.edge_right
-        if kr is None:
-            continue
-        e_top = edges[kr]
-        if e_top.kind != "heat":
-            continue
-        n2 = nodes[e_top.head]
-        kd = n2.edge_down
-        if kd is None:
-            continue
-        e_right = edges[kd]
-        if e_right.kind != "mechanical":
-            continue
-        n3 = nodes[e_right.tail]
-        kl = n3.edge_left
-        if kl is None:
-            continue
-        e_bottom = edges[kl]
-        if e_bottom.kind != "heat":
-            continue
-        if e_bottom.tail != n0.index:
-            continue
-
-        idxs = (n0.index, n1.index, n2.index, n3.index)
-        if len(set(idxs)) != 4:
-            continue
-
-        # 四角集合去重：同一物理单元只输出一个 SubCycle
-        cell = frozenset(idxs)
-        if cell in seen_cells:
-            continue
-        seen_cells.add(cell)
-
-        out.append(
-            SubCycle(
-                nodes=(n0.index, n1.index, n2.index, n3.index),
-                edges=(ku, kr, kd, kl),
-            )
-        )
-
-    return out
-
-
-# ============================================================
 # §6. 入口类 ClosedCycleLayer
 # ============================================================
 
