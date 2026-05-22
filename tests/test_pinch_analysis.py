@@ -17,6 +17,7 @@ from core import (
     PinchAnalysisResult,
     ProcessCategory,
     apply_combined_offsets,
+    build_heat_tq_curves,
     compute_cycle_performance,
     compute_pinch,
     resolve_performance_context,
@@ -36,19 +37,20 @@ def _he_wide_input() -> ClosedCycleTPInput:
         p_max=9000.0,
         t_quantiles=(0.3, 0.7),
         p_quantiles=(0.3, 0.7),
-        max_mass_flow=10.0,
+        mass_flow_max=10.0,
     )
 
 
 def _assign_random_subcycle_flows(layer: ClosedCycleLayer, seed: int) -> None:
     n_sc = len(layer.subcycles)
     rng = random.Random(seed)
-    mf = float(layer.input.max_mass_flow)
+    mf_min = float(layer.input.mass_flow_min)
+    mf_max = float(layer.input.mass_flow_max)
     idxs = list(range(n_sc))
     rng.shuffle(idxs)
     n_pick = min(8, max(3, n_sc // 2))
     for j in idxs[:n_pick]:
-        layer.subcycle_mass_flows[j] = round(rng.uniform(0.05 * mf, 0.45 * mf), 3)
+        layer.subcycle_mass_flows[j] = round(rng.uniform(mf_min, mf_max), 3)
     layer.commit_subcycle_mass_flows_to_topology()
 
 
@@ -134,18 +136,21 @@ def test_pinch_analysis_ideal_and_non_ideal() -> None:
     # ── 构建理想层 ──
     layer = ClosedCycleLayer(_he_wide_input())
     _assign_random_subcycle_flows(layer, seed=42)
+    enthalpy_fn = lambda f, T, P: layer.properties.state("TP", T, P)["H"]
 
     # 理想
     snap = NonIdealClosedCycleLayer.from_closed_cycle_layer(layer)
     ideal_ctx = resolve_performance_context(layer, non_ideal=snap)
     ideal_report = compute_cycle_performance(ideal_ctx)
-    ideal_pinch = _run_pinch_on_report(ideal_report.heat_tq_curves, delta_T_min)
+    ideal_tq = build_heat_tq_curves(ideal_report, enthalpy_fn)
+    ideal_pinch = _run_pinch_on_report(ideal_tq, delta_T_min)
 
     # 非理想
     ni = layer.ensure_non_ideal()
     apply_combined_offsets(ni)
     ni_report = compute_cycle_performance(resolve_performance_context(layer))
-    ni_pinch = _run_pinch_on_report(ni_report.heat_tq_curves, delta_T_min)
+    ni_tq = build_heat_tq_curves(ni_report, enthalpy_fn)
+    ni_pinch = _run_pinch_on_report(ni_tq, delta_T_min)
 
     # ── 绘图 ──
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -159,7 +164,7 @@ def test_pinch_analysis_ideal_and_non_ideal() -> None:
         axes[0],
         row_label="ideal",
         rej_curve=ideal_pinch.rejection,
-        abs_curve=next(c for c in ideal_report.heat_tq_curves if c.category == ProcessCategory.HEAT_ABSORPTION),
+        abs_curve=next(c for c in ideal_tq if c.category == ProcessCategory.HEAT_ABSORPTION),
         pinch=ideal_pinch,
     )
 
@@ -168,7 +173,7 @@ def test_pinch_analysis_ideal_and_non_ideal() -> None:
         axes[1],
         row_label="non-ideal",
         rej_curve=ni_pinch.rejection,
-        abs_curve=next(c for c in ni_report.heat_tq_curves if c.category == ProcessCategory.HEAT_ABSORPTION),
+        abs_curve=next(c for c in ni_tq if c.category == ProcessCategory.HEAT_ABSORPTION),
         pinch=ni_pinch,
     )
 

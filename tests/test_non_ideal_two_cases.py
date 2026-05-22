@@ -54,7 +54,7 @@ CASES: tuple[PlotCase, ...] = (
             p_max=9000.0,
             t_quantiles=(0.3, 0.7),
             p_quantiles=(0.3, 0.7),
-            max_mass_flow=10.0,
+            mass_flow_max=10.0,
         ),
         flow_seed=42,
         outfile="non_ideal_offsets_case_a_he_wide.png",
@@ -69,7 +69,7 @@ CASES: tuple[PlotCase, ...] = (
             p_max=7500.0,
             t_quantiles=(0.5,),
             p_quantiles=(0.3, 0.7),
-            max_mass_flow=6.0,
+            mass_flow_max=6.0,
         ),
         flow_seed=2026,
         outfile="non_ideal_offsets_case_b_he_mid_fine.png",
@@ -80,12 +80,13 @@ CASES: tuple[PlotCase, ...] = (
 def _assign_random_subcycle_flows(layer: ClosedCycleLayer, seed: int) -> int:
     n_sc = len(layer.subcycles)
     rng = random.Random(seed)
-    mf = float(layer.input.max_mass_flow)
+    mf_min = float(layer.input.mass_flow_min)
+    mf_max = float(layer.input.mass_flow_max)
     idxs = list(range(n_sc))
     rng.shuffle(idxs)
     n_pick = min(8, max(3, n_sc // 2))
     for j in idxs[:n_pick]:
-        layer.subcycle_mass_flows[j] = round(rng.uniform(0.05 * mf, 0.45 * mf), 3)
+        layer.subcycle_mass_flows[j] = round(rng.uniform(mf_min, mf_max), 3)
     layer.commit_subcycle_mass_flows_to_topology()
     return n_pick
 
@@ -181,7 +182,7 @@ def _plot_case(case: PlotCase, out_dir: Path) -> Path:
     fig.suptitle(
         f"{case.name}\n"
         f"T=[{case.inp.t_min},{case.inp.t_max}] K  P=[{case.inp.p_min},{case.inp.p_max}] kPa  "
-        f"ṁ_max={case.inp.max_mass_flow}  kept={n_kept}  subcycles={n_sc}  flow_seed={case.flow_seed}",
+        f"ṁ∈[{case.inp.mass_flow_min},{case.inp.mass_flow_max}]  kept={n_kept}  subcycles={n_sc}  flow_seed={case.flow_seed}",
         fontsize=9,
         y=1.02,
     )

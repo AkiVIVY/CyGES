@@ -16,8 +16,8 @@ from core import (
     ClosedCycleLayer,
     ClosedCycleTPInput,
     ProcessCategory,
-    ProcessRecord,
     apply_combined_offsets,
+    build_heat_tq_curves,
     compute_cycle_performance,
     resolve_performance_context,
 )
@@ -34,19 +34,20 @@ def _case_a_input() -> ClosedCycleTPInput:
         p_max=9000.0,
         t_quantiles=(0.3, 0.7),
         p_quantiles=(0.3, 0.7),
-        max_mass_flow=10.0,
+        mass_flow_max=10.0,
     )
 
 
 def _assign_random_subcycle_flows(layer: ClosedCycleLayer, seed: int) -> None:
     n_sc = len(layer.subcycles)
     rng = random.Random(seed)
-    mf = float(layer.input.max_mass_flow)
+    mf_min = float(layer.input.mass_flow_min)
+    mf_max = float(layer.input.mass_flow_max)
     idxs = list(range(n_sc))
     rng.shuffle(idxs)
     n_pick = min(8, max(3, n_sc // 2))
     for j in idxs[:n_pick]:
-        layer.subcycle_mass_flows[j] = round(rng.uniform(0.05 * mf, 0.45 * mf), 3)
+        layer.subcycle_mass_flows[j] = round(rng.uniform(mf_min, mf_max), 3)
     layer.commit_subcycle_mass_flows_to_topology()
 
 
@@ -140,7 +141,8 @@ def _plot_case_a_visualization(out_dir: Path) -> Path:
         )
 
     ax2 = axes[2]
-    for curve in report.heat_tq_curves:
+    enthalpy_fn = lambda f, T, P: layer.properties.state("TP", T, P)["H"]
+    for curve in build_heat_tq_curves(report, enthalpy_fn):
         color = "tab:red" if curve.category == ProcessCategory.HEAT_ABSORPTION else "tab:green"
         label = "absorption" if curve.category == ProcessCategory.HEAT_ABSORPTION else "rejection"
         ax2.plot(curve.q_points, curve.t_points, marker="o", color=color, linewidth=2.0, label=label)

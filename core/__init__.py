@@ -42,8 +42,6 @@ from core.non_ideal_bias import (
 from core.cycle_performance import (
     CyclePerformanceReport,
     CycleTotals,
-    EnthalpyLookup,
-    HeatTQCurve,
     NodeStateSnapshot,
     PerformanceContext,
     ProcessCategory,
@@ -52,7 +50,12 @@ from core.cycle_performance import (
     resolve_performance_context,
 )
 from core.postprocess import (
+    EnthalpyLookup,
+    HeatTQCurve,
     PinchAnalysisResult,
+    PinchResult,
+    analyse_pinch,
+    build_heat_tq_curves,
     compute_pinch,
 )
 
@@ -93,5 +96,8 @@ __all__ = [
     "compute_cycle_performance",
     "resolve_performance_context",
     "PinchAnalysisResult",
+    "PinchResult",
+    "analyse_pinch",
+    "build_heat_tq_curves",
     "compute_pinch",
 ]

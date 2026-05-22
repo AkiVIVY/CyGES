@@ -60,12 +60,20 @@ class ClosedCycleTPInput:
     """[0,1] 分位，在 [t_min, t_max] 内线性插值；须互不重复（与端点亦不重复）。"""
     p_quantiles: Sequence[float] = field(default_factory=tuple)
     """[0,1] 分位，在 [p_min, p_max] 内线性插值；须互不重复（与端点亦不重复）。"""
-    max_mass_flow: float | None = None
-    """全层质量流量上界 [kg/s] 等；用于子循环默认流量（系数见根目录 ``config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX``）与量化步长基准。"""
+    mass_flow_min: float = field(
+        default_factory=lambda: float(cyges_config.MASS_FLOW_MIN_DEFAULT)
+    )
+    """全层子循环质量流量下限 [kg/s]；未传入时取 ``config.MASS_FLOW_MIN_DEFAULT``。"""
+    mass_flow_max: float = field(
+        default_factory=lambda: float(cyges_config.MASS_FLOW_MAX_DEFAULT)
+    )
+    """全层子循环质量流量上限 [kg/s]；未传入时取 ``config.MASS_FLOW_MAX_DEFAULT``。"""
     subcycle_mass_flow_step_fraction: float = field(
         default_factory=lambda: float(cyges_config.SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT)
     )
-    """子循环质量流量化步长占 ``max_mass_flow`` 的比例；未传入时取根目录 ``config.SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT``。步长 ``step = subcycle_mass_flow_step_fraction * max_mass_flow``。"""
+    """子循环质量流量化步长占 ``mass_flow_max - mass_flow_min`` 的比例；
+    未传入时取根目录 ``config.SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT``。
+    步长 ``step = subcycle_mass_flow_step_fraction * (mass_flow_max - mass_flow_min)``。"""
 
 
 @dataclass(frozen=True)
@@ -861,12 +869,13 @@ class ClosedCycleLayer:
     def quantize_subcycle_mass_flows(self) -> None:
         """将 ``subcycle_mass_flows`` 就地舍入到 ``step`` 整数倍。
 
-        ``step = subcycle_mass_flow_step_fraction × max_mass_flow``；调用方须保证两者为有效
-        正数（本层不做防御校验）。列表为空时直接返回。
+        ``step = subcycle_mass_flow_step_fraction × (mass_flow_max - mass_flow_min)``；
+        调用方须保证两者为有效正数（本层不做防御校验）。列表为空时直接返回。
         """
-        mf = self.input.max_mass_flow
+        mf_min = self.input.mass_flow_min
+        mf_max = self.input.mass_flow_max
         frac = self.input.subcycle_mass_flow_step_fraction
-        step = frac * mf
+        step = frac * (mf_max - mf_min)
         self.subcycle_mass_flows = [round(x / step) * step for x in self.subcycle_mass_flows]
 
     def sync_subcycle_mass_flows_to_subcycles(self) -> None:
@@ -958,9 +967,9 @@ class ClosedCycleLayer:
         """重建完整拓扑并初始化子循环流量。
 
         ``build_node_edge_topology`` → ``build_subcycles`` → 初值 ``subcycle_mass_flows``
-        （``SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX × max_mass_flow``） → 同步与汇聚 →
-        ``_rebuild_simplified()``。覆盖既有拓扑并清空 ``non_ideal``；无子循环时 ``simplified``
-        为空骨架并 ``warn``。
+        （``mass_flow_min + SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX × (mass_flow_max - mass_flow_min)``）
+        → 同步与汇聚 → ``_rebuild_simplified()``。覆盖既有拓扑并清空 ``non_ideal``；无子循环时
+        ``simplified`` 为空骨架并 ``warn``。
         """
         self._invalidate_non_ideal()
         self.nodes, self.edges, self.skipped_points = build_node_edge_topology(self.properties, self.input)
@@ -970,9 +979,10 @@ class ClosedCycleLayer:
             self.subcycle_mass_flows = []
             self._rebuild_simplified()
             return
-        # 子循环统一初值（系数×max_mass_flow），再同步并汇聚到边，最后生成 simplified
-        mf = self.input.max_mass_flow
-        q0 = cyges_config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * (0.0 if mf is None else float(mf))
+        # 子循环统一初值（mf_min + 系数×(mf_max-mf_min)），再同步并汇聚到边，最后生成 simplified
+        mf_min = self.input.mass_flow_min
+        mf_max = self.input.mass_flow_max
+        q0 = mf_min + cyges_config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * (mf_max - mf_min)
         self.subcycle_mass_flows = [q0] * n
         self.sync_subcycle_mass_flows_to_subcycles()
         self.assign_edge_mass_flows_from_subcycles()

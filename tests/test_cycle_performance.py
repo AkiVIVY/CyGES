@@ -21,6 +21,7 @@ from core import (
     ProcessCategory,
     ProcessRecord,
     apply_combined_offsets,
+    build_heat_tq_curves,
     compute_cycle_performance,
     resolve_performance_context,
 )
@@ -39,19 +40,20 @@ def _he_wide_input() -> ClosedCycleTPInput:
         p_max=9000.0,
         t_quantiles=(0.3, 0.7),
         p_quantiles=(0.3, 0.7),
-        max_mass_flow=10.0,
+        mass_flow_max=10.0,
     )
 
 
 def _assign_random_subcycle_flows(layer: ClosedCycleLayer, seed: int) -> None:
     n_sc = len(layer.subcycles)
     rng = random.Random(seed)
-    mf = float(layer.input.max_mass_flow)
+    mf_min = float(layer.input.mass_flow_min)
+    mf_max = float(layer.input.mass_flow_max)
     idxs = list(range(n_sc))
     rng.shuffle(idxs)
     n_pick = min(8, max(3, n_sc // 2))
     for j in idxs[:n_pick]:
-        layer.subcycle_mass_flows[j] = round(rng.uniform(0.05 * mf, 0.45 * mf), 3)
+        layer.subcycle_mass_flows[j] = round(rng.uniform(mf_min, mf_max), 3)
     layer.commit_subcycle_mass_flows_to_topology()
 
 
@@ -78,9 +80,9 @@ def _signed_power_by_rule(category: ProcessCategory, power_rate: float) -> float
 def _draw_performance_row(
     axes,
     *,
-    layer: ClosedCycleLayer,
     report: CyclePerformanceReport,
     row_label: str,
+    enthalpy_fn,
 ) -> None:
     by_edge = dict(report.by_edge)
     ax_mech, ax_cat, ax_tq = axes
@@ -144,7 +146,7 @@ def _draw_performance_row(
             fontsize=8,
         )
 
-    for curve in report.heat_tq_curves:
+    for curve in build_heat_tq_curves(report, enthalpy_fn):
         color = "tab:red" if curve.category == ProcessCategory.HEAT_ABSORPTION else "tab:green"
         label = "absorption" if curve.category == ProcessCategory.HEAT_ABSORPTION else "rejection"
         ax_tq.plot(curve.q_points, curve.t_points, marker="o", color=color, linewidth=1.8, label=label)
@@ -237,8 +239,10 @@ def test_ideal_and_non_ideal_cycle_totals_same_figure() -> None:
         y=0.98,
     )
 
-    _draw_performance_row(axes[0], layer=layer, report=ideal_report, row_label="ideal")
-    _draw_performance_row(axes[1], layer=layer, report=ni_report, row_label="non-ideal")
+    enthalpy_fn = lambda f, T, P: layer.properties.state("TP", T, P)["H"]
+
+    _draw_performance_row(axes[0], report=ideal_report, row_label="ideal", enthalpy_fn=enthalpy_fn)
+    _draw_performance_row(axes[1], report=ni_report, row_label="non-ideal", enthalpy_fn=enthalpy_fn)
 
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     out = TESTS_DIR / "ideal_vs_non_ideal_cycle_performance.png"

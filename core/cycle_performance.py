@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import warnings
 from collections import defaultdict
-from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Literal, Mapping
@@ -23,10 +22,6 @@ from core.closed_cycle_layer import Node, SimplifiedEdge, SimplifiedTopology
 if TYPE_CHECKING:
     from core.closed_cycle_layer import ClosedCycleLayer
     from core.non_ideal_bias import NonIdealClosedCycleLayer
-
-
-EnthalpyLookup = Callable[[float, float], float]
-"""(T[K], P[kPa]) -> H[kJ/kg]，用于 T-Q 曲线构建时按温压查焓。"""
 
 
 # ============================================================
@@ -65,6 +60,8 @@ class ProcessRecord:
     """单条精简边（``SM*`` / ``SH*``）的性能记录。"""
 
     edge_key: str
+    fluid: str
+    """工质（CoolProp 流体名）。"""
     kind: Literal["mechanical", "heat"]
     category: ProcessCategory
     tail: int
@@ -110,22 +107,8 @@ class CyclePerformanceReport:
     nodes: tuple[tuple[int, NodeStateSnapshot], ...]
     """``kept_nodes`` 上的节点快照（按 index 排序）。"""
     cycle_totals: CycleTotals
-    heat_tq_curves: tuple[HeatTQCurve, ...]
-    """换热 T-Q 折线；含吸热与放热各一条（无对应边则为空）。"""
     skipped_edges: tuple[str, ...]
     """预留：因异常跳过的边键（当前恒空）。"""
-
-
-@dataclass(frozen=True)
-class HeatTQCurve:
-    """单条换热 T-Q 折线（吸热或放热）。"""
-
-    category: ProcessCategory
-    """``HEAT_ABSORPTION`` 或 ``HEAT_REJECTION``。"""
-    q_points: tuple[float, ...]
-    """累积热量 [kW]（从 0 开始逐段累加）。"""
-    t_points: tuple[float, ...]
-    """温度 [K]（与 ``q_points`` 一一对应）。"""
 
 
 @dataclass(frozen=True)
@@ -135,8 +118,8 @@ class PerformanceContext:
     simplified: SimplifiedTopology
     nodes: Mapping[int, Node]
     source: Literal["ideal", "non_ideal"]
-    enthalpy_fn: EnthalpyLookup
-    """``(T, P) → H``，用于构建换热 T-Q 曲线；由 ``resolve_performance_context`` 自动从层属性注入。"""
+    fluid: str
+    """工质（CoolProp 流体名）；由 ``resolve_performance_context`` 自动从层属性注入。"""
 
 
 # ============================================================
@@ -201,79 +184,6 @@ def _power_rate(mass_flow: float | None, delta_H: float) -> float | None:
     return float(mass_flow) * delta_H
 
 
-def _interp_pressure_by_temperature(rec: ProcessRecord, T: float) -> float:
-    """在 ``rec.tail→head`` 的 T 空间线性插值 P，供区间端点 TP 查焓使用。"""
-    t0 = float(rec.tail_state.T)
-    t1 = float(rec.head_state.T)
-    p0 = float(rec.tail_state.P)
-    p1 = float(rec.head_state.P)
-    if abs(t1 - t0) <= 1e-12:
-        return p0
-    alpha = (T - t0) / (t1 - t0)
-    return p0 + alpha * (p1 - p0)
-
-
-def _build_heat_tq_curve(
-    records: list[ProcessRecord],
-    category: ProcessCategory,
-    enthalpy_fn: EnthalpyLookup,
-) -> HeatTQCurve:
-    """按温度节点离散并填充区间能量（TP 查焓），生成单条 T-Q 折线。
-
-    对每条换热过程，在每个重叠温区的两个端点通过 TP 查焓并计算
-    ``dq = |mass_flow| * |h(T_b, P_b) - h(T_a, P_a)|``，各区间累计后得到连续折线；
-    Q 统一按绝对值，曲线位于 ``Q >= 0`` 右半轴。
-    """
-    selected = [rec for rec in records if rec.category == category]
-    if not selected:
-        return HeatTQCurve(category=category, q_points=(0.0,), t_points=(0.0,))
-
-    temp_nodes = sorted(
-        {float(rec.tail_state.T) for rec in selected}
-        | {float(rec.head_state.T) for rec in selected}
-    )
-    if len(temp_nodes) == 1:
-        return HeatTQCurve(
-            category=category,
-            q_points=(0.0,),
-            t_points=(float(temp_nodes[0]),),
-        )
-
-    interval_q = [0.0] * (len(temp_nodes) - 1)
-    for rec in selected:
-        if rec.mass_flow is None:
-            continue
-        m_abs = abs(float(rec.mass_flow))
-        t0 = float(rec.tail_state.T)
-        t1 = float(rec.head_state.T)
-        lo = min(t0, t1)
-        hi = max(t0, t1)
-        if hi - lo <= 1e-12:
-            continue
-        for i in range(len(temp_nodes) - 1):
-            a = temp_nodes[i]
-            b = temp_nodes[i + 1]
-            overlap = max(0.0, min(hi, b) - max(lo, a))
-            if overlap <= 0.0:
-                continue
-            Ta = max(lo, a)
-            Tb = min(hi, b)
-            Pa = _interp_pressure_by_temperature(rec, Ta)
-            Pb = _interp_pressure_by_temperature(rec, Tb)
-            h_a = float(enthalpy_fn(Ta, Pa))
-            h_b = float(enthalpy_fn(Tb, Pb))
-            interval_q[i] += m_abs * abs(h_b - h_a)
-
-    q_points = [0.0]
-    for dq in interval_q:
-        q_points.append(q_points[-1] + dq)
-    return HeatTQCurve(
-        category=category,
-        q_points=tuple(q_points),
-        t_points=tuple(temp_nodes),
-    )
-
-
 # ============================================================
 # §3. 状态解析（理想 / 非理想节点表选取）
 # ============================================================
@@ -289,7 +199,7 @@ def resolve_performance_context(
     - ``simplified``：``non_ideal.simplified``（若传入或挂载）否则 ``layer.simplified``。
     - ``nodes``：若 ``non_ideal.nodes`` 已写入（已 ``apply_combined_offsets``）→ 非理想；
       否则 ``layer.nodes``。
-    - ``enthalpy_fn``：从 ``layer.properties`` 自动构造 ``(T, P) → H``。
+    - ``fluid``：从 ``layer.properties.fluid`` 获取。
     - 流量始终来自 ``SimplifiedEdge.mass_flow``（偏置不改变流量）。
     - 前置：``layer.simplified is not None``。
 
@@ -308,14 +218,14 @@ def resolve_performance_context(
             simplified=simplified,
             nodes=ni.nodes,
             source="non_ideal",
-            enthalpy_fn=lambda T, P: layer.properties.state("TP", T, P)["H"],
+            fluid=layer.properties.fluid,
         )
 
     return PerformanceContext(
         simplified=simplified,
         nodes=layer.nodes,
         source="ideal",
-        enthalpy_fn=lambda T, P: layer.properties.state("TP", T, P)["H"],
+        fluid=layer.properties.fluid,
     )
 
 
@@ -358,6 +268,7 @@ def compute_cycle_performance(ctx: PerformanceContext) -> CyclePerformanceReport
 
         rec = ProcessRecord(
             edge_key=edge_key,
+            fluid=ctx.fluid,
             kind=edge.kind,
             category=category,
             tail=edge.tail,
@@ -400,19 +311,11 @@ def compute_cycle_performance(ctx: PerformanceContext) -> CyclePerformanceReport
         if cat in by_cat
     )
 
-    heat_records = [rec for rec in by_edge.values() if rec.kind == "heat" and rec.power_rate is not None]
-    tq_curves: list[HeatTQCurve] = []
-    for cat in (ProcessCategory.HEAT_ABSORPTION, ProcessCategory.HEAT_REJECTION):
-        curve = _build_heat_tq_curve(heat_records, cat, ctx.enthalpy_fn)
-        if len(curve.q_points) > 1 or curve.t_points[0] != 0.0:
-            tq_curves.append(curve)
-
     return CyclePerformanceReport(
         source=ctx.source,
         by_edge=tuple(sorted(by_edge.items())),
         by_category=by_category_sorted,
         nodes=tuple(sorted(node_snaps.items())),
         cycle_totals=cycle_totals,
-        heat_tq_curves=tuple(tq_curves),
         skipped_edges=(),
     )

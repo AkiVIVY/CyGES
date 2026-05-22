@@ -28,7 +28,7 @@ def test_helium_topology_overview_plot():
         p_max=9000.0,
         t_quantiles=(0.3, 0.7),
         p_quantiles=(0.3, 0.7),
-        max_mass_flow=10.0,
+        mass_flow_max=10.0,
     )
     layer = ClosedCycleLayer(inp)
     primary = [n for n in layer.nodes.values() if n.parent is None]
@@ -36,7 +36,7 @@ def test_helium_topology_overview_plot():
     assert len(primary) >= 1
     assert len(layer.subcycles) >= 1
     n_sc = len(layer.subcycles)
-    default_q = config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * inp.max_mass_flow
+    default_q = inp.mass_flow_min + config.SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * (inp.mass_flow_max - inp.mass_flow_min)
     layer.subcycle_mass_flows[0] = 1.27
     layer.commit_subcycle_mass_flows_to_topology()
     if n_sc >= 2:

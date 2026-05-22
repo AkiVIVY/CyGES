@@ -5,13 +5,22 @@ CyGES 项目级可调数值参数（不含密钥）。
 """
 
 # 子循环质量流在 ``ClosedCycleLayer.analyze_topology`` 中的初值：
-# 每项 = SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * max_mass_flow
-# （``max_mass_flow`` 见 ``ClosedCycleTPInput``；若为 ``None`` 则按 0 参与乘法）
+# 每项 = mass_flow_min + SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * (mass_flow_max - mass_flow_min)
+# （``mass_flow_min`` / ``mass_flow_max`` 见 ``ClosedCycleTPInput``）
 SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX: float = 0.1
 
-# 子循环质量流量化：步长 = subcycle_mass_flow_step_fraction * max_mass_flow；
+# 子循环质量流量化：步长 = subcycle_mass_flow_step_fraction * (mass_flow_max - mass_flow_min)；
 # ``ClosedCycleTPInput`` 未显式传入 ``subcycle_mass_flow_step_fraction`` 时使用本默认值。
 SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT: float = 0.01
+
+# 全层子循环质量流量边界默认值 [kg/s]；``ClosedCycleTPInput`` 未显式传入时使用。
+MASS_FLOW_MIN_DEFAULT: float = -5.0
+MASS_FLOW_MAX_DEFAULT: float = 10.0
+
+# 夹点分析：额外换热曲线截断阈值。
+# ``analyse_pinch`` 中，若额外吸热/放热量占该过程总换热的比例低于此值，
+# 则 ``PinchResult.extra_absorption`` / ``extra_rejection`` 为 ``None``。
+PINCH_EXTRA_CURVE_FRACTION_THRESHOLD: float = 0.01
 
 # 非理想精简「机械边」统一等熵效率 η_is ∈ (0, 1]。
 # 拓扑上 mechanical 边表示叶轮机械工作过程（压缩/膨胀等）；非理想层后续按该 η_is
