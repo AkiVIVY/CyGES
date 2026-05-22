@@ -62,81 +62,6 @@ def _signed_power_by_rule(category: ProcessCategory, power_rate: float) -> float
     return power_rate
 
 
-def _interp_pressure_by_temperature(rec: ProcessRecord, T: float) -> float:
-    """在线性温度参数下插值压力，供区间端点 TP 查焓使用。"""
-    t0 = float(rec.tail_state.T)
-    t1 = float(rec.head_state.T)
-    p0 = float(rec.tail_state.P)
-    p1 = float(rec.head_state.P)
-    if abs(t1 - t0) <= 1e-12:
-        return p0
-    alpha = (T - t0) / (t1 - t0)
-    return p0 + alpha * (p1 - p0)
-
-
-def _build_tq_polyline_by_temperature_nodes(
-    layer: ClosedCycleLayer,
-    heat_records: list[tuple[str, ProcessRecord]],
-    category: ProcessCategory,
-) -> tuple[list[float], list[float]]:
-    """按温度节点离散并填充区间能量（TP 查焓），生成单条连续 T-Q 折线。
-
-    对每条换热过程，在每个重叠温区的两个端点 `(T_a, T_b)` 通过 TP 查焓并计算：
-
-    ``dq = |mass_flow| * |h(T_b, P_b) - h(T_a, P_a)|``
-
-    各区间累计后，得到单条连续折线；Q 统一按绝对值，故曲线位于 ``Q>=0`` 右半轴。
-    """
-    selected = [(ek, rec) for ek, rec in heat_records if rec.category == category]
-    if not selected:
-        return [0.0], [0.0]
-
-    temp_nodes = sorted(
-        {
-            float(rec.tail_state.T)
-            for _, rec in selected
-        }
-        | {
-            float(rec.head_state.T)
-            for _, rec in selected
-        }
-    )
-    if len(temp_nodes) == 1:
-        return [0.0], [temp_nodes[0]]
-
-    interval_q = [0.0] * (len(temp_nodes) - 1)
-    for _, rec in selected:
-        if rec.mass_flow is None:
-            continue
-        m_abs = abs(float(rec.mass_flow))
-        t0 = float(rec.tail_state.T)
-        t1 = float(rec.head_state.T)
-        lo = min(t0, t1)
-        hi = max(t0, t1)
-        width = hi - lo
-        if width <= 1e-12:
-            continue
-        for i in range(len(temp_nodes) - 1):
-            a = temp_nodes[i]
-            b = temp_nodes[i + 1]
-            overlap = max(0.0, min(hi, b) - max(lo, a))
-            if overlap <= 0.0:
-                continue
-            Ta = max(lo, a)
-            Tb = min(hi, b)
-            Pa = _interp_pressure_by_temperature(rec, Ta)
-            Pb = _interp_pressure_by_temperature(rec, Tb)
-            h_a = float(layer.properties.state("TP", Ta, Pa)["H"])
-            h_b = float(layer.properties.state("TP", Tb, Pb)["H"])
-            dq = m_abs * abs(h_b - h_a)
-            interval_q[i] += dq
-
-    q_points = [0.0]
-    for dq in interval_q:
-        q_points.append(q_points[-1] + dq)
-    return q_points, temp_nodes
-
-
 def _plot_case_a_visualization(out_dir: Path) -> Path:
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg")
@@ -178,18 +103,6 @@ def _plot_case_a_visualization(out_dir: Path) -> Path:
             s += _signed_power_by_rule(cat, rec.power_rate)
         cat_sums.append(s)
 
-    heat_records: list[tuple[str, ProcessRecord]] = []
-    for edge_key, rec in sorted(by_edge.items()):
-        if rec.kind == "heat" and rec.power_rate is not None:
-            heat_records.append((edge_key, rec))
-
-    q_abs, t_abs = _build_tq_polyline_by_temperature_nodes(
-        layer, heat_records, ProcessCategory.HEAT_ABSORPTION
-    )
-    q_rej, t_rej = _build_tq_polyline_by_temperature_nodes(
-        layer, heat_records, ProcessCategory.HEAT_REJECTION
-    )
-
     fig, axes = plt.subplots(1, 3, figsize=(17, 5.5))
     fig.suptitle("Case A (non-ideal): process performance visualization", fontsize=10)
 
@@ -227,8 +140,10 @@ def _plot_case_a_visualization(out_dir: Path) -> Path:
         )
 
     ax2 = axes[2]
-    ax2.plot(q_abs, t_abs, marker="o", color="tab:red", linewidth=2.0, label="absorption")
-    ax2.plot(q_rej, t_rej, marker="o", color="tab:green", linewidth=2.0, label="rejection")
+    for curve in report.heat_tq_curves:
+        color = "tab:red" if curve.category == ProcessCategory.HEAT_ABSORPTION else "tab:green"
+        label = "absorption" if curve.category == ProcessCategory.HEAT_ABSORPTION else "rejection"
+        ax2.plot(curve.q_points, curve.t_points, marker="o", color=color, linewidth=2.0, label=label)
     ax2.set_title("Heat-process T-Q (two merged polylines)")
     ax2.set_xlabel("Cumulative |Q| [kW] (per line)")
     ax2.set_ylabel("T [K]")

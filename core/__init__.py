@@ -42,12 +42,18 @@ from core.non_ideal_bias import (
 from core.cycle_performance import (
     CyclePerformanceReport,
     CycleTotals,
+    EnthalpyLookup,
+    HeatTQCurve,
     NodeStateSnapshot,
     PerformanceContext,
     ProcessCategory,
     ProcessRecord,
     compute_cycle_performance,
     resolve_performance_context,
+)
+from core.postprocess import (
+    PinchAnalysisResult,
+    compute_pinch,
 )
 
 __all__ = [
@@ -79,10 +85,13 @@ __all__ = [
     "apply_combined_offsets",
     "CyclePerformanceReport",
     "CycleTotals",
+    "HeatTQCurve",
     "NodeStateSnapshot",
     "PerformanceContext",
     "ProcessCategory",
     "ProcessRecord",
     "compute_cycle_performance",
     "resolve_performance_context",
+    "PinchAnalysisResult",
+    "compute_pinch",
 ]

@@ -75,64 +75,6 @@ def _signed_power_by_rule(category: ProcessCategory, power_rate: float) -> float
     return power_rate
 
 
-def _interp_pressure_by_temperature(rec: ProcessRecord, T: float) -> float:
-    t0 = float(rec.tail_state.T)
-    t1 = float(rec.head_state.T)
-    p0 = float(rec.tail_state.P)
-    p1 = float(rec.head_state.P)
-    if abs(t1 - t0) <= 1e-12:
-        return p0
-    alpha = (T - t0) / (t1 - t0)
-    return p0 + alpha * (p1 - p0)
-
-
-def _build_tq_polyline_by_temperature_nodes(
-    layer: ClosedCycleLayer,
-    heat_records: list[tuple[str, ProcessRecord]],
-    category: ProcessCategory,
-) -> tuple[list[float], list[float]]:
-    selected = [(ek, rec) for ek, rec in heat_records if rec.category == category]
-    if not selected:
-        return [0.0], [0.0]
-
-    temp_nodes = sorted(
-        {float(rec.tail_state.T) for _, rec in selected}
-        | {float(rec.head_state.T) for _, rec in selected}
-    )
-    if len(temp_nodes) == 1:
-        return [0.0], [temp_nodes[0]]
-
-    interval_q = [0.0] * (len(temp_nodes) - 1)
-    for _, rec in selected:
-        if rec.mass_flow is None:
-            continue
-        m_abs = abs(float(rec.mass_flow))
-        t0 = float(rec.tail_state.T)
-        t1 = float(rec.head_state.T)
-        lo = min(t0, t1)
-        hi = max(t0, t1)
-        if hi - lo <= 1e-12:
-            continue
-        for i in range(len(temp_nodes) - 1):
-            a = temp_nodes[i]
-            b = temp_nodes[i + 1]
-            overlap = max(0.0, min(hi, b) - max(lo, a))
-            if overlap <= 0.0:
-                continue
-            Ta = max(lo, a)
-            Tb = min(hi, b)
-            Pa = _interp_pressure_by_temperature(rec, Ta)
-            Pb = _interp_pressure_by_temperature(rec, Tb)
-            h_a = float(layer.properties.state("TP", Ta, Pa)["H"])
-            h_b = float(layer.properties.state("TP", Tb, Pb)["H"])
-            interval_q[i] += m_abs * abs(h_b - h_a)
-
-    q_points = [0.0]
-    for dq in interval_q:
-        q_points.append(q_points[-1] + dq)
-    return q_points, temp_nodes
-
-
 def _draw_performance_row(
     axes,
     *,
@@ -202,19 +144,10 @@ def _draw_performance_row(
             fontsize=8,
         )
 
-    heat_records = [
-        (ek, rec)
-        for ek, rec in sorted(by_edge.items())
-        if rec.kind == "heat" and rec.power_rate is not None
-    ]
-    q_abs, t_abs = _build_tq_polyline_by_temperature_nodes(
-        layer, heat_records, ProcessCategory.HEAT_ABSORPTION
-    )
-    q_rej, t_rej = _build_tq_polyline_by_temperature_nodes(
-        layer, heat_records, ProcessCategory.HEAT_REJECTION
-    )
-    ax_tq.plot(q_abs, t_abs, marker="o", color="tab:red", linewidth=1.8, label="absorption")
-    ax_tq.plot(q_rej, t_rej, marker="o", color="tab:green", linewidth=1.8, label="rejection")
+    for curve in report.heat_tq_curves:
+        color = "tab:red" if curve.category == ProcessCategory.HEAT_ABSORPTION else "tab:green"
+        label = "absorption" if curve.category == ProcessCategory.HEAT_ABSORPTION else "rejection"
+        ax_tq.plot(curve.q_points, curve.t_points, marker="o", color=color, linewidth=1.8, label=label)
     ax_tq.set_title(f"{row_label}: heat T-Q")
     ax_tq.set_xlabel("Cumulative |Q| [kW]")
     ax_tq.set_ylabel("T [K]")
