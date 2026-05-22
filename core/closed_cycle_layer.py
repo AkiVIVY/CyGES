@@ -2,7 +2,7 @@
 闭式循环**理想层**：离散 TP/PS 拓扑、子循环流量、活跃子图精简，并为非理想层提供基准。
 
 ``ClosedCycleLayer`` 持有 ``nodes`` / ``edges`` / ``subcycles`` 与 ``simplified``；不实现非理想效率
-或状态偏移，后者由 :mod:`core.non_ideal_closed_cycle_layer` 在 ``ensure_non_ideal()`` 时快照
+或状态偏移，后者由 :mod:`core.non_ideal_bias` 在 ``ensure_non_ideal()`` 时快照
 ``simplified`` 后承接。
 
 失效语义：``analyze_topology()`` 与 ``commit_subcycle_mass_flows_to_topology()`` 会重建
@@ -28,9 +28,9 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, Sequence
 
 if TYPE_CHECKING:
-    # 仅类型检查导入，避免与 non_ideal_closed_cycle_layer（反向 import 本模块）循环依赖；
+    # 仅类型检查导入，避免与 non_ideal_bias（反向 import 本模块）循环依赖；
     # 运行时 ``ensure_non_ideal()`` 内再延迟 import 并构造实例。
-    from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer
+    from core.non_ideal_bias import NonIdealClosedCycleLayer
 
 import config as cyges_config
 
@@ -934,14 +934,25 @@ class ClosedCycleLayer:
     def ensure_non_ideal(self) -> NonIdealClosedCycleLayer:
         """创建或返回 ``non_ideal`` 快照层；不修改理想层字段。
 
-        要求 ``self.simplified`` 已生成。节点偏置待新实现；临时可 import
-        ``core.non_ideal_node_offsets_legacy`` 中的 ``apply_*`` 函数。
+        要求 ``self.simplified`` 已生成。
         """
-        from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer
+        from core.non_ideal_bias import NonIdealClosedCycleLayer
 
         if self.non_ideal is None:
             self.non_ideal = NonIdealClosedCycleLayer.from_closed_cycle_layer(self)
         return self.non_ideal
+
+    def performance_report(self):
+        """精简拓扑性能统计；非理想偏置已写入时采用非理想节点状态。
+
+        委托 :mod:`core.cycle_performance`；不缓存结果。
+        """
+        from core.cycle_performance import (
+            compute_cycle_performance,
+            resolve_performance_context,
+        )
+
+        return compute_cycle_performance(resolve_performance_context(self))
 
     def analyze_topology(self) -> None:
         """重建完整拓扑并初始化子循环流量。

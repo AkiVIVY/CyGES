@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput, Node, SimplifiedTopology
-from core.non_ideal_closed_cycle_layer import NonIdealClosedCycleLayer, apply_combined_offsets
+from core.non_ideal_bias import NonIdealClosedCycleLayer, apply_combined_offsets
 
 
 @dataclass(frozen=True)
@@ -85,7 +85,7 @@ def _assign_random_subcycle_flows(layer: ClosedCycleLayer, seed: int) -> int:
     rng.shuffle(idxs)
     n_pick = min(8, max(3, n_sc // 2))
     for j in idxs[:n_pick]:
-        layer.subcycle_mass_flows[j] = round(rng.uniform(-0.45 * mf, 0.45 * mf), 3)
+        layer.subcycle_mass_flows[j] = round(rng.uniform(0.05 * mf, 0.45 * mf), 3)
     layer.commit_subcycle_mass_flows_to_topology()
     return n_pick
 

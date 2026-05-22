@@ -20,16 +20,19 @@ flowchart TD
     simplified --> ensure[ensure_non_ideal]
     ensure --> ni[NonIdealClosedCycleLayer]
     ni --> off[apply_combined_offsets]
+    off --> perf[compute_cycle_performance]
+    simp --> perf
 ```
 
-**失效语义**：`analyze_topology()` 与 `commit_subcycle_mass_flows_to_topology()` 末尾重建 `simplified` 并置 `non_ideal = None`。须在理想层流量稳定后再 `ensure_non_ideal()`。
+**失效语义**：`analyze_topology()` 与 `commit_subcycle_mass_flows_to_topology()` 末尾重建 `simplified` 并置 `non_ideal = None`。须在理想层流量稳定后再 `ensure_non_ideal()`。性能统计为只读第三层，不参与上述失效链。
 
 **代码分节**（与阅读顺序一致）：
 
 | 模块 | 分节 |
 |------|------|
 | [`closed_cycle_layer.py`](../core/closed_cycle_layer.py) | §1 模型 → §2 小工具 → §3 拓扑构建 → §4 子循环 → §5 精简 → §6 入口类 |
-| [`non_ideal_closed_cycle_layer.py`](../core/non_ideal_closed_cycle_layer.py) | §1 分组 → §2 数据类 → §3 深度 → §4 组构造 → §5 容器 → §6 偏置 |
+| [`non_ideal_bias.py`](../core/non_ideal_bias.py) | §1 分组 → §2 数据类 → §3 深度 → §4 组构造 → §5 容器 → §6 偏置 |
+| [`cycle_performance.py`](../core/cycle_performance.py) | §1 数据模型 → §2 判据小工具 → §3 状态解析 → §4 统计计算 |
 
 ---
 
@@ -124,20 +127,20 @@ flowchart TD
 
 ## 7. 有向组与深度
 
-[`SimplifiedDirectedGroup`](../core/non_ideal_closed_cycle_layer.py)（非理想层 §2）：同 `kind`、无向连通的一组精简边。深度只在组内有意义。
+[`SimplifiedDirectedGroup`](../core/non_ideal_bias.py)（非理想层 §2）：同 `kind`、无向连通的一组精简边。深度只在组内有意义。
 
 ### 7.1 分组与邻接
 
-- [`partition_simplified_edges_by_kind`](../core/non_ideal_closed_cycle_layer.py)（§1）：并查集按无向连通分量分组。
-- [`_group_adjacency`](../core/non_ideal_closed_cycle_layer.py)（§3）：组内 `tail→head` 有向邻接。
+- [`partition_simplified_edges_by_kind`](../core/non_ideal_bias.py)（§1）：并查集按无向连通分量分组。
+- [`_group_adjacency`](../core/non_ideal_bias.py)（§3）：组内 `tail→head` 有向邻接。
 
 ### 7.2 `reach`
 
-[`compute_group_downstream_reach`](../core/non_ideal_closed_cycle_layer.py)：`reach(v)` = 沿 `tail→head` 最长下游路径边数；无出边为 `0`；有向环 → `ValueError`。`upstream_special_nodes = argmax(reach)`（`frozenset`，可并列）。
+[`compute_group_downstream_reach`](../core/non_ideal_bias.py)：`reach(v)` = 沿 `tail→head` 最长下游路径边数；无出边为 `0`；有向环 → `ValueError`。`upstream_special_nodes = argmax(reach)`（`frozenset`，可并列）。
 
 ### 7.3 `layer`：主脊分层
 
-[`_compute_layer_by_spine`](../core/non_ideal_closed_cycle_layer.py)（§3）：
+[`_compute_layer_by_spine`](../core/non_ideal_bias.py)（§3）：
 
 1. Kahn + DP 得 `dist(v)` = 从任一源点到 `v` 的最长有向路径边数。
 2. 在 `dist(end)=max(dist)` 的终点上回溯最长路径起点；**并列取 index 最小**。
@@ -159,11 +162,11 @@ flowchart TD
 
 ## 8. 非理想节点偏置
 
-[`apply_combined_offsets`](../core/non_ideal_closed_cycle_layer.py)（非理想层 §6）：单步完成换热 `σ` 与机械 `η_is`。
+[`apply_combined_offsets`](../core/non_ideal_bias.py)（非理想层 §6）：单步完成换热 `σ` 与机械 `η_is`。
 
 ### 8.1 步骤 1：换热 `P`（不闭合）
 
-[`_apply_heat_pressure`](../core/non_ideal_closed_cycle_layer.py)：
+[`_apply_heat_pressure`](../core/non_ideal_bias.py)：
 
 ```
 P_new(v) = P_ideal(v) × σ ** heat_group.layer(v)
@@ -175,17 +178,17 @@ P_new(v) = P_ideal(v) × σ ** heat_group.layer(v)
 
 ### 8.2 步骤 2 / 3：机械组
 
-[`_apply_mechanical_group`](../core/non_ideal_closed_cycle_layer.py) 对每个机械组：
+[`_apply_mechanical_group`](../core/non_ideal_bias.py) 对每个机械组：
 
-1. **anchor + `S_base`**（[`_pick_anchor_and_sbase`](../core/non_ideal_closed_cycle_layer.py)）：
+1. **anchor + `S_base`**（[`_pick_anchor_and_sbase`](../core/non_ideal_bias.py)）：
    - 组节点含一级（`parent is None`）→ **步骤 2**：`anchor = min(primaries)`，`S_base = state("TP", T_ideal_anchor, P_new_anchor)["S"]`。
    - 否则 → **步骤 3**：`anchor = min(layer==0)`，`S_base = nodes[anchor].S`。
 2. **组内 PS 重置**：`state("PS", P_v, S_base)` → 写回 `T,H,S`。
-3. **DFS 机械步**（[`_walk_mechanical_branches`](../core/non_ideal_closed_cycle_layer.py)）：锚点整点不变；不连通节点 `RuntimeWarning`。
+3. **DFS 机械步**（[`_walk_mechanical_branches`](../core/non_ideal_bias.py)）：锚点整点不变；不连通节点 `RuntimeWarning`。
 
 ### 8.3 机械步公式
 
-[`_mechanical_step_known_to_unknown`](../core/non_ideal_closed_cycle_layer.py) 由已知端 `k` 推未知端 `u`：
+[`_mechanical_step_known_to_unknown`](../core/non_ideal_bias.py) 由已知端 `k` 推未知端 `u`：
 
 ```
 H1 = state("PS", P_u, S_k)["H"]
@@ -199,7 +202,47 @@ H1 = state("PS", P_u, S_k)["H"]
 
 ---
 
-## 9. 待办与约束（备忘）
+## 10. 精简过程性能统计
+
+[`cycle_performance.py`](../core/cycle_performance.py)（只读第三层）：在 `SimplifiedTopology` 与节点状态上推导过程归类与循环汇总；不修改拓扑。
+
+### 10.1 状态来源
+
+[`resolve_performance_context`](../core/cycle_performance.py)：
+
+- `simplified`：`non_ideal.simplified`（若传入或挂载）否则 `layer.simplified`。
+- `nodes`：若 `non_ideal.nodes` 已写入（已 `apply_combined_offsets`）→ **非理想**；否则 **理想** `layer.nodes`。
+- 流量始终来自 `SimplifiedEdge.mass_flow`（偏置不改变流量）。
+
+[`ClosedCycleLayer.performance_report()`](../core/closed_cycle_layer.py) 为薄封装，不缓存结果。
+
+### 10.2 过程归类（沿 `tail→head`）
+
+| 类别 | 判定 | 记录字段 |
+|------|------|----------|
+| 压缩 | `kind==mechanical` 且 `P_head > P_tail` | `mass_flow`、端点 `T,H`、``power_rate = ṁ·ΔH`` |
+| 膨胀 | `kind==mechanical` 且 `P_head < P_tail` | 同上 |
+| 吸热 | `kind==heat` 且 `H_head > H_tail` | `mass_flow`、起始/终止 `T,H`、``power_rate = ṁ·ΔH`` |
+| 放热 | `kind==heat` 且 `H_head < H_tail` | 同上 |
+| 等压机械 | `kind==mechanical` 且 `P_head ≈ P_tail` | 同上；计入机械汇总 |
+
+其中 ``ΔH = H_head - H_tail`` [kJ/kg]；``power_rate`` [kW] 在 `mass_flow` 为 `None` 时为 `None`。
+
+符号约定：沿工质流动方向，``power_rate > 0`` 表示对该控制体**输入** enthalpy flow（压缩、吸热为正；膨胀、放热为负）。
+
+### 10.3 循环汇总
+
+[`CycleTotals`](../core/cycle_performance.py)：
+
+- `net_mechanical_power`：所有机械边 `power_rate` 之和。
+- `net_heat_rate`：所有换热边 `power_rate` 之和。
+- `compression_power` / `expansion_power` / `heat_absorption_rate` / `heat_rejection_rate`：按类别子集求和。
+
+统计范围仅 `kept_nodes` 与 `simplified_edges`；`merged_into` 中间点不重复计功/热。
+
+---
+
+## 11. 待办与约束（备忘）
 
 - 非理想方程/约束装配、优化器：未实现。
 - HEN 边界：未实现。

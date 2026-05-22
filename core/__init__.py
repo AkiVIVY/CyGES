@@ -29,7 +29,7 @@ from core.fluid_property_solver import (
     PropertyPair,
     ThermoStateTPHS,
 )
-from core.non_ideal_closed_cycle_layer import (
+from core.non_ideal_bias import (
     GroupDepthMetrics,
     NonIdealClosedCycleLayer,
     SimplifiedDirectedGroup,
@@ -38,6 +38,16 @@ from core.non_ideal_closed_cycle_layer import (
     compute_group_downstream_depth,
     compute_group_downstream_reach,
     partition_simplified_edges_by_kind,
+)
+from core.cycle_performance import (
+    CyclePerformanceReport,
+    CycleTotals,
+    NodeStateSnapshot,
+    PerformanceContext,
+    ProcessCategory,
+    ProcessRecord,
+    compute_cycle_performance,
+    resolve_performance_context,
 )
 
 __all__ = [
@@ -67,4 +77,12 @@ __all__ = [
     "build_simplified_topology",
     "filter_topology_for_non_ideal",
     "apply_combined_offsets",
+    "CyclePerformanceReport",
+    "CycleTotals",
+    "NodeStateSnapshot",
+    "PerformanceContext",
+    "ProcessCategory",
+    "ProcessRecord",
+    "compute_cycle_performance",
+    "resolve_performance_context",
 ]

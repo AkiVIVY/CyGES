@@ -1,4 +1,4 @@
-"""闭式循环**非理想层**：理想 ``simplified`` 快照、有向组、组内深度，以及**单步**节点偏置。
+"""闭式循环**非理想偏置**（``core.non_ideal_bias``）：理想 ``simplified`` 快照、有向组、组内深度，以及**单步**节点偏置。
 
 由 ``ClosedCycleLayer.ensure_non_ideal()`` 构造，**不修改**父层 ``nodes`` / ``edges``。父层
 ``analyze_topology()`` / ``commit_*`` 时 ``layer.non_ideal`` 被置 ``None``，已生成的实例仍指向

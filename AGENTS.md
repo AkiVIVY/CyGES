@@ -21,7 +21,8 @@
 **已实现**
 
 - 理想层：PS 离散拓扑、最小 4 节点子循环、子循环流量、活跃子图精简（[`closed_cycle_layer.py`](core/closed_cycle_layer.py)）。
-- 非理想层：有向组、组内 `reach` / `layer`（主脊分层）、单步 [`apply_combined_offsets`](core/non_ideal_closed_cycle_layer.py)（换热 `σ` → 机械组 PS 重置 → DFS `PS→η→HP`）。
+- 非理想偏置：有向组、组内 `reach` / `layer`（主脊分层）、单步 [`apply_combined_offsets`](core/non_ideal_bias.py)（换热 `σ` → 机械组 PS 重置 → DFS `PS→η→HP`）。
+- 性能统计：精简边过程归类与循环汇总（[`cycle_performance.py`](core/cycle_performance.py)）；[`ClosedCycleLayer.performance_report()`](core/closed_cycle_layer.py) 为薄封装。
 - 物性：CoolProp，`state("TP"|"PS"|"HP"|"HS", x, y)`。
 
 **未实现**（勿写进 README 为已完成）
@@ -40,9 +41,13 @@
 
 典型流水线：`analyze_topology` = `build_node_edge_topology` → `build_subcycles` → 初值流量 → 汇聚 → `_rebuild_simplified`。
 
-### [`core/non_ideal_closed_cycle_layer.py`](core/non_ideal_closed_cycle_layer.py)（非理想层）
+### [`core/non_ideal_bias.py`](core/non_ideal_bias.py)（非理想偏置）
 
 §1 分组 → §2 `SimplifiedDirectedGroup` → §3 深度 → §4 `build_directed_groups*` → §5 `NonIdealClosedCycleLayer` → §6 `apply_combined_offsets`。
+
+### [`core/cycle_performance.py`](core/cycle_performance.py)（性能统计）
+
+§1 数据模型 → §2 判据小工具 → §3 状态解析 → §4 统计计算。只读；不参与 analyze/commit 失效链。公式见 architecture §10。
 
 ---
 
@@ -76,6 +81,7 @@
 |------|------|
 | [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 理想 He 拓扑绘图 |
 | [`tests/test_non_ideal_two_cases.py`](tests/test_non_ideal_two_cases.py) | 非理想 Case A / B 两工况绘图 |
+| [`tests/test_cycle_performance.py`](tests/test_cycle_performance.py) | 精简过程性能统计；理想/非理想 3×2 对比图（机械柱、四类合计、T-Q） |
 
 勿恢复已删的单元测试（layer spine、combined_offsets 断言、旧单工况 non_ideal plot）除非用户明确要求。
 
