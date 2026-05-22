@@ -22,7 +22,8 @@
 
 - 理想层：PS 离散拓扑、最小 4 节点子循环、子循环流量、活跃子图精简（[`closed_cycle_layer.py`](core/closed_cycle_layer.py)）。
 - 非理想偏置：有向组、组内 `reach` / `layer`（主脊分层）、单步 [`apply_combined_offsets`](core/non_ideal_bias.py)（换热 `σ` → 机械组 PS 重置 → DFS `PS→η→HP`）。
-- 性能统计：精简边过程归类与循环汇总（[`cycle_performance.py`](core/cycle_performance.py)）；[`ClosedCycleLayer.performance_report()`](core/closed_cycle_layer.py) 为薄封装。
+- 性能统计：精简边过程归类、T-Q 换热曲线构建与循环汇总（[`cycle_performance.py`](core/cycle_performance.py)）；[`ClosedCycleLayer.performance_report()`](core/closed_cycle_layer.py) 为薄封装。
+- 夹点分析：放热/吸热曲线平移、δQ 求解、重叠/非重叠区段分离（[`postprocess.py`](core/postprocess.py)）。
 - 物性：CoolProp，`state("TP"|"PS"|"HP"|"HS", x, y)`。
 
 **未实现**（勿写进 README 为已完成）
@@ -47,7 +48,11 @@
 
 ### [`core/cycle_performance.py`](core/cycle_performance.py)（性能统计）
 
-§1 数据模型 → §2 判据小工具 → §3 状态解析 → §4 统计计算。只读；不参与 analyze/commit 失效链。公式见 architecture §10。
+§1 数据模型 → §2 判据小工具 → §3 状态解析 → §4 统计计算（含 T-Q 曲线构建）。只读；不参与 analyze/commit 失效链。公式见 architecture §10。
+
+### [`core/postprocess.py`](core/postprocess.py)（二次处理）
+
+§1 数据模型 → §2 曲线插值与采样 → §3 夹点计算。在 ``HeatTQCurve`` 上做放热/吸热平移、夹点定位与区段分离。公式见 architecture §11。
 
 ---
 
@@ -82,6 +87,8 @@
 | [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 理想 He 拓扑绘图 |
 | [`tests/test_non_ideal_two_cases.py`](tests/test_non_ideal_two_cases.py) | 非理想 Case A / B 两工况绘图 |
 | [`tests/test_cycle_performance.py`](tests/test_cycle_performance.py) | 精简过程性能统计；理想/非理想 3×2 对比图（机械柱、四类合计、T-Q） |
+| [`tests/test_cycle_performance_visualization.py`](tests/test_cycle_performance_visualization.py) | 非理想单工况性能可视化；机械柱、四类合计、T-Q 折线 |
+| [`tests/test_pinch_analysis.py`](tests/test_pinch_analysis.py) | 夹点分析；理想/非理想 2×2 对比图（平移前/后，夹点标记） |
 
 勿恢复已删的单元测试（layer spine、combined_offsets 断言、旧单工况 non_ideal plot）除非用户明确要求。
 

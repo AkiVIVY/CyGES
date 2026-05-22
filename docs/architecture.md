@@ -22,6 +22,8 @@ flowchart TD
     ni --> off[apply_combined_offsets]
     off --> perf[compute_cycle_performance]
     simp --> perf
+    perf --> report[CyclePerformanceReport]
+    report --> pinch[compute_pinch]
 ```
 
 **失效语义**：`analyze_topology()` 与 `commit_subcycle_mass_flows_to_topology()` 末尾重建 `simplified` 并置 `non_ideal = None`。须在理想层流量稳定后再 `ensure_non_ideal()`。性能统计为只读第三层，不参与上述失效链。
@@ -32,7 +34,8 @@ flowchart TD
 |------|------|
 | [`closed_cycle_layer.py`](../core/closed_cycle_layer.py) | §1 模型 → §2 小工具 → §3 拓扑构建 → §4 子循环 → §5 精简 → §6 入口类 |
 | [`non_ideal_bias.py`](../core/non_ideal_bias.py) | §1 分组 → §2 数据类 → §3 深度 → §4 组构造 → §5 容器 → §6 偏置 |
-| [`cycle_performance.py`](../core/cycle_performance.py) | §1 数据模型 → §2 判据小工具 → §3 状态解析 → §4 统计计算 |
+| [`cycle_performance.py`](../core/cycle_performance.py) | §1 数据模型 → §2 判据小工具 → §3 状态解析 → §4 统计计算（含 T-Q 曲线） |
+| [`postprocess.py`](../core/postprocess.py) | §1 数据模型 → §2 曲线插值与采样 → §3 夹点计算 |
 
 ---
 
@@ -204,7 +207,7 @@ H1 = state("PS", P_u, S_k)["H"]
 
 ## 10. 精简过程性能统计
 
-[`cycle_performance.py`](../core/cycle_performance.py)（只读第三层）：在 `SimplifiedTopology` 与节点状态上推导过程归类与循环汇总；不修改拓扑。
+[`cycle_performance.py`](../core/cycle_performance.py)（只读第三层）：在 `SimplifiedTopology` 与节点状态上推导过程归类、循环汇总与 T-Q 曲线；不修改拓扑。
 
 ### 10.1 状态来源
 
@@ -212,6 +215,7 @@ H1 = state("PS", P_u, S_k)["H"]
 
 - `simplified`：`non_ideal.simplified`（若传入或挂载）否则 `layer.simplified`。
 - `nodes`：若 `non_ideal.nodes` 已写入（已 `apply_combined_offsets`）→ **非理想**；否则 **理想** `layer.nodes`。
+- `enthalpy_fn`：从 `layer.properties` 自动注入 `(T, P) → H`，用于 T-Q 曲线构建。
 - 流量始终来自 `SimplifiedEdge.mass_flow`（偏置不改变流量）。
 
 [`ClosedCycleLayer.performance_report()`](../core/closed_cycle_layer.py) 为薄封装，不缓存结果。
@@ -240,9 +244,80 @@ H1 = state("PS", P_u, S_k)["H"]
 
 统计范围仅 `kept_nodes` 与 `simplified_edges`；`merged_into` 中间点不重复计功/热。
 
+### 10.4 T-Q 换热曲线
+
+[`compute_cycle_performance`](../core/cycle_performance.py) 默认构建两条 T-Q 折线，存入 `CyclePerformanceReport.heat_tq_curves`：
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `HeatTQCurve.category` | `ProcessCategory` | `HEAT_ABSORPTION` 或 `HEAT_REJECTION` |
+| `q_points` | `tuple[float, ...]` | 累积热量 [kW]，从 0 递增 |
+| `t_points` | `tuple[float, ...]` | 温度 [K]，升序，与 ``q_points`` 一一对应 |
+
+构建逻辑（`_build_heat_tq_curve`）：
+
+1. 收集同类换热边的所有端点温度 → 去重排序得 `temp_nodes`。
+2. 温度节点间形成区间 `[T_i, T_{i+1}]`；对每条边，计算其覆盖段与区间的重叠 `[T_a, T_b]`。
+3. 在 `T_a, T_b` 处按端点 P 线性插值 → `enthalpy_fn(T, P)` 得焓值。
+4. `dq = |mass_flow| × |h(T_b, P_b) - h(T_a, P_a)|` 累加入区间。
+5. `q_points` 从 0 逐段累加；`t_points = temp_nodes`。
+
 ---
 
-## 11. 待办与约束（备忘）
+## 11. 夹点分析
+
+[`compute_pinch`](../core/postprocess.py)（二次处理）：在放热/吸热 T-Q 曲线上平移吸热曲线，使最小温差为 `ΔT_min`，并分离重叠/非重叠区段。
+
+### 11.1 输入
+
+- `rej_curve: HeatTQCurve`（放热，热流）
+- `abs_curve: HeatTQCurve`（吸热，冷流）
+- `delta_T_min: float ≥ 0`
+
+两曲线均满足 ``q_points[0] = 0``、``q_points`` 递增、``t_points`` 升序。
+
+### 11.2 平移量 δQ
+
+约束：``T_rej(Q) ≥ T_abs(Q - δQ) + ΔT_min`` 对所有重叠 Q。
+
+在分段线性曲线上，最紧约束必在某顶点处，候选收集：
+
+```
+遍历放热顶点 (Q_h, T_h):
+  Q_c = interp_cold_Q_at_T(T_h - ΔT_min)  →  δQ ≥ Q_h - Q_c
+遍历吸热顶点 (Q_c, T_c):
+  Q_h = interp_hot_Q_at_T(T_c + ΔT_min)  →  δQ ≥ Q_h - Q_c
+δQ = max(所有候选)
+```
+
+产生 max 的约束点对即为**夹点**：``pinch_T_hot - pinch_T_cold = ΔT_min``。
+
+### 11.3 重叠/非重叠区段
+
+平移后放热覆盖 ``[0, Q_h_max]``，吸热覆盖 ``[δQ, δQ+Q_c_max]``。
+
+| 区段 | Q 范围（原坐标系） | 含义 |
+|------|---------------------|------|
+| `overlap_rejection` | ``[max(0,δQ), min(Q_h_max, δQ+Q_c_max)]`` | 内部换热 |
+| `overlap_absorption` | ``[max(0,δQ)-δQ, min(Q_h_max, δQ+Q_c_max)-δQ]`` | 内部换热 |
+| `unmatched_rejection` | 重叠区外的放热段（拼接） | 需冷公用工程 |
+| `unmatched_absorption` | 重叠区外的吸热段（拼接） | 需热公用工程 |
+
+### 11.4 返回值
+
+[`PinchAnalysisResult`](../core/postprocess.py)：
+
+| 字段 | 含义 |
+|------|------|
+| `delta_Q` | 吸热平移量 [kW] |
+| `pinch_T_hot` / `pinch_T_cold` / `pinch_Q_hot` / `pinch_Q_cold` | 夹点位置 |
+| `rejection` / `absorption_shifted` | 原放热 / 平移后吸热曲线 |
+| `overlap_rejection` / `overlap_absorption` | 重叠区段（``None`` 若无） |
+| `unmatched_rejection` / `unmatched_absorption` | 非重叠区段（``None`` 若无） |
+
+---
+
+## 12. 待办与约束（备忘）
 
 - 非理想方程/约束装配、优化器：未实现。
 - HEN 边界：未实现。
