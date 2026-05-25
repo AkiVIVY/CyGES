@@ -54,7 +54,7 @@ class CycleConfig:
     delta_T_min: float = 0.0
     """循环内部换热夹点温差 [K]。"""
     heat_method: str | None = "pinch"
-    """循环换热处理方法：``"pinch"`` = 夹点法，``None`` = 跳过。"""
+    """循环换热处理方法：``"pinch"`` = 内部夹点，``None`` = 跳过。"""
     mechanical_method: str | None = None
     """循环机械边处理方法（预留）。"""
 
@@ -69,7 +69,10 @@ class SystemInput:
     delta_T_min: float = 0.0
     """系统级夹点最小温差 [K]。"""
     heat_method: str = "pinch"
-    """系统换热处理方法：``"pinch"`` = 夹点法（必填，不可跳过）。"""
+    """系统换热处理方法：
+    ``"system_pinch"`` — 所有换热在系统级统一匹配；
+    ``"pinch"`` — 循环内部先匹配，未匹配部分 + 外部源在系统级匹配；
+    ``"split_pinch"`` — 循环内部先匹配，未匹配吸热 vs 热源、未匹配放热 vs 冷源分别匹配。"""
     mechanical_method: str | None = None
     """系统机械边处理方法（预留）。"""
 
@@ -84,7 +87,11 @@ class SystemResult:
     cycle_pinch: PinchResult | None
     """循环内部夹点结果；``None`` = 未执行或无边。"""
     system_pinch: PinchResult | None
-    """系统级夹点结果；``None`` = 未执行或无边。"""
+    """系统级夹点结果（Mode ``"system_pinch"`` / ``"pinch"``）；``"split_pinch"`` 时为 ``None``。"""
+    hot_match_pinch: PinchResult | None = None
+    """Mode ``"split_pinch"``：循环未匹配吸热 vs 热源的夹点结果。"""
+    cold_match_pinch: PinchResult | None = None
+    """Mode ``"split_pinch"``：冷源 vs 循环未匹配放热的夹点结果。"""
     objective: float | None = None
 
 
@@ -213,13 +220,14 @@ class SystemPipeline:
 
         # 3. 循环内部夹点：匹配后多余的热量拆回 ProcessRecord 供系统级使用
         cycle_pinch: PinchResult | None = None
-        # 先拷贝全量作为默认（不做内部夹点时全部透传至系统级）
+        # 先拷贝全量作为默认（不做内部夹点时全部透传至系统级，即 Mode system_pinch）
         cycle_unmatched_rej: list[ProcessRecord] = list(cycle_all_rej)
         cycle_unmatched_abs: list[ProcessRecord] = list(cycle_all_abs)
 
         if inp.cycles:
             cfg = inp.cycles[0]
-            if cfg.heat_method == "pinch" and cycle_all_rej and cycle_all_abs:
+            cycle_does_internal = cfg.heat_method == "pinch"
+            if cycle_does_internal and cycle_all_rej and cycle_all_abs:
                 cycle_pinch = analyze_pinch(
                     cycle_all_abs, cycle_all_rej, cfg.delta_T_min, props,
                 )
@@ -235,14 +243,35 @@ class SystemPipeline:
                         cycle_pinch.extra_absorption, props,
                     )
 
-        # 4. 系统级夹点：循环未匹配 + 外部冷热源
+        # 4. 系统级夹点（三种模式）
         system_pinch: PinchResult | None = None
-        if inp.heat_method == "pinch":
+        hot_match_pinch: PinchResult | None = None
+        cold_match_pinch: PinchResult | None = None
+        method = inp.heat_method
+
+        if method == "system_pinch":
+            # Mode 1: 全部换热统一匹配
+            all_abs = list(cold_records) + cycle_all_abs
+            all_rej = list(heat_records) + cycle_all_rej
+            if all_abs and all_rej:
+                system_pinch = analyze_pinch(all_abs, all_rej, inp.delta_T_min, props)
+
+        elif method == "pinch":
+            # Mode 2: 循环未匹配 + 外部源
             all_abs = list(cold_records) + cycle_unmatched_abs
             all_rej = list(heat_records) + cycle_unmatched_rej
             if all_abs and all_rej:
-                system_pinch = analyze_pinch(
-                    all_abs, all_rej, inp.delta_T_min, props,
+                system_pinch = analyze_pinch(all_abs, all_rej, inp.delta_T_min, props)
+
+        elif method == "split_pinch":
+            # Mode 3: 循环未匹配吸热 vs 热源；冷源 vs 循环未匹配放热
+            if cycle_unmatched_abs and list(heat_records):
+                hot_match_pinch = analyze_pinch(
+                    cycle_unmatched_abs, list(heat_records), inp.delta_T_min, props,
+                )
+            if list(cold_records) and cycle_unmatched_rej:
+                cold_match_pinch = analyze_pinch(
+                    list(cold_records), cycle_unmatched_rej, inp.delta_T_min, props,
                 )
 
         return SystemResult(
@@ -251,5 +280,7 @@ class SystemPipeline:
             cycle_reports=tuple(cycle_reports),
             cycle_pinch=cycle_pinch,
             system_pinch=system_pinch,
+            hot_match_pinch=hot_match_pinch,
+            cold_match_pinch=cold_match_pinch,
             objective=None,
         )

@@ -110,6 +110,8 @@ class PinchResult:
     """夹点处吸热温度 [K]。"""
     delta_Q: float
     """吸热曲线平移量 [kW]。"""
+    pinch_Q_hot: float
+    """夹点处放热坐标系 Q 值 [kW]。"""
 
 
 # ============================================================
@@ -637,4 +639,5 @@ def analyze_pinch(
         pinch_T_hot=pa.pinch_T_hot,
         pinch_T_cold=pa.pinch_T_cold,
         delta_Q=dq,
+        pinch_Q_hot=pa.pinch_Q_hot,
     )

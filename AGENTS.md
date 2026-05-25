@@ -24,7 +24,7 @@
 - 非理想偏置：有向组、组内 `reach` / `layer`（主脊分层）、单步 [`NonIdealClosedCycleLayer.apply_offsets()`](core/non_ideal_bias.py)（换热 `σ` → 机械组 PS 重置 → DFS `PS→η→HP`）。
 - 性能统计：精简边过程归类与循环汇总（[`cycle_performance.py`](core/cycle_performance.py)），纯计算、零外部依赖；[`ClosedCycleLayer.performance_report()`](core/closed_cycle_layer.py) 为薄封装。
 - 夹点分析：T-Q 曲线构建（`build_heat_tq_curves`）、夹点平移（`compute_pinch`）、公用工程需求（`analyze_pinch`），全部位于 [`postprocess.py`](core/postprocess.py)。
-- 系统集成：外部冷热源转换、`SystemPipeline.run(props)` 多级夹点管线（[`system.py`](core/system.py)）。
+- 系统集成：外部冷热源转换、`SystemPipeline.run(props)` 三种夹点模式（全系统级 / 循环+系统级 / 分离匹配）位于 [`system.py`](core/system.py)。
 - 物性：`PropertyRegistry` 多工质注册表 + CoolProp，`props(fluid, pair, x, y)` / `props.enthalpy(fluid, T, P)`。
 
 **未实现**（勿写进 README 为已完成）
@@ -57,7 +57,7 @@
 
 ### [`core/system.py`](core/system.py)（系统层）
 
-§1 数据模型 → §2 冷热源转换 → §3 管线。``SystemPipeline.run(props)`` 多级夹点管线。
+§1 数据模型 → §2 冷热源转换 → §3 管线。``SystemPipeline.run(props)`` 三种夹点模式。公式见 architecture §9。
 
 ---
 
@@ -85,9 +85,13 @@
 
 ---
 
-## 6. 测试
+## 6. 测试（仓库内仅保留）
 
-测试文件已暂时清除；后续将根据新需求重建。
+| 文件 | 用途 |
+|------|------|
+| [`tests/test_system_full.py`](tests/test_system_full.py) | 全管线可视化测试：冷热源 TS/PS、循环 TS/PS、循环夹点、循环性能、系统夹点（5 图） |
+
+勿恢复已删的旧测试文件，除非用户明确要求。
 
 ---
 
