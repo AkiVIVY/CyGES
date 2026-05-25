@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+import warnings
 from collections.abc import Callable
 from typing import Any
 
@@ -24,9 +25,11 @@ def _differential_evolution(
     CR: float = 0.9,
     seed: int | None = 42,
     early_stop: int = 30,
+    callback: Callable[[int, list[float], float, int], None] | None = None,
 ) -> tuple[list[float], float, int]:
     """DE/rand/1/bin 单目标差分进化。
 
+    :param callback: 每代末调用 ``callback(gen, best_x, best_val, n_evals)``；``None`` 不回调。
     :returns: ``(best_x, best_val, n_evaluations)``。
     """
     rng = random.Random(seed)
@@ -84,10 +87,95 @@ def _differential_evolution(
             else:
                 stall += 1
 
+        if callback is not None:
+            callback(gen, best_x, best_val, n_evals)
+
         if stall >= early_stop * popsize:
             break
 
     return best_x, best_val, n_evals
+
+
+def _cma_evolution(
+    fn: Callable[[tuple[float, ...]], float],
+    bounds: list[tuple[float, float]],
+    *,
+    sigma0: float = 0.3,
+    maxiter: int = 200,
+    seed: int | None = 42,
+    early_stop: int = 30,
+    restarts: int = 5,
+    callback: Callable[[int, list[float], float, int], None] | None = None,
+) -> tuple[list[float], float, int]:
+    """CMA-ES + 多起点重启（BIPOP 风格），自动交替大小种群避免局部最优。
+
+    :returns: ``(best_x, best_val, n_evaluations)``。
+    """
+    import cma
+
+    dim = len(bounds)
+    lo = [b[0] for b in bounds]
+    hi = [b[1] for b in bounds]
+    stds = [sigma0 * (hi[i] - lo[i]) for i in range(dim)]
+    x0_init = [(lo[i] + hi[i]) / 2 for i in range(dim)]
+
+    global_best_val = float("inf")
+    global_best_x = x0_init[:]
+    total_evals = 0
+    gen_offset = 0
+
+    for restart in range(restarts):
+        # BIPOP: 交替小种群（4+3*log(dim)）和大种群（dim²）
+        if restart % 2 == 0:
+            p = max(4, int(4 + 3 * math.log2(dim)))
+        else:
+            p = max(10, min(dim * dim, 50))
+
+        options: dict[str, Any] = {
+            "bounds": [lo, hi],
+            "CMA_stds": stds,
+            "popsize": p,
+            "verbose": -9,
+            "seed": seed + restart if seed is not None else None,
+        }
+
+        # 随机起点（restart=0 用中点，后续均匀散布）
+        if restart == 0:
+            x0 = x0_init[:]
+        else:
+            rng_x0 = random.Random(seed + restart if seed is not None else None)
+            x0 = [rng_x0.uniform(lo[i], hi[i]) for i in range(dim)]
+
+        es = cma.CMAEvolutionStrategy(x0, sigma0, options)
+        stall = 0
+        gen = 0
+
+        while not es.stop():
+            solutions = es.ask()
+            scores = [fn(tuple(s)) for s in solutions]
+            es.tell(solutions, scores)
+            total_evals += len(solutions)
+            gen += 1
+
+            improved = False
+            for s, sc in zip(solutions, scores):
+                if sc < global_best_val:
+                    global_best_val = sc
+                    global_best_x = s
+                    improved = True
+                    stall = 0
+            if not improved:
+                stall += 1
+
+            if callback is not None:
+                callback(gen_offset + gen, global_best_x, global_best_val, total_evals)
+
+            if gen >= maxiter or stall >= early_stop * len(solutions):
+                break
+
+        gen_offset += gen
+
+    return global_best_x, global_best_val, total_evals
 
 
 class Optimizer:
@@ -138,13 +226,14 @@ class Optimizer:
 
     @property
     def bounds(self) -> list[tuple[float, float]]:
-        """参数边界：分位 [0.01, 0.99] + 流量 [mf_min, mf_max] × max_sc。"""
+        """参数边界：t_max [500,1000] + t_min [40,100] + 分位 [0.005, 0.995] + 流量。"""
         b: list[tuple[float, float]] = []
-
+        b.append((900.0, 1000.0))
+        b.append((40.0, 100.0))
         for _ in range(self._n_t_q):
-            b.append((0.01, 0.99))
+            b.append((0.005, 0.995))
         for _ in range(self._n_p_q):
-            b.append((0.01, 0.99))
+            b.append((0.005, 0.995))
 
         mf_lo = float(self._base_tp.mass_flow_min)
         mf_hi = float(self._base_tp.mass_flow_max)
@@ -156,6 +245,8 @@ class Optimizer:
     def _evaluate(self, x: tuple[float, ...]) -> float:
         """解包 x → 构造系统 → 运行管线 → 返回目标值。"""
         idx = 0
+        t_max = float(x[idx]); idx += 1
+        t_min = float(x[idx]); idx += 1
         t_q = tuple(x[idx + i] for i in range(self._n_t_q))
         idx += self._n_t_q
         p_q = tuple(x[idx + i] for i in range(self._n_p_q))
@@ -164,8 +255,8 @@ class Optimizer:
 
         tp = ClosedCycleTPInput(
             fluid=self._base_tp.fluid,
-            t_min=self._base_tp.t_min,
-            t_max=self._base_tp.t_max,
+            t_min=t_min,
+            t_max=t_max,
             p_min=self._base_tp.p_min,
             p_max=self._base_tp.p_max,
             t_quantiles=t_q,
@@ -213,28 +304,46 @@ class Optimizer:
     def run(
         self,
         *,
+        method: str = "de",
         popsize: int = 15,
         maxiter: int = 200,
         F: float = 0.8,
         CR: float = 0.9,
+        sigma0: float = 0.3,
         seed: int | None = 42,
         early_stop: int = 30,
+        callback: Callable[[int, list[float], float, int], None] | None = None,
     ) -> OptimizationResult:
-        """执行差分进化优化。
+        """执行优化。
 
+        :param method: ``"de"`` = 差分进化，``"cma"`` = CMA-ES。
+        :param callback: 每代末回调 ``(gen, best_x, best_val, n_evals)``。
         :returns: ``OptimizationResult``（含最优参数与完整系统结果）。
         """
         bounds = self.bounds
-        best_x, best_val, n_evals = _differential_evolution(
-            self._evaluate,
-            bounds,
-            popsize=popsize,
-            maxiter=maxiter,
-            F=F,
-            CR=CR,
-            seed=seed,
-            early_stop=early_stop,
-        )
+        if method == "cma":
+            best_x, best_val, n_evals = _cma_evolution(
+                self._evaluate,
+                bounds,
+                sigma0=sigma0,
+                maxiter=maxiter,
+                seed=seed,
+                early_stop=early_stop,
+                restarts=5,
+                callback=callback,
+            )
+        else:
+            best_x, best_val, n_evals = _differential_evolution(
+                self._evaluate,
+                bounds,
+                popsize=popsize,
+                maxiter=maxiter,
+                F=F,
+                CR=CR,
+                seed=seed,
+                early_stop=early_stop,
+                callback=callback,
+            )
 
         # 用最优参数再运行一次，获取完整 SystemResult
         best_val_final = self._evaluate(tuple(best_x))
@@ -254,6 +363,8 @@ class Optimizer:
     def _run_with_params(self, x: tuple[float, ...]) -> SystemResult:
         """用指定参数运行完整系统，返回 SystemResult。"""
         idx = 0
+        t_max = float(x[idx]); idx += 1
+        t_min = float(x[idx]); idx += 1
         t_q = tuple(x[idx + i] for i in range(self._n_t_q))
         idx += self._n_t_q
         p_q = tuple(x[idx + i] for i in range(self._n_p_q))
@@ -262,8 +373,8 @@ class Optimizer:
 
         tp = ClosedCycleTPInput(
             fluid=self._base_tp.fluid,
-            t_min=self._base_tp.t_min,
-            t_max=self._base_tp.t_max,
+            t_min=t_min,
+            t_max=t_max,
             p_min=self._base_tp.p_min,
             p_max=self._base_tp.p_max,
             t_quantiles=t_q,

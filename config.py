@@ -11,7 +11,7 @@ SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX: float = 0.1
 
 # 子循环质量流量化：步长 = subcycle_mass_flow_step_fraction * (mass_flow_max - mass_flow_min)；
 # ``ClosedCycleTPInput`` 未显式传入 ``subcycle_mass_flow_step_fraction`` 时使用本默认值。
-SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT: float = 0.01
+SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT: float = 0.001
 
 # 全层子循环质量流量边界默认值 [kg/s]；``ClosedCycleTPInput`` 未显式传入时使用。
 MASS_FLOW_MIN_DEFAULT: float = -5.0

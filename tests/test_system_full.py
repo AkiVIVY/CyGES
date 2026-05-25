@@ -40,7 +40,7 @@ def _make_system_input(use_non_ideal: bool) -> SystemInput:
         fluid="Air", mass_flow=100.0, T_in=1250.0, P_in=200.0, T_out=500.0, P_out=180.0,
     )
     cold_src = ExternalSourceInput(
-        fluid="Hydrogen", mass_flow=3.0, T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0,
+        fluid="Hydrogen", mass_flow=3.1, T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0,
     )
 
     cycle_input = ClosedCycleTPInput(
