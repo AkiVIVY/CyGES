@@ -36,7 +36,6 @@ from core.non_ideal_bias import (
     GroupDepthMetrics,
     NonIdealClosedCycleLayer,
     SimplifiedDirectedGroup,
-    apply_combined_offsets,
     build_directed_groups,
     compute_group_downstream_depth,
     compute_group_downstream_reach,
@@ -55,9 +54,11 @@ from core.cycle_performance import (
 from core.postprocess import (
     HeatTQCurve,
     PinchResult,
+    TQSegment,
     analyze_pinch,
     build_heat_tq_curves,
     compute_pinch,
+    split_tq_curve_to_records,
 )
 from core.system import (
     CycleConfig,
@@ -95,7 +96,6 @@ __all__ = [
     "SimplifiedTopology",
     "build_simplified_topology",
     "filter_topology_for_non_ideal",
-    "apply_combined_offsets",
     "CyclePerformanceReport",
     "CycleTotals",
     "HeatTQCurve",
@@ -109,6 +109,8 @@ __all__ = [
     "analyze_pinch",
     "build_heat_tq_curves",
     "compute_pinch",
+    "TQSegment",
+    "split_tq_curve_to_records",
     "CycleConfig",
     "ExternalSourceInput",
     "SystemInput",

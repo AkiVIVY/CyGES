@@ -102,13 +102,11 @@ class CyclePerformanceReport:
     """节点状态来源：理想 ``layer.nodes`` 或非理想 ``NonIdealClosedCycleLayer.nodes``。"""
     by_edge: tuple[tuple[str, ProcessRecord], ...]
     """边键 → 单条过程记录（按边键排序）。"""
-    by_category: tuple[tuple[ProcessCategory, tuple[ProcessRecord, ...]], ...]
-    """按 ``ProcessCategory`` 分组的过程列表。"""
+    by_category: dict[ProcessCategory, tuple[ProcessRecord, ...]]
+    """按 ``ProcessCategory`` 分组的过程列表；可直接用枚举键访问。"""
     nodes: tuple[tuple[int, NodeStateSnapshot], ...]
     """``kept_nodes`` 上的节点快照（按 index 排序）。"""
     cycle_totals: CycleTotals
-    skipped_edges: tuple[str, ...]
-    """预留：因异常跳过的边键（当前恒空）。"""
 
 
 @dataclass(frozen=True)
@@ -163,7 +161,9 @@ def _classify_edge(edge: SimplifiedEdge, tail_n: Node, head_n: Node) -> ProcessC
             return ProcessCategory.COMPRESSION
         if _pressure_decreases(tail_n.P, head_n.P):
             return ProcessCategory.EXPANSION
+        return ProcessCategory.ISOBARIC_MECHANICAL
 
+    # 换热边：按焓值变化判定吸热/放热
     if _enthalpy_increases(tail_n.H, head_n.H):
         return ProcessCategory.HEAT_ABSORPTION
     if _enthalpy_decreases(tail_n.H, head_n.H):
@@ -196,7 +196,7 @@ def resolve_performance_context(
     """从理想层（及可选非理想层）解析统计用 ``simplified`` 与节点表。
 
     - ``simplified``：``non_ideal.simplified``（若传入或挂载）否则 ``layer.simplified``。
-    - ``nodes``：若 ``non_ideal.nodes`` 已写入（已 ``apply_combined_offsets``）→ 非理想；
+    - ``nodes``：若 ``non_ideal.nodes`` 已写入（已 ``ni.apply_offsets()``）→ 非理想；
       否则 ``layer.nodes``。
     - ``fluid``：从 ``layer.properties.fluid`` 获取。
     - 流量始终来自 ``SimplifiedEdge.mass_flow``（偏置不改变流量）。
@@ -304,17 +304,10 @@ def compute_cycle_performance(ctx: PerformanceContext) -> CyclePerformanceReport
         heat_rejection_rate=totals["heat_rej"],
     )
 
-    by_category_sorted = tuple(
-        (cat, tuple(by_cat[cat]))
-        for cat in ProcessCategory
-        if cat in by_cat
-    )
-
     return CyclePerformanceReport(
         source=ctx.source,
         by_edge=tuple(sorted(by_edge.items())),
-        by_category=by_category_sorted,
+        by_category={cat: tuple(by_cat[cat]) for cat in ProcessCategory if cat in by_cat},
         nodes=tuple(sorted(node_snaps.items())),
         cycle_totals=cycle_totals,
-        skipped_edges=(),
     )

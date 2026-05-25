@@ -83,7 +83,7 @@ class CoolPropFluidPropertySolver:
         return self._fluid
 
     def _abstract_state(self) -> Any:
-        """懒加载 Helmholtz 状态对象，全实例共享、反复 update。"""
+        """懒加载 Helmholtz 状态对象，本实例内复用，反复 update。"""
         if self._as is None:
             self._as = CP.AbstractState("HEOS", self._fluid)
         return self._as
@@ -150,7 +150,7 @@ class PropertyRegistry:
     def __init__(self) -> None:
         self._solvers: dict[str, CoolPropFluidPropertySolver] = {}
 
-    def __call__(self, fluid: str, pair: str, x: float, y: float) -> ThermoStateTPHS:
+    def __call__(self, fluid: str, pair: PropertyPair, x: float, y: float) -> ThermoStateTPHS:
         """``(fluid, pair, x, y) → ThermoStateTPHS``，匹配原 ``ThermoLookup`` 签名。"""
         if fluid not in self._solvers:
             self._solvers[fluid] = CoolPropFluidPropertySolver(fluid)

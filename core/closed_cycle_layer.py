@@ -417,7 +417,8 @@ def build_subcycles(nodes: dict[int, Node], edges: dict[str, Edge]) -> list[SubC
     out: list[SubCycle] = []
 
     for n0 in nodes.values():
-        # 固定走法：左下 n0 → 上 M → 右上 → 右 M → 右下 → 下 H 回到 n0（与 PS 子循环模板一致）
+        # 固定走法：左下 n0 → e_left(M↑) → 左上 n1 → e_top(H→) → 右上 n2
+        #           → e_right(M↓) → 右下 n3 → e_bottom(H←) → 回到 n0
         ku = n0.edge_up
         if ku is None:
             continue
@@ -832,7 +833,6 @@ class ClosedCycleLayer:
         auto_analyze: bool = True,
     ) -> None:
         self.input = inp
-        self.fluid = inp.fluid
         self.properties = properties if properties is not None else CoolPropFluidPropertySolver(inp.fluid)
         self.nodes: dict[int, Node] = {}
         self.edges: dict[str, Edge] = {}

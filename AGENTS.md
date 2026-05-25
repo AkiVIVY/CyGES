@@ -21,10 +21,11 @@
 **已实现**
 
 - 理想层：PS 离散拓扑、最小 4 节点子循环、子循环流量、活跃子图精简（[`closed_cycle_layer.py`](core/closed_cycle_layer.py)）。
-- 非理想偏置：有向组、组内 `reach` / `layer`（主脊分层）、单步 [`apply_combined_offsets`](core/non_ideal_bias.py)（换热 `σ` → 机械组 PS 重置 → DFS `PS→η→HP`）。
+- 非理想偏置：有向组、组内 `reach` / `layer`（主脊分层）、单步 [`NonIdealClosedCycleLayer.apply_offsets()`](core/non_ideal_bias.py)（换热 `σ` → 机械组 PS 重置 → DFS `PS→η→HP`）。
 - 性能统计：精简边过程归类与循环汇总（[`cycle_performance.py`](core/cycle_performance.py)），纯计算、零外部依赖；[`ClosedCycleLayer.performance_report()`](core/closed_cycle_layer.py) 为薄封装。
 - 夹点分析：T-Q 曲线构建（`build_heat_tq_curves`）、夹点平移（`compute_pinch`）、公用工程需求（`analyze_pinch`），全部位于 [`postprocess.py`](core/postprocess.py)。
-- 物性：CoolProp，`state("TP"|"PS"|"HP"|"HS", x, y)`。
+- 系统集成：外部冷热源转换、`SystemPipeline.run(props)` 多级夹点管线（[`system.py`](core/system.py)）。
+- 物性：`PropertyRegistry` 多工质注册表 + CoolProp，`props(fluid, pair, x, y)` / `props.enthalpy(fluid, T, P)`。
 
 **未实现**（勿写进 README 为已完成）
 
@@ -44,7 +45,7 @@
 
 ### [`core/non_ideal_bias.py`](core/non_ideal_bias.py)（非理想偏置）
 
-§1 分组 → §2 `SimplifiedDirectedGroup` → §3 深度 → §4 `build_directed_groups*` → §5 `NonIdealClosedCycleLayer` → §6 `apply_combined_offsets`。
+§1 分组 → §2 `SimplifiedDirectedGroup` → §3 深度 → §4 `build_directed_groups*` → §5 `NonIdealClosedCycleLayer` → §6 `apply_offsets`。
 
 ### [`core/cycle_performance.py`](core/cycle_performance.py)（性能统计）
 
@@ -53,6 +54,10 @@
 ### [`core/postprocess.py`](core/postprocess.py)（二次处理）
 
 §1 数据模型 → §2 T-Q 曲线构建 → §3 曲线插值与采样 → §4 夹点计算。T-Q 在 ``ProcessRecord`` 上构建（``build_heat_tq_curves``），夹点分析含底层 ``compute_pinch`` 与高层 ``analyze_pinch``。公式见 architecture §11。
+
+### [`core/system.py`](core/system.py)（系统层）
+
+§1 数据模型 → §2 冷热源转换 → §3 管线。``SystemPipeline.run(props)`` 多级夹点管线。
 
 ---
 
@@ -74,23 +79,15 @@
 
 **同节点两套深度**：同一 `Node.index` 可同时在一个机械组与一个换热组；`layer` 数值可不同。偏移/约束**必须**按 `kind + 组` 用 `group.depth_dict()` 查询，勿建全局 `node_index → 深度` 单表。见 architecture §7.4。
 
-**非理想偏置顺序**：必须先 `ensure_non_ideal()`，再 `apply_combined_offsets(ni)`；步骤 1 只改换热组 `P`，步骤 2/3 在机械组内 PS 重置后 DFS。见 architecture §8。
+**非理想偏置顺序**：必须先 `ensure_non_ideal()`，再 `ni.apply_offsets()`；步骤 1 只改换热组 `P`，步骤 2/3 在机械组内 PS 重置后 DFS。见 architecture §8。
 
 **主脊 `layer`**：最长路径定标 + 并列最小起点；脊延伸时后继须在「能到达 `max_d`」的集合内。见 architecture §7.3。
 
 ---
 
-## 6. 测试（仓库内仅保留）
+## 6. 测试
 
-| 文件 | 用途 |
-|------|------|
-| [`tests/test_tp_topology.py`](tests/test_tp_topology.py) | 理想 He 拓扑绘图 |
-| [`tests/test_non_ideal_two_cases.py`](tests/test_non_ideal_two_cases.py) | 非理想 Case A / B 两工况绘图 |
-| [`tests/test_cycle_performance.py`](tests/test_cycle_performance.py) | 精简过程性能统计；理想/非理想 3×2 对比图（机械柱、四类合计、T-Q） |
-| [`tests/test_cycle_performance_visualization.py`](tests/test_cycle_performance_visualization.py) | 非理想单工况性能可视化；机械柱、四类合计、T-Q 折线 |
-| [`tests/test_pinch_analysis.py`](tests/test_pinch_analysis.py) | 夹点分析；理想/非理想 2×2 对比图（平移前/后，夹点标记） |
-
-勿恢复已删的单元测试（layer spine、combined_offsets 断言、旧单工况 non_ideal plot）除非用户明确要求。
+测试文件已暂时清除；后续将根据新需求重建。
 
 ---
 

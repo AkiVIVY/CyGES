@@ -19,6 +19,7 @@ from core.fluid_property_solver import PropertyRegistry, ThermoStateTPHS
 from core.postprocess import (
     PinchResult,
     analyze_pinch,
+    split_tq_curve_to_records,
 )
 
 
@@ -50,8 +51,12 @@ class CycleConfig:
     input: ClosedCycleTPInput
     use_non_ideal: bool = False
     subcycle_mass_flows: list[float] = field(default_factory=list)
-    internal_pinch_dT: float = 0.0
-    """循环内部换热夹点温差 [K]；0 表示不做内部夹点。"""
+    delta_T_min: float = 0.0
+    """循环内部换热夹点温差 [K]。"""
+    heat_method: str | None = "pinch"
+    """循环换热处理方法：``"pinch"`` = 夹点法，``None`` = 跳过。"""
+    mechanical_method: str | None = None
+    """循环机械边处理方法（预留）。"""
 
 
 @dataclass(frozen=True)
@@ -62,7 +67,11 @@ class SystemInput:
     cold_sources: tuple[ExternalSourceInput, ...] = ()
     cycles: tuple[CycleConfig, ...] = ()
     delta_T_min: float = 0.0
-    """系统级夹点最小温差 [K]；0 表示不执行系统级夹点。"""
+    """系统级夹点最小温差 [K]。"""
+    heat_method: str = "pinch"
+    """系统换热处理方法：``"pinch"`` = 夹点法（必填，不可跳过）。"""
+    mechanical_method: str | None = None
+    """系统机械边处理方法（预留）。"""
 
 
 @dataclass(frozen=True)
@@ -92,7 +101,7 @@ def _source_to_record(
 ) -> ProcessRecord:
     """将单个外部源转换为 ``ProcessRecord``。
 
-    通过 ``thermo_fn(fluid, "TP", T, P)`` 查询进出口完整状态（T/P/H/S）。
+    通过 ``props(fluid, "TP", T, P)`` 查询进出口完整状态（T/P/H/S）。
     index 用负值以区分拓扑节点。
     """
     in_state: ThermoStateTPHS = props(src.fluid, "TP", src.T_in, src.P_in)
@@ -141,11 +150,11 @@ def convert_sources(
     """
     hr: list[ProcessRecord] = []
     for i, src in enumerate(heat_sources):
-        hr.append(_source_to_record(src, f"HS_{i}", ProcessCategory.HEAT_REJECTION, thermo_fn))
+        hr.append(_source_to_record(src, f"HS_{i}", ProcessCategory.HEAT_REJECTION, props))
 
     cr: list[ProcessRecord] = []
     for i, src in enumerate(cold_sources):
-        cr.append(_source_to_record(src, f"CS_{i}", ProcessCategory.HEAT_ABSORPTION, thermo_fn))
+        cr.append(_source_to_record(src, f"CS_{i}", ProcessCategory.HEAT_ABSORPTION, props))
 
     return tuple(hr), tuple(cr)
 
@@ -164,7 +173,7 @@ class SystemPipeline:
     def __init__(self, system_input: SystemInput) -> None:
         self._input = system_input
 
-    def run(self, thermo_fn: ThermoLookup) -> SystemResult:
+    def run(self, props: PropertyRegistry) -> SystemResult:
         """执行系统级分析。
 
         :param props: 多工质物性注册表，用于 ``props(fluid, pair, x, y)`` 查询完整状态。
@@ -173,7 +182,7 @@ class SystemPipeline:
 
         # 1. 转换外部冷热源
         heat_records, cold_records = convert_sources(
-            inp.heat_sources, inp.cold_sources, thermo_fn,
+            inp.heat_sources, inp.cold_sources, props,
         )
 
         # 2. 处理闭式循环
@@ -202,21 +211,33 @@ class SystemPipeline:
                 elif rec.category == ProcessCategory.HEAT_ABSORPTION:
                     cycle_all_abs.append(rec)
 
-        # 3. 循环内部夹点
+        # 3. 循环内部夹点：匹配后多余的热量拆回 ProcessRecord 供系统级使用
         cycle_pinch: PinchResult | None = None
+        # 先拷贝全量作为默认（不做内部夹点时全部透传至系统级）
         cycle_unmatched_rej: list[ProcessRecord] = list(cycle_all_rej)
         cycle_unmatched_abs: list[ProcessRecord] = list(cycle_all_abs)
 
         if inp.cycles:
             cfg = inp.cycles[0]
-            if cfg.internal_pinch_dT > 0.0 and cycle_all_rej and cycle_all_abs:
+            if cfg.heat_method == "pinch" and cycle_all_rej and cycle_all_abs:
                 cycle_pinch = analyze_pinch(
-                    cycle_all_abs, cycle_all_rej, cfg.internal_pinch_dT, props,
+                    cycle_all_abs, cycle_all_rej, cfg.delta_T_min, props,
                 )
+                # 内部夹点完成后，仅将匹配不掉的多余部分传入系统级
+                cycle_unmatched_rej = []
+                cycle_unmatched_abs = []
+                if cycle_pinch.extra_rejection is not None:
+                    cycle_unmatched_rej = split_tq_curve_to_records(
+                        cycle_pinch.extra_rejection, props,
+                    )
+                if cycle_pinch.extra_absorption is not None:
+                    cycle_unmatched_abs = split_tq_curve_to_records(
+                        cycle_pinch.extra_absorption, props,
+                    )
 
-        # 4. 系统级夹点：循环换热 + 外部冷热源
+        # 4. 系统级夹点：循环未匹配 + 外部冷热源
         system_pinch: PinchResult | None = None
-        if inp.delta_T_min > 0.0:
+        if inp.heat_method == "pinch":
             all_abs = list(cold_records) + cycle_unmatched_abs
             all_rej = list(heat_records) + cycle_unmatched_rej
             if all_abs and all_rej:

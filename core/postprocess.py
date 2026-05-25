@@ -22,6 +22,16 @@ from core.fluid_property_solver import PropertyRegistry
 
 
 @dataclass(frozen=True)
+class TQSegment:
+    """T-Q 曲线中一个温度区间的源信息，用于反向还原为 ``ProcessRecord``。"""
+
+    T_from: float
+    T_to: float
+    contributions: tuple[tuple[ProcessRecord, float], ...]
+    """``(record, dQ)`` 元组——每个原记录在该区间贡献的热量 [kW]。"""
+
+
+@dataclass(frozen=True)
 class HeatTQCurve:
     """单条换热 T-Q 折线（吸热或放热）。"""
 
@@ -31,6 +41,8 @@ class HeatTQCurve:
     """累积热量 [kW]（从 0 开始逐段累加）。"""
     t_points: tuple[float, ...]
     """温度 [K]（与 ``q_points`` 一一对应）。"""
+    segments: tuple[TQSegment, ...] = ()
+    """每个温度区间的源记录与贡献，用于 ``split_tq_curve_to_records`` 反向还原。"""
 
 
 @dataclass(frozen=True)
@@ -75,7 +87,7 @@ class PinchResult:
     """夹点分析结果：公用工程需求与匹配换热曲线。
 
     由 ``analyze_pinch`` 直接处理 ``ProcessRecord`` 列表生成；
-    是 ``Compute_pinch`` 的上层封装。
+    是 ``compute_pinch`` 的上层封装。
     """
 
     delta_T_min: float
@@ -144,6 +156,10 @@ def _build_heat_tq_curve(
         )
 
     interval_q = [0.0] * (len(temp_nodes) - 1)
+    # 每个区间的 (record, dQ) 列表，用于构建 segments
+    interval_sources: list[list[tuple[ProcessRecord, float]]] = [
+        [] for _ in range(len(temp_nodes) - 1)
+    ]
     for rec in selected:
         if rec.mass_flow is None:
             continue
@@ -166,15 +182,31 @@ def _build_heat_tq_curve(
             Pb = _interp_pressure_by_temperature(rec, Tb)
             h_a = float(props.enthalpy(rec.fluid, Ta, Pa))
             h_b = float(props.enthalpy(rec.fluid, Tb, Pb))
-            interval_q[i] += m_abs * abs(h_b - h_a)
+            dq = m_abs * abs(h_b - h_a)
+            interval_q[i] += dq
+            interval_sources[i].append((rec, dq))
 
     q_points = [0.0]
     for dq in interval_q:
         q_points.append(q_points[-1] + dq)
+
+    segments: list[TQSegment] = []
+    for i in range(len(temp_nodes) - 1):
+        contributions = interval_sources[i]
+        if contributions:
+            segments.append(
+                TQSegment(
+                    T_from=float(temp_nodes[i]),
+                    T_to=float(temp_nodes[i + 1]),
+                    contributions=tuple(contributions),
+                )
+            )
+
     return HeatTQCurve(
         category=category,
         q_points=tuple(q_points),
         t_points=tuple(temp_nodes),
+        segments=tuple(segments),
     )
 
 
@@ -198,6 +230,68 @@ def build_heat_tq_curves(
         if len(curve.q_points) > 1 or curve.t_points[0] != 0.0:
             tq_curves.append(curve)
     return tuple(tq_curves)
+
+
+def split_tq_curve_to_records(
+    curve: HeatTQCurve,
+    props: PropertyRegistry,
+) -> list[ProcessRecord]:
+    """将 T-Q 曲线反向拆解为 ``ProcessRecord`` 列表。
+
+    遍历 ``curve.segments`` 中每个温度区间的每条源记录贡献，
+    在区间端点通过 ``props`` 补全焓值与熵值，重建带完整状态的 ``ProcessRecord``。
+
+    适用于：内部夹点后将 ``extra_absorption`` / ``extra_rejection`` 曲线
+    还原为记录列表，与外部冷热源合并后传入 ``analyze_pinch`` 做系统级夹点。
+    """
+    from core.cycle_performance import NodeStateSnapshot
+
+    records: list[ProcessRecord] = []
+    seg_counter: dict[str, int] = {}
+
+    for seg in curve.segments:
+        for rec, _dq in seg.contributions:
+            # 重建区间 [T_from, T_to] 的状态
+            P_a = _interp_pressure_by_temperature(rec, seg.T_from)
+            P_b = _interp_pressure_by_temperature(rec, seg.T_to)
+            st_a = props(rec.fluid, "TP", seg.T_from, P_a)
+            st_b = props(rec.fluid, "TP", seg.T_to, P_b)
+
+            tail_h = st_a["H"]
+            head_h = st_b["H"]
+            delta_H = head_h - tail_h
+            mf = abs(float(rec.mass_flow)) if rec.mass_flow is not None else 0.0
+
+            # 按原记录方向确定 tail/head：吸热 T 升、放热 T 降
+            if rec.category == ProcessCategory.HEAT_ABSORPTION:
+                tail_snap = NodeStateSnapshot(index=-3, T=seg.T_from, P=P_a, H=tail_h, S=st_a["S"])
+                head_snap = NodeStateSnapshot(index=-4, T=seg.T_to, P=P_b, H=head_h, S=st_b["S"])
+            else:
+                tail_snap = NodeStateSnapshot(index=-3, T=seg.T_to, P=P_b, H=head_h, S=st_b["S"])
+                head_snap = NodeStateSnapshot(index=-4, T=seg.T_from, P=P_a, H=tail_h, S=st_a["S"])
+                delta_H = -delta_H
+
+            base_key = f"{rec.edge_key}_seg"
+            idx = seg_counter.get(base_key, 0)
+            seg_counter[base_key] = idx + 1
+
+            records.append(
+                ProcessRecord(
+                    edge_key=f"{base_key}_{idx}",
+                    fluid=rec.fluid,
+                    kind="heat",
+                    category=rec.category,
+                    tail=-3,
+                    head=-4,
+                    mass_flow=mf,
+                    tail_state=tail_snap,
+                    head_state=head_snap,
+                    delta_H=delta_H,
+                    power_rate=mf * delta_H,
+                )
+            )
+
+    return records
 
 
 # ============================================================
@@ -286,16 +380,33 @@ def _sample_curve_segment(
 
     if len(kept_q) < 2:
         return None
+
+    T_start = kept_t[0]
+    T_end = kept_t[-1]
+    kept_segs: list[TQSegment] = []
+    for seg in curve.segments:
+        if seg.T_to <= T_start or seg.T_from >= T_end:
+            continue
+        lo = max(seg.T_from, T_start)
+        hi = min(seg.T_to, T_end)
+        frac = (hi - lo) / (seg.T_to - seg.T_from) if seg.T_to > seg.T_from else 1.0
+        scaled: list[tuple[ProcessRecord, float]] = []
+        for rec, dq in seg.contributions:
+            scaled.append((rec, dq * frac))
+        if scaled:
+            kept_segs.append(TQSegment(T_from=lo, T_to=hi, contributions=tuple(scaled)))
+
     return HeatTQCurve(
         category=curve.category,
         q_points=tuple(kept_q),
         t_points=tuple(kept_t),
+        segments=tuple(kept_segs),
     )
 
 
 def _sample_curve_multi_segment(
     curve: HeatTQCurve,
-    segments: list[tuple[float, float]],
+    q_ranges: list[tuple[float, float]],
 ) -> HeatTQCurve | None:
     """从曲线拼接多个 ``[(Q_start, Q_end), ...]`` 区段为一条新曲线。
 
@@ -304,13 +415,13 @@ def _sample_curve_multi_segment(
     qs = curve.q_points
     ts = curve.t_points
     n = len(qs)
-    if n == 0 or not segments:
+    if n == 0 or not q_ranges:
         return None
 
     kept_q: list[float] = []
     kept_t: list[float] = []
     first = True
-    for seg_start, seg_end in segments:
+    for seg_start, seg_end in q_ranges:
         if seg_end <= qs[0] or seg_start >= qs[-1] or seg_start >= seg_end:
             continue
         if not first:
@@ -333,10 +444,21 @@ def _sample_curve_multi_segment(
 
     if len(kept_q) < 2:
         return None
+
+    # 重建 segments：遍历每个 Q-range 子区间，收集对应 T 范围的原始 segments
+    kept_segs: list[TQSegment] = []
+    for seg_start, seg_end in q_ranges:
+        if seg_end <= qs[0] or seg_start >= qs[-1] or seg_start >= seg_end:
+            continue
+        sub_curve = _sample_curve_segment(curve, seg_start, seg_end)
+        if sub_curve is not None:
+            kept_segs.extend(sub_curve.segments)
+
     return HeatTQCurve(
         category=curve.category,
         q_points=tuple(kept_q),
         t_points=tuple(kept_t),
+        segments=tuple(kept_segs),
     )
 
 
@@ -375,8 +497,10 @@ def compute_pinch(
     n_h = len(q_h)
     n_c = len(q_c)
 
+    # ── 阶段 1：遍历两曲线顶点求候选 δQ — T_rej(Q_h) ≥ T_abs(Q_h-δQ) + ΔT_min ──
     candidates: list[tuple[float, float, float, float]] = []  # (δQ, pinch_T_hot, pinch_T_cold, pinch_Q_hot)
 
+    # 放热顶点约束：δQ ≥ Q_h - abs_Q_at_T(T_h - ΔT_min)
     for i in range(n_h):
         Q_h = float(q_h[i])
         T_h = float(t_h[i])
@@ -393,6 +517,7 @@ def compute_pinch(
         dq = Q_h_at_target - Q_c_j
         candidates.append((dq, T_target, T_c_j, Q_h_at_target))
 
+    # ── 阶段 2：取最大 δQ → 夹点位置 + 平移后吸热曲线 ──
     delta_Q, pinch_T_hot, pinch_T_cold, pinch_Q_hot = max(candidates, key=lambda x: x[0])
     pinch_Q_cold = _interp_Q_at_T(abs_curve, pinch_T_cold)
 
@@ -400,8 +525,10 @@ def compute_pinch(
         category=abs_curve.category,
         q_points=tuple(qc + delta_Q for qc in q_c),
         t_points=t_c,
+        segments=abs_curve.segments,
     )
 
+    # ── 阶段 3：分离重叠区 [overlap_start, overlap_end] ──
     Q_h_max = float(q_h[-1])
     Q_c_max = float(q_c[-1])
     overlap_start = max(0.0, delta_Q)
@@ -414,6 +541,7 @@ def compute_pinch(
         overlap_rej = None
         overlap_abs = None
 
+    # ── 阶段 4：分离非重叠区段（需公用工程） ──
     unmatched_rej_segs: list[tuple[float, float]] = []
     if delta_Q > 0.0 and delta_Q <= Q_h_max:
         unmatched_rej_segs.append((0.0, min(delta_Q, Q_h_max)))
@@ -479,18 +607,21 @@ def analyze_pinch(
     Q_c_max = float(abs_curve.q_points[-1])
     dq = pa.delta_Q
 
+    # 公用工程 = 平移量 + 终端溢出：放热覆盖 [0, Q_h_max]，吸热平移后覆盖 [dq, dq+Q_c_max]
+    # cold_utility = 左端（放热无对应吸热）+ 右端（放热超出吸热）
     cold_utility = max(0.0, dq) + max(0.0, Q_h_max - dq - Q_c_max)
+    # hot_utility  = 左端（吸热无对应放热）+ 右端（吸热超出放热）
     hot_utility = max(0.0, -dq) + max(0.0, dq + Q_c_max - Q_h_max)
 
-    # 额外曲线：低于阈值比例则不输出
+    # 额外曲线：低于阈值比例则不输出（用公用工程总量，避免多段曲线 q_points[-1] 取错）
     extra_abs = pa.unmatched_absorption
     if extra_abs is not None and Q_c_max > 1e-12:
-        if abs(extra_abs.q_points[-1]) / Q_c_max < threshold_fraction:
+        if hot_utility / Q_c_max < threshold_fraction:
             extra_abs = None
 
     extra_rej = pa.unmatched_rejection
     if extra_rej is not None and Q_h_max > 1e-12:
-        if abs(extra_rej.q_points[-1]) / Q_h_max < threshold_fraction:
+        if cold_utility / Q_h_max < threshold_fraction:
             extra_rej = None
 
     return PinchResult(

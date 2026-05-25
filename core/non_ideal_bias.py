@@ -4,11 +4,11 @@
 ``analyze_topology()`` / ``commit_*`` 时 ``layer.non_ideal`` 被置 ``None``，已生成的实例仍指向
 ensure 时刻的快照。
 
-``ideal_nodes`` 为 ensure 时刻对父层 ``nodes`` 的只读引用；首次调用 :func:`apply_combined_offsets`
-时整表拷贝到 ``nodes`` 再写修正量（理想层不变）。
+``ideal_nodes`` 为 ensure 时刻对父层 ``nodes`` 的只读引用；首次调用 ``apply_offsets`` /
+:func:`_apply_combined_offsets` 时整表拷贝到 ``nodes`` 再写修正量（理想层不变）。
 
 模块分节：§1 分组 → §2 有向组数据类 → §3 深度 → §4 有向组构造 → §5 快照容器
-``NonIdealClosedCycleLayer`` → §6 节点偏置 ``apply_combined_offsets``。
+``NonIdealClosedCycleLayer`` → §6 节点偏置 ``apply_offsets``。
 
 ``reach`` / ``layer`` / 换热 σ / 机械 η_is 公式见 ``docs/architecture.md``。
 """
@@ -18,12 +18,15 @@ from __future__ import annotations
 import warnings
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
-from typing import Literal, Mapping
+from typing import TYPE_CHECKING, Literal, Mapping
 
 import config as cyges_config
 
 from core.closed_cycle_layer import Node, SimplifiedEdge, SimplifiedTopology
 from core.fluid_property_solver import FluidPropertySolver
+
+if TYPE_CHECKING:
+    from core.closed_cycle_layer import ClosedCycleLayer
 
 
 # ============================================================
@@ -209,6 +212,7 @@ def _compute_layer_by_spine(
     if not nodes:
         return {}
 
+    # ── 阶段 1：Kahn 拓扑排序 → 各节点自上而下的最长距离 dist ──
     in_degree: dict[int, int] = {v: 0 for v in nodes}
     for u, w in directed_edges:
         in_degree[w] += 1
@@ -226,6 +230,8 @@ def _compute_layer_by_spine(
                 q.append(w)
 
     max_d = max(dist.values())
+
+    # ── 阶段 2：反向邻接 + 回溯 → 找距 max_d 最远的最小起点 ──
     rev: dict[int, list[int]] = defaultdict(list)
     for u, w in directed_edges:
         if dist[u] + 1 == dist[w]:
@@ -262,6 +268,7 @@ def _compute_layer_by_spine(
             if u not in on_longest:
                 rev_stack.append(u)
 
+    # ── 阶段 3：从 best_start 沿 dist 递增走主脊（后继必须 on_longest） ──
     spine: list[int] = [best_start]
     cur = best_start
     while dist[cur] < max_d:
@@ -279,6 +286,7 @@ def _compute_layer_by_spine(
     for i, v in enumerate(spine):
         layer[v] = i
 
+    # ── 阶段 4：迭代正反向松弛 → 支流/汇流对齐，主脊节点不受影响 ──
     for _ in range(len(nodes) + 1):
         changed = False
         for u, w in directed_edges:
@@ -301,6 +309,7 @@ def _compute_layer_by_spine(
         if not changed:
             break
 
+    # 收敛后仍悬空的孤立/不连通节点 → 归零
     for v in nodes:
         if layer[v] < 0:
             layer[v] = 0
@@ -392,7 +401,7 @@ def build_directed_groups_both(
 # ============================================================
 # §5. 非理想分析容器
 # ----------------------------------------------------------------
-# 仅持有快照与分组；状态偏移由 §6 :func:`apply_combined_offsets` 完成。
+# 仅持有快照与分组；状态偏移由 §6 ``apply_offsets()`` 完成。
 # ============================================================
 
 
@@ -405,13 +414,13 @@ class NonIdealClosedCycleLayer:
     - ``simplified``：ensure 时刻 ``layer.simplified`` 的同一引用（frozen，不可变）。
     - ``mechanical_groups`` / ``heat_groups``：按 ``kind`` 划分的 ``SimplifiedDirectedGroup`` 元组。
     - ``ideal_nodes``：ensure 时刻 ``layer.nodes`` 的只读映射。
-    - ``nodes``：首次 :func:`apply_combined_offsets` 时从 ``ideal_nodes`` 拷贝；写非理想状态。
+    - ``nodes``：首次 ``apply_offsets()`` 时从 ``ideal_nodes`` 拷贝；写非理想状态。
     - ``heat_efficiency`` / ``mechanical_efficiency``：最近一次偏置采用的 ``σ`` / ``η_is``；
       未偏置时为 ``None``。
     - ``properties``：与父层相同的物性求解器。
 
      由 ``from_closed_cycle_layer`` / ``ClosedCycleLayer.ensure_non_ideal()`` 创建；
-     偏置请调用 ``apply_offsets()`` 或模块级 ``apply_combined_offsets(self)``。
+      偏置请调用 ``apply_offsets()``。
     """
 
     simplified: SimplifiedTopology
@@ -424,7 +433,7 @@ class NonIdealClosedCycleLayer:
     mechanical_efficiency: float | None = None
 
     @classmethod
-    def from_closed_cycle_layer(cls, layer) -> NonIdealClosedCycleLayer:
+    def from_closed_cycle_layer(cls, layer: ClosedCycleLayer) -> NonIdealClosedCycleLayer:
         """读取理想层 ``simplified`` / ``nodes``，构建机械/换热有向组快照。
 
         前置：``layer.simplified is not None``（已 ``analyze_topology`` 或 ``commit_*``）。
@@ -445,14 +454,14 @@ class NonIdealClosedCycleLayer:
 
     def apply_offsets(
         self,
-        heat_efficiency: float | None = None,
-        mechanical_efficiency: float | None = None,
+        sigma: float | None = None,
+        eta_is: float | None = None,
     ) -> None:
         """单步应用换热 ``σ`` 与机械 ``η_is`` 偏置，写入 ``self.nodes``。
 
-        委托 :func:`apply_combined_offsets`；详见 ``docs/architecture.md`` §8。
+        详见 ``docs/architecture.md`` §8。
         """
-        apply_combined_offsets(self, heat_efficiency, mechanical_efficiency)
+        _apply_combined_offsets(self, sigma=sigma, eta_is=eta_is)
 
 # ============================================================
 # §6. 节点偏置（单步：换热 σ → 机械组 PS 重置 → DFS ``PS→η→HP``）
@@ -651,7 +660,7 @@ def _apply_mechanical_group(
         )
 
 
-def apply_combined_offsets(
+def _apply_combined_offsets(
     layer: NonIdealClosedCycleLayer,
     *,
     sigma: float | None = None,
@@ -659,12 +668,10 @@ def apply_combined_offsets(
 ) -> NonIdealClosedCycleLayer:
     """单步骤非理想节点偏置：换热 σ 改 P → 机械组 PS 重置 → 从 anchor DFS 非理想机械步。
 
-    参数
-    ----
-    - ``sigma``：换热总压恢复系数；``None`` → ``layer.heat_efficiency`` →
-      ``config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT``。须在 ``(0, 1]``。
-    - ``eta_is``：机械等熵效率；``None`` → ``layer.mechanical_efficiency`` →
-      ``config.NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT``。须在 ``(0, 1]``。
+    ``sigma``：换热总压恢复系数；``None`` → ``layer.heat_efficiency`` →
+    ``config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT``。须在 ``(0, 1]``。
+    ``eta_is``：机械等熵效率；``None`` → ``layer.mechanical_efficiency`` →
+    ``config.NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT``。须在 ``(0, 1]``。
 
     返回 ``layer`` 自身（``nodes`` 已写入新状态；``heat_efficiency`` /
     ``mechanical_efficiency`` 记录本次 ``σ`` / ``η_is``）。不修改 ``ideal_nodes`` 与父层。

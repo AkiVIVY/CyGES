@@ -19,7 +19,7 @@ flowchart TD
     simp --> simplified[SimplifiedTopology]
     simplified --> ensure[ensure_non_ideal]
     ensure --> ni[NonIdealClosedCycleLayer]
-    ni --> off[apply_combined_offsets]
+    ni --> off[ni.apply_offsets]
     off --> perf[compute_cycle_performance]
     simp --> perf
     perf --> report[CyclePerformanceReport]
@@ -36,6 +36,7 @@ flowchart TD
 | [`non_ideal_bias.py`](../core/non_ideal_bias.py) | §1 分组 → §2 数据类 → §3 深度 → §4 组构造 → §5 容器 → §6 偏置 |
 | [`cycle_performance.py`](../core/cycle_performance.py) | §1 数据模型 → §2 判据小工具 → §3 状态解析 → §4 统计计算 |
 | [`postprocess.py`](../core/postprocess.py) | §1 数据模型 → §2 T-Q 曲线构建 → §3 曲线插值与采样 → §4 夹点计算 |
+| [`system.py`](../core/system.py) | §1 数据模型 → §2 冷热源转换 → §3 管线 |
 
 ---
 
@@ -165,7 +166,7 @@ flowchart TD
 
 ## 8. 非理想节点偏置
 
-[`apply_combined_offsets`](../core/non_ideal_bias.py)（非理想层 §6）：单步完成换热 `σ` 与机械 `η_is`。
+[`apply_offsets`](../core/non_ideal_bias.py)（非理想层 §6）：单步完成换热 `σ` 与机械 `η_is`。
 
 ### 8.1 步骤 1：换热 `P`（不闭合）
 
@@ -205,6 +206,36 @@ H1 = state("PS", P_u, S_k)["H"]
 
 ---
 
+## 9. 系统层
+
+[`SystemPipeline`](../core/system.py)（系统层 §3）：整合外部冷热源与闭式循环，执行多级夹点分析。
+
+### 9.1 外部源转换
+
+[`convert_sources`](../core/system.py)：`ExternalSourceInput` → `ProcessRecord`（热源→`HEAT_REJECTION`，冷源→`HEAT_ABSORPTION`）。通过 `props(fluid, "TP", T, P)` 补全 H/S。
+
+### 9.2 管线流程
+
+``SystemPipeline.run(props)``：
+
+1. `convert_sources` 转换外部冷热源。
+2. 对每个 `CycleConfig`：`ClosedCycleLayer` → 可选非理想偏置 → `performance_report()`。
+3. 循环内部夹点（`internal_pinch_dT > 0`）：`analyze_pinch` 匹配循环自身换热，多余热量通过 `split_tq_curve_to_records` 拆回 `ProcessRecord`。
+4. 系统级夹点（`delta_T_min > 0`）：循环未匹配 + 外部冷热源 → `analyze_pinch` → `PinchResult`。
+
+### 9.3 输出
+
+[`SystemResult`](../core/system.py)：
+
+| 字段 | 含义 |
+|------|------|
+| `heat_source_records` / `cold_source_records` | 外部源转换结果 |
+| `cycle_reports` | 各闭式循环性能报告 |
+| `cycle_pinch` | 循环内部夹点结果（``None`` = 未执行） |
+| `system_pinch` | 系统级夹点结果（``None`` = 未执行） |
+
+---
+
 ## 10. 精简过程性能统计
 
 [`cycle_performance.py`](../core/cycle_performance.py)（只读第三层）：在 `SimplifiedTopology` 与节点状态上推导过程归类与循环汇总；不修改拓扑，零外部库依赖。
@@ -214,7 +245,7 @@ H1 = state("PS", P_u, S_k)["H"]
 [`resolve_performance_context`](../core/cycle_performance.py)：
 
 - `simplified`：`non_ideal.simplified`（若传入或挂载）否则 `layer.simplified`。
-- `nodes`：若 `non_ideal.nodes` 已写入（已 `apply_combined_offsets`）→ **非理想**；否则 **理想** `layer.nodes`。
+- `nodes`：若 `non_ideal.nodes` 已写入（已 `ni.apply_offsets()`）→ **非理想**；否则 **理想** `layer.nodes`。
 - `fluid`：从 `layer.properties.fluid` 获取，写入每条 `ProcessRecord`。
 - 流量始终来自 `SimplifiedEdge.mass_flow`（偏置不改变流量）。
 
@@ -254,17 +285,17 @@ T-Q 曲线构建与夹点分析集中在 [`postprocess.py`](../core/postprocess.
 
 [`build_heat_tq_curves`](../core/postprocess.py)：从 `CyclePerformanceReport` 中提取换热边，构建吸热与放热各一条分段线性 T-Q 折线。
 
-依赖 `EnthalpyLookup = Callable[[str, float, float], float]`（`(fluid, T, P) → H`），支持多工质——每条边按 `rec.fluid` 分发：
+依赖 `PropertyRegistry`（`props(fluid, "TP", T, P)` / `props.enthalpy(fluid, T, P)`），支持多工质——每条边按 `rec.fluid` 分发：
 
 ```
-h = enthalpy_fn(rec.fluid, T, P)
+h = props.enthalpy(rec.fluid, T, P)
 ```
 
 底层 [`_build_heat_tq_curve`](../core/postprocess.py)：
 
 1. 收集同类换热边端点温度 → 去重排序得 `temp_nodes`。
 2. 温度区间 `[T_i, T_{i+1}]`；每条边计算覆盖段与区间的重叠 `[T_a, T_b]`。
-3. `T_a, T_b` 处按端点 P 线性插值 → `enthalpy_fn(fluid, T, P)` 得焓。
+3. `T_a, T_b` 处按端点 P 线性插值 → `props.enthalpy(fluid, T, P)` 得焓。
 4. `dq = |mass_flow| × |h(T_b, P_b) - h(T_a, P_a)|` 累加入区间。
 5. `q_points` 从 0 逐段累加；`t_points = temp_nodes`。
 
@@ -295,7 +326,7 @@ h = enthalpy_fn(rec.fluid, T, P)
 
 ### 11.3 高层入口 `analyze_pinch`
 
-[`analyze_pinch`](../core/postprocess.py)：一站式接收 `ProcessRecord` 列表 + `ΔT_min` + `enthalpy_fn`，返回 `PinchResult`：
+[`analyze_pinch`](../core/postprocess.py)：一站式接收 `ProcessRecord` 列表 + `ΔT_min` + `props: PropertyRegistry`，返回 `PinchResult`：
 
 | 字段 | 含义 |
 |------|------|
