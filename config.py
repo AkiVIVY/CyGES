@@ -18,7 +18,7 @@ MASS_FLOW_MIN_DEFAULT: float = -5.0
 MASS_FLOW_MAX_DEFAULT: float = 10.0
 
 # 夹点分析：额外换热曲线截断阈值。
-# ``analyse_pinch`` 中，若额外吸热/放热量占该过程总换热的比例低于此值，
+# ``analyze_pinch`` 中，若额外吸热/放热量占该过程总换热的比例低于此值，
 # 则 ``PinchResult.extra_absorption`` / ``extra_rejection`` 为 ``None``。
 PINCH_EXTRA_CURVE_FRACTION_THRESHOLD: float = 0.01
 

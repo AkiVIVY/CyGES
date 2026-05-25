@@ -11,6 +11,7 @@ T[K]、P[kPa]、H[kJ/kg]、S[kJ/(kg·K)]；内部 CoolProp 使用 SI。
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 
 import CoolProp.CoolProp as CP
@@ -34,6 +35,12 @@ class ThermoStateTPHS(TypedDict):
     P: float
     H: float
     S: float
+
+
+# 多工质通用物性查询：(fluid, pair, x, y) → ThermoStateTPHS
+# 与 EnthalpyLookup 互补——前者用于完整状态查询（如 convert_sources），
+# 后者仅返回焓值用于 T-Q 曲线构建。
+ThermoLookup = Callable[[str, str, float, float], ThermoStateTPHS]
 
 
 def _tphs(t_k: float, p_kpa: float, h_kjkg: float, s_kj_per_kgk: float) -> ThermoStateTPHS:

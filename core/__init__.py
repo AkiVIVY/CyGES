@@ -7,6 +7,8 @@
 原始全路径 ``from core.closed_cycle_layer import ...`` 等仍保持可用。
 """
 
+from __future__ import annotations
+
 from core.closed_cycle_layer import (
     ClosedCycleLayer,
     ClosedCycleTPInput,
@@ -27,6 +29,7 @@ from core.fluid_property_solver import (
     CoolPropFluidPropertySolver,
     FluidPropertySolver,
     PropertyPair,
+    ThermoLookup,
     ThermoStateTPHS,
 )
 from core.non_ideal_bias import (
@@ -52,11 +55,18 @@ from core.cycle_performance import (
 from core.postprocess import (
     EnthalpyLookup,
     HeatTQCurve,
-    PinchAnalysisResult,
     PinchResult,
-    analyse_pinch,
+    analyze_pinch,
     build_heat_tq_curves,
     compute_pinch,
+)
+from core.system import (
+    CycleConfig,
+    ExternalSourceInput,
+    SystemInput,
+    SystemPipeline,
+    SystemResult,
+    convert_sources,
 )
 
 __all__ = [
@@ -88,6 +98,7 @@ __all__ = [
     "apply_combined_offsets",
     "CyclePerformanceReport",
     "CycleTotals",
+    "EnthalpyLookup",
     "HeatTQCurve",
     "NodeStateSnapshot",
     "PerformanceContext",
@@ -95,9 +106,14 @@ __all__ = [
     "ProcessRecord",
     "compute_cycle_performance",
     "resolve_performance_context",
-    "PinchAnalysisResult",
     "PinchResult",
-    "analyse_pinch",
+    "analyze_pinch",
     "build_heat_tq_curves",
     "compute_pinch",
+    "CycleConfig",
+    "ExternalSourceInput",
+    "SystemInput",
+    "SystemPipeline",
+    "SystemResult",
+    "convert_sources",
 ]

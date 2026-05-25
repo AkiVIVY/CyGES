@@ -23,7 +23,7 @@ flowchart TD
     off --> perf[compute_cycle_performance]
     simp --> perf
     perf --> report[CyclePerformanceReport]
-    report --> post[postprocess: build_heat_tq_curves / analyse_pinch]
+    report --> post[postprocess: build_heat_tq_curves / analyze_pinch]
 ```
 
 **失效语义**：`analyze_topology()` 与 `commit_subcycle_mass_flows_to_topology()` 末尾重建 `simplified` 并置 `non_ideal = None`。须在理想层流量稳定后再 `ensure_non_ideal()`。性能统计为只读第三层，不参与上述失效链。
@@ -293,9 +293,9 @@ h = enthalpy_fn(rec.fluid, T, P)
 | `unmatched_rejection` | 重叠区外放热段（拼接） | 需冷公用工程 |
 | `unmatched_absorption` | 重叠区外吸热段（拼接） | 需热公用工程 |
 
-### 11.3 高层入口 `analyse_pinch`
+### 11.3 高层入口 `analyze_pinch`
 
-[`analyse_pinch`](../core/postprocess.py)：一站式接收 `ProcessRecord` 列表 + `ΔT_min` + `enthalpy_fn`，返回 `PinchResult`：
+[`analyze_pinch`](../core/postprocess.py)：一站式接收 `ProcessRecord` 列表 + `ΔT_min` + `enthalpy_fn`，返回 `PinchResult`：
 
 | 字段 | 含义 |
 |------|------|

@@ -410,8 +410,8 @@ class NonIdealClosedCycleLayer:
       未偏置时为 ``None``。
     - ``properties``：与父层相同的物性求解器。
 
-    由 ``from_closed_cycle_layer`` / ``ClosedCycleLayer.ensure_non_ideal()`` 创建；偏置请调用
-    本模块 :func:`apply_combined_offsets`。
+     由 ``from_closed_cycle_layer`` / ``ClosedCycleLayer.ensure_non_ideal()`` 创建；
+     偏置请调用 ``apply_offsets()`` 或模块级 ``apply_combined_offsets(self)``。
     """
 
     simplified: SimplifiedTopology
@@ -442,6 +442,18 @@ class NonIdealClosedCycleLayer:
             ideal_nodes=layer.nodes,
             properties=layer.properties,
         )
+
+    def apply_offsets(
+        self,
+        heat_efficiency: float | None = None,
+        mechanical_efficiency: float | None = None,
+    ) -> None:
+        """单步应用换热 ``σ`` 与机械 ``η_is`` 偏置，写入 ``self.nodes``。
+
+        委托 :func:`apply_combined_offsets`；详见 ``docs/architecture.md`` §8。
+        """
+        apply_combined_offsets(self, heat_efficiency, mechanical_efficiency)
+
 # ============================================================
 # §6. 节点偏置（单步：换热 σ → 机械组 PS 重置 → DFS ``PS→η→HP``）
 # ----------------------------------------------------------------

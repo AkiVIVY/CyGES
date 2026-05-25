@@ -23,7 +23,7 @@
 - 理想层：PS 离散拓扑、最小 4 节点子循环、子循环流量、活跃子图精简（[`closed_cycle_layer.py`](core/closed_cycle_layer.py)）。
 - 非理想偏置：有向组、组内 `reach` / `layer`（主脊分层）、单步 [`apply_combined_offsets`](core/non_ideal_bias.py)（换热 `σ` → 机械组 PS 重置 → DFS `PS→η→HP`）。
 - 性能统计：精简边过程归类与循环汇总（[`cycle_performance.py`](core/cycle_performance.py)），纯计算、零外部依赖；[`ClosedCycleLayer.performance_report()`](core/closed_cycle_layer.py) 为薄封装。
-- 夹点分析：T-Q 曲线构建（`build_heat_tq_curves`）、夹点平移（`compute_pinch`）、公用工程需求（`analyse_pinch`），全部位于 [`postprocess.py`](core/postprocess.py)。
+- 夹点分析：T-Q 曲线构建（`build_heat_tq_curves`）、夹点平移（`compute_pinch`）、公用工程需求（`analyze_pinch`），全部位于 [`postprocess.py`](core/postprocess.py)。
 - 物性：CoolProp，`state("TP"|"PS"|"HP"|"HS", x, y)`。
 
 **未实现**（勿写进 README 为已完成）
@@ -52,7 +52,7 @@
 
 ### [`core/postprocess.py`](core/postprocess.py)（二次处理）
 
-§1 数据模型 → §2 T-Q 曲线构建 → §3 曲线插值与采样 → §4 夹点计算。T-Q 在 ``ProcessRecord`` 上构建（``build_heat_tq_curves``），夹点分析含底层 ``compute_pinch`` 与高层 ``analyse_pinch``。公式见 architecture §11。
+§1 数据模型 → §2 T-Q 曲线构建 → §3 曲线插值与采样 → §4 夹点计算。T-Q 在 ``ProcessRecord`` 上构建（``build_heat_tq_curves``），夹点分析含底层 ``compute_pinch`` 与高层 ``analyze_pinch``。公式见 architecture §11。
 
 ---
 

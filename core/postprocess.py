@@ -38,7 +38,7 @@ class HeatTQCurve:
 
 
 @dataclass(frozen=True)
-class PinchAnalysisResult:
+class _PinchAnalysisResult:
     """单次夹点分析的冻结结果（底层，输入为 T-Q 曲线）。
 
     ``rejection`` / ``absorption`` 分别对应放热曲线 / 吸热曲线；
@@ -78,7 +78,7 @@ class PinchAnalysisResult:
 class PinchResult:
     """夹点分析结果：公用工程需求与匹配换热曲线。
 
-    由 ``analyse_pinch`` 直接处理 ``ProcessRecord`` 列表生成；
+    由 ``analyze_pinch`` 直接处理 ``ProcessRecord`` 列表生成；
     是 ``Compute_pinch`` 的上层封装。
     """
 
@@ -353,7 +353,7 @@ def compute_pinch(
     rej_curve: HeatTQCurve,
     abs_curve: HeatTQCurve,
     delta_T_min: float = 0.0,
-) -> PinchAnalysisResult:
+) -> _PinchAnalysisResult:
     """在放热/吸热 T-Q 曲线上执行夹点分析。
 
     - 将吸热曲线沿 Q 轴平移 ``delta_Q``，使 ``T_rej(Q) ≥ T_abs(Q - delta_Q) + delta_T_min`` 成立。
@@ -434,7 +434,7 @@ def compute_pinch(
         unmatched_abs_segs.append((hot_end_shifted, Q_c_max))
     unmatched_absorption = _sample_curve_multi_segment(abs_curve, unmatched_abs_segs)
 
-    return PinchAnalysisResult(
+    return _PinchAnalysisResult(
         delta_T_min=delta_T_min,
         delta_Q=delta_Q,
         pinch_T_hot=pinch_T_hot,
@@ -450,7 +450,7 @@ def compute_pinch(
     )
 
 
-def analyse_pinch(
+def analyze_pinch(
     abs_records: list[ProcessRecord],
     rej_records: list[ProcessRecord],
     delta_T_min: float,

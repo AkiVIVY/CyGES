@@ -127,26 +127,26 @@ class PerformanceContext:
 # ============================================================
 
 
-def _pressure_greater(P_tail: float, P_head: float) -> bool:
-    """``P_head`` 是否显著大于 ``P_tail``。"""
+def _pressure_increases(P_tail: float, P_head: float) -> bool:
+    """``P_head`` 是否显著大于 ``P_tail``（压力沿流向上升 → 压缩）。"""
     tol = max(1e-9, 1e-6 * max(abs(P_tail), abs(P_head)))
     return P_head - P_tail > tol
 
 
-def _pressure_less(P_tail: float, P_head: float) -> bool:
-    """``P_tail`` 是否显著大于 ``P_head``。"""
+def _pressure_decreases(P_tail: float, P_head: float) -> bool:
+    """``P_tail`` 是否显著大于 ``P_head``（压力沿流向下降 → 膨胀）。"""
     tol = max(1e-9, 1e-6 * max(abs(P_tail), abs(P_head)))
     return P_tail - P_head > tol
 
 
-def _enthalpy_greater(H_tail: float, H_head: float) -> bool:
-    """``H_head`` 是否显著大于 ``H_tail``。"""
+def _enthalpy_increases(H_tail: float, H_head: float) -> bool:
+    """``H_head`` 是否显著大于 ``H_tail``（焓沿流向上升 → 吸热）。"""
     tol = max(1e-12, 1e-9 * max(abs(H_tail), abs(H_head)))
     return H_head - H_tail > tol
 
 
-def _enthalpy_less(H_tail: float, H_head: float) -> bool:
-    """``H_tail`` 是否显著大于 ``H_head``。"""
+def _enthalpy_decreases(H_tail: float, H_head: float) -> bool:
+    """``H_tail`` 是否显著大于 ``H_head``（焓沿流向下降 → 放热）。"""
     tol = max(1e-12, 1e-9 * max(abs(H_tail), abs(H_head)))
     return H_tail - H_head > tol
 
@@ -159,15 +159,14 @@ def _node_snapshot(node: Node) -> NodeStateSnapshot:
 def _classify_edge(edge: SimplifiedEdge, tail_n: Node, head_n: Node) -> ProcessCategory:
     """沿 ``tail→head`` 判定过程类别；判据见 ``docs/architecture.md`` §10.2。"""
     if edge.kind == "mechanical":
-        if _pressure_greater(tail_n.P, head_n.P):
+        if _pressure_increases(tail_n.P, head_n.P):
             return ProcessCategory.COMPRESSION
-        if _pressure_less(tail_n.P, head_n.P):
+        if _pressure_decreases(tail_n.P, head_n.P):
             return ProcessCategory.EXPANSION
-        return ProcessCategory.ISOBARIC_MECHANICAL
 
-    if _enthalpy_greater(tail_n.H, head_n.H):
+    if _enthalpy_increases(tail_n.H, head_n.H):
         return ProcessCategory.HEAT_ABSORPTION
-    if _enthalpy_less(tail_n.H, head_n.H):
+    if _enthalpy_decreases(tail_n.H, head_n.H):
         return ProcessCategory.HEAT_REJECTION
     warnings.warn(
         f"精简换热边 {edge.tail!r}→{edge.head!r} 的 ΔH 在容差内为零，归为吸热。",
