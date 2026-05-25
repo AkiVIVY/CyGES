@@ -9,15 +9,11 @@ T-Q 曲线在 ``ProcessRecord`` 上按温度节点离散累积；夹点分析通
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import config as cyges_config
 from core.cycle_performance import CyclePerformanceReport, ProcessCategory, ProcessRecord
-
-
-EnthalpyLookup = Callable[[str, float, float], float]
-"""(fluid: str, T[K], P[kPa]) -> H[kJ/kg]，用于 T-Q 曲线构建时按工质与温压查焓。"""
+from core.fluid_property_solver import PropertyRegistry
 
 
 # ============================================================
@@ -124,7 +120,7 @@ def _interp_pressure_by_temperature(rec: ProcessRecord, T: float) -> float:
 def _build_heat_tq_curve(
     records: list[ProcessRecord],
     category: ProcessCategory,
-    enthalpy_fn: EnthalpyLookup,
+    props: PropertyRegistry,
 ) -> HeatTQCurve:
     """按温度节点离散并填充区间能量（TP 查焓），生成单条 T-Q 折线。
 
@@ -168,8 +164,8 @@ def _build_heat_tq_curve(
             Tb = min(hi, b)
             Pa = _interp_pressure_by_temperature(rec, Ta)
             Pb = _interp_pressure_by_temperature(rec, Tb)
-            h_a = float(enthalpy_fn(rec.fluid, Ta, Pa))
-            h_b = float(enthalpy_fn(rec.fluid, Tb, Pb))
+            h_a = float(props.enthalpy(rec.fluid, Ta, Pa))
+            h_b = float(props.enthalpy(rec.fluid, Tb, Pb))
             interval_q[i] += m_abs * abs(h_b - h_a)
 
     q_points = [0.0]
@@ -184,12 +180,12 @@ def _build_heat_tq_curve(
 
 def build_heat_tq_curves(
     report: CyclePerformanceReport,
-    enthalpy_fn: EnthalpyLookup,
+    props: PropertyRegistry,
 ) -> tuple[HeatTQCurve, ...]:
     """从 ``CyclePerformanceReport`` 构建吸热和放热 T-Q 折线。
 
     :param report: 含 ``by_edge`` 的性能报告。
-    :param enthalpy_fn: ``(fluid, T, P) → H``，通常为 ``lambda f, T, P: properties.state("TP", T, P)["H"]``。
+    :param props: 物性注册表，用于 ``props.enthalpy(fluid, T, P)`` 查询。
     :returns: 一条或两条 ``HeatTQCurve``（吸热/放热）。
     """
     heat_records = [
@@ -198,7 +194,7 @@ def build_heat_tq_curves(
     ]
     tq_curves: list[HeatTQCurve] = []
     for cat in (ProcessCategory.HEAT_ABSORPTION, ProcessCategory.HEAT_REJECTION):
-        curve = _build_heat_tq_curve(heat_records, cat, enthalpy_fn)
+        curve = _build_heat_tq_curve(heat_records, cat, props)
         if len(curve.q_points) > 1 or curve.t_points[0] != 0.0:
             tq_curves.append(curve)
     return tuple(tq_curves)
@@ -454,7 +450,7 @@ def analyze_pinch(
     abs_records: list[ProcessRecord],
     rej_records: list[ProcessRecord],
     delta_T_min: float,
-    enthalpy_fn: EnthalpyLookup,
+    props: PropertyRegistry,
     *,
     threshold_fraction: float | None = None,
 ) -> PinchResult:
@@ -468,14 +464,14 @@ def analyze_pinch(
     :param abs_records: 吸热过程 ``ProcessRecord`` 列表。
     :param rej_records: 放热过程 ``ProcessRecord`` 列表。
     :param delta_T_min: 夹点最小温差 [K]。
-    :param enthalpy_fn: ``(T, P) → H``，用于 T-Q 曲线构建时查焓。
+    :param props: 物性注册表，用于 ``props.enthalpy(fluid, T, P)`` 查询。
     :param threshold_fraction: 额外曲线截断阈值比例 [0,1]；默认取 ``config.PINCH_EXTRA_CURVE_FRACTION_THRESHOLD``。
     """
     if threshold_fraction is None:
         threshold_fraction = cyges_config.PINCH_EXTRA_CURVE_FRACTION_THRESHOLD
 
-    abs_curve = _build_heat_tq_curve(abs_records, ProcessCategory.HEAT_ABSORPTION, enthalpy_fn)
-    rej_curve = _build_heat_tq_curve(rej_records, ProcessCategory.HEAT_REJECTION, enthalpy_fn)
+    abs_curve = _build_heat_tq_curve(abs_records, ProcessCategory.HEAT_ABSORPTION, props)
+    rej_curve = _build_heat_tq_curve(rej_records, ProcessCategory.HEAT_REJECTION, props)
 
     pa = compute_pinch(rej_curve, abs_curve, delta_T_min)
 

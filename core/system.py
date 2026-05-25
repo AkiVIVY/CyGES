@@ -15,9 +15,8 @@ from core.cycle_performance import (
     ProcessCategory,
     ProcessRecord,
 )
-from core.fluid_property_solver import ThermoLookup, ThermoStateTPHS
+from core.fluid_property_solver import PropertyRegistry, ThermoStateTPHS
 from core.postprocess import (
-    EnthalpyLookup,
     PinchResult,
     analyze_pinch,
 )
@@ -89,15 +88,15 @@ def _source_to_record(
     src: ExternalSourceInput,
     edge_key: str,
     category: ProcessCategory,
-    thermo_fn: ThermoLookup,
+    props: PropertyRegistry,
 ) -> ProcessRecord:
     """将单个外部源转换为 ``ProcessRecord``。
 
     通过 ``thermo_fn(fluid, "TP", T, P)`` 查询进出口完整状态（T/P/H/S）。
     index 用负值以区分拓扑节点。
     """
-    in_state: ThermoStateTPHS = thermo_fn(src.fluid, "TP", src.T_in, src.P_in)
-    out_state: ThermoStateTPHS = thermo_fn(src.fluid, "TP", src.T_out, src.P_out)
+    in_state: ThermoStateTPHS = props(src.fluid, "TP", src.T_in, src.P_in)
+    out_state: ThermoStateTPHS = props(src.fluid, "TP", src.T_out, src.P_out)
 
     tail_snap = NodeStateSnapshot(
         index=-1,
@@ -133,12 +132,12 @@ def _source_to_record(
 def convert_sources(
     heat_sources: tuple[ExternalSourceInput, ...],
     cold_sources: tuple[ExternalSourceInput, ...],
-    thermo_fn: ThermoLookup,
+    props: PropertyRegistry,
 ) -> tuple[tuple[ProcessRecord, ...], tuple[ProcessRecord, ...]]:
     """将外部冷/热源批量转换为 ``ProcessRecord`` 元组。
 
     热源 → ``HEAT_REJECTION``，冷源 → ``HEAT_ABSORPTION``。
-    ``thermo_fn(fluid, "TP", T, P)`` 须返回含 T/P/H/S 的完整状态。
+    ``props(fluid, "TP", T, P)`` 须返回含 T/P/H/S 的完整状态。
     """
     hr: list[ProcessRecord] = []
     for i, src in enumerate(heat_sources):
@@ -168,7 +167,7 @@ class SystemPipeline:
     def run(self, thermo_fn: ThermoLookup) -> SystemResult:
         """执行系统级分析。
 
-        :param thermo_fn: 多工药物性查询 ``(fluid, pair, x, y) → ThermoStateTPHS``。
+        :param props: 多工质物性注册表，用于 ``props(fluid, pair, x, y)`` 查询完整状态。
         """
         inp = self._input
 
@@ -204,7 +203,6 @@ class SystemPipeline:
                     cycle_all_abs.append(rec)
 
         # 3. 循环内部夹点
-        enthalpy_fn: EnthalpyLookup = lambda f, T, P: thermo_fn(f, "TP", T, P)["H"]
         cycle_pinch: PinchResult | None = None
         cycle_unmatched_rej: list[ProcessRecord] = list(cycle_all_rej)
         cycle_unmatched_abs: list[ProcessRecord] = list(cycle_all_abs)
@@ -213,7 +211,7 @@ class SystemPipeline:
             cfg = inp.cycles[0]
             if cfg.internal_pinch_dT > 0.0 and cycle_all_rej and cycle_all_abs:
                 cycle_pinch = analyze_pinch(
-                    cycle_all_abs, cycle_all_rej, cfg.internal_pinch_dT, enthalpy_fn,
+                    cycle_all_abs, cycle_all_rej, cfg.internal_pinch_dT, props,
                 )
 
         # 4. 系统级夹点：循环换热 + 外部冷热源
@@ -223,7 +221,7 @@ class SystemPipeline:
             all_rej = list(heat_records) + cycle_unmatched_rej
             if all_abs and all_rej:
                 system_pinch = analyze_pinch(
-                    all_abs, all_rej, inp.delta_T_min, enthalpy_fn,
+                    all_abs, all_rej, inp.delta_T_min, props,
                 )
 
         return SystemResult(

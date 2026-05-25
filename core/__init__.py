@@ -29,7 +29,7 @@ from core.fluid_property_solver import (
     CoolPropFluidPropertySolver,
     FluidPropertySolver,
     PropertyPair,
-    ThermoLookup,
+    PropertyRegistry,
     ThermoStateTPHS,
 )
 from core.non_ideal_bias import (
@@ -53,7 +53,6 @@ from core.cycle_performance import (
     resolve_performance_context,
 )
 from core.postprocess import (
-    EnthalpyLookup,
     HeatTQCurve,
     PinchResult,
     analyze_pinch,
@@ -82,6 +81,7 @@ __all__ = [
     "CoolPropFluidPropertySolver",
     "FluidPropertySolver",
     "PropertyPair",
+    "PropertyRegistry",
     "ThermoStateTPHS",
     "MERGED_ISOLATED_NODE_EDGE_KEY",
     "NonIdealClosedCycleLayer",
@@ -98,7 +98,6 @@ __all__ = [
     "apply_combined_offsets",
     "CyclePerformanceReport",
     "CycleTotals",
-    "EnthalpyLookup",
     "HeatTQCurve",
     "NodeStateSnapshot",
     "PerformanceContext",

@@ -11,7 +11,6 @@ T[K]、P[kPa]、H[kJ/kg]、S[kJ/(kg·K)]；内部 CoolProp 使用 SI。
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 
 import CoolProp.CoolProp as CP
@@ -35,12 +34,6 @@ class ThermoStateTPHS(TypedDict):
     P: float
     H: float
     S: float
-
-
-# 多工质通用物性查询：(fluid, pair, x, y) → ThermoStateTPHS
-# 与 EnthalpyLookup 互补——前者用于完整状态查询（如 convert_sources），
-# 后者仅返回焓值用于 T-Q 曲线构建。
-ThermoLookup = Callable[[str, str, float, float], ThermoStateTPHS]
 
 
 def _tphs(t_k: float, p_kpa: float, h_kjkg: float, s_kj_per_kgk: float) -> ThermoStateTPHS:
@@ -136,3 +129,33 @@ class CoolPropFluidPropertySolver:
 
         # 理论上 Literal 已约束；保留分支便于扩展或运行时校验
         raise ValueError(f"不支持的 pair：{pair!r}，应为 HP、TP、HS、PS 之一")
+
+
+class PropertyRegistry:
+    """多工质物性注册表，按 fluid 缓存 ``CoolPropFluidPropertySolver``。
+
+    统一入口，替代 ``ThermoLookup`` 与 ``EnthalpyLookup`` 类型别名：
+    ``__call__`` 用于完整状态查询（convert_sources），
+    ``enthalpy`` 用于焓值查询（T-Q 构建）。
+
+    用法::
+
+        props = PropertyRegistry()
+        state = props("He", "TP", 300, 101.325)       # → ThermoStateTPHS
+        h = props.enthalpy("He", 300, 101.325)         # → float
+    """
+
+    __slots__ = ("_solvers",)
+
+    def __init__(self) -> None:
+        self._solvers: dict[str, CoolPropFluidPropertySolver] = {}
+
+    def __call__(self, fluid: str, pair: str, x: float, y: float) -> ThermoStateTPHS:
+        """``(fluid, pair, x, y) → ThermoStateTPHS``，匹配原 ``ThermoLookup`` 签名。"""
+        if fluid not in self._solvers:
+            self._solvers[fluid] = CoolPropFluidPropertySolver(fluid)
+        return self._solvers[fluid].state(pair, x, y)  # type: ignore[arg-type]
+
+    def enthalpy(self, fluid: str, T: float, P: float) -> float:
+        """``(fluid, T, P) → H``，匹配原 ``EnthalpyLookup`` 签名。"""
+        return self(fluid, "TP", T, P)["H"]
