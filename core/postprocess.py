@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import config as cyges_config
 from core.cycle_performance import CyclePerformanceReport, ProcessCategory, ProcessRecord
 from core.fluid_property_solver import PropertyRegistry
 
@@ -112,6 +111,10 @@ class PinchResult:
     """吸热曲线平移量 [kW]。"""
     pinch_Q_hot: float
     """夹点处放热坐标系 Q 值 [kW]。"""
+    hot_utility_ratio: float
+    """热源需求占比：``hot_utility_demand / min(|吸热总量|, |放热总量|)``。"""
+    cold_utility_ratio: float
+    """冷源需求占比：``cold_utility_demand / min(|吸热总量|, |放热总量|)``。"""
 
 
 # ============================================================
@@ -581,25 +584,19 @@ def analyze_pinch(
     rej_records: list[ProcessRecord],
     delta_T_min: float,
     props: PropertyRegistry,
-    *,
-    threshold_fraction: float | None = None,
 ) -> PinchResult:
     """夹点分析入口：接收吸热/放热过程记录与夹点温差，输出公用工程需求与匹配/额外换热曲线。
 
     - 内部先构建吸热/放热 T-Q 曲线，再执行 ``compute_pinch`` 平移与区段分离。
     - 公用工程需求直接由非重叠区段 Q 跨度计算。
     - ``extra_absorption`` / ``extra_rejection`` 来自夹点平移后的非重叠区段；
-      若其热量占该过程总换热的比例低于 ``threshold_fraction`` 则不输出（``None``）。
+      无对应非重叠时为 ``None``。
 
     :param abs_records: 吸热过程 ``ProcessRecord`` 列表。
     :param rej_records: 放热过程 ``ProcessRecord`` 列表。
     :param delta_T_min: 夹点最小温差 [K]。
     :param props: 物性注册表，用于 ``props.enthalpy(fluid, T, P)`` 查询。
-    :param threshold_fraction: 额外曲线截断阈值比例 [0,1]；默认取 ``config.PINCH_EXTRA_CURVE_FRACTION_THRESHOLD``。
     """
-    if threshold_fraction is None:
-        threshold_fraction = cyges_config.PINCH_EXTRA_CURVE_FRACTION_THRESHOLD
-
     abs_curve = _build_heat_tq_curve(abs_records, ProcessCategory.HEAT_ABSORPTION, props)
     rej_curve = _build_heat_tq_curve(rej_records, ProcessCategory.HEAT_REJECTION, props)
 
@@ -615,16 +612,8 @@ def analyze_pinch(
     # hot_utility  = 左端（吸热无对应放热）+ 右端（吸热超出放热）
     hot_utility = max(0.0, -dq) + max(0.0, dq + Q_c_max - Q_h_max)
 
-    # 额外曲线：低于阈值比例则不输出（用公用工程总量，避免多段曲线 q_points[-1] 取错）
     extra_abs = pa.unmatched_absorption
-    if extra_abs is not None and Q_c_max > 1e-12:
-        if hot_utility / Q_c_max < threshold_fraction:
-            extra_abs = None
-
     extra_rej = pa.unmatched_rejection
-    if extra_rej is not None and Q_h_max > 1e-12:
-        if cold_utility / Q_h_max < threshold_fraction:
-            extra_rej = None
 
     return PinchResult(
         delta_T_min=delta_T_min,
@@ -640,4 +629,6 @@ def analyze_pinch(
         pinch_T_cold=pa.pinch_T_cold,
         delta_Q=dq,
         pinch_Q_hot=pa.pinch_Q_hot,
+        hot_utility_ratio=hot_utility / min(abs(Q_c_max), abs(Q_h_max)) if min(abs(Q_c_max), abs(Q_h_max)) > 1e-12 else 0.0,
+        cold_utility_ratio=cold_utility / min(abs(Q_c_max), abs(Q_h_max)) if min(abs(Q_c_max), abs(Q_h_max)) > 1e-12 else 0.0,
     )

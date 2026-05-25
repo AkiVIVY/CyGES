@@ -17,11 +17,6 @@ SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT: float = 0.01
 MASS_FLOW_MIN_DEFAULT: float = -5.0
 MASS_FLOW_MAX_DEFAULT: float = 10.0
 
-# 夹点分析：额外换热曲线截断阈值。
-# ``analyze_pinch`` 中，若额外吸热/放热量占该过程总换热的比例低于此值，
-# 则 ``PinchResult.extra_absorption`` / ``extra_rejection`` 为 ``None``。
-PINCH_EXTRA_CURVE_FRACTION_THRESHOLD: float = 0.01
-
 # 非理想精简「机械边」统一等熵效率 η_is ∈ (0, 1]。
 # 拓扑上 mechanical 边表示叶轮机械工作过程（压缩/膨胀等）；非理想层后续按该 η_is
 # 修正状态（等熵效率定义：实际功与等熵功之比，或等价的焓升/降相对理想过程的折减）。
