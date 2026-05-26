@@ -18,4 +18,4 @@ NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT: float = 0.9
 # 拓扑上 heat 边表示换热过程（加热/冷却）；σ 表征流经该过程后工质总压相对理想
 # 换热路径的保留程度（``non_ideal_bias._apply_combined_offsets`` 步骤 1：P ← P_ideal × σ^layer）。
 # 临时配置：组内所有精简换热边 SH* 共用该值，后续会按边分别赋值。
-NON_IDEAL_HEAT_EFFICIENCY_DEFAULT: float = 0.95
+NON_IDEAL_HEAT_EFFICIENCY_DEFAULT: float = 0.98

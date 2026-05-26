@@ -216,13 +216,16 @@ H1 = state("PS", P_u, S_k)["H"]
 
 ### 9.2 管线流程
 
-``SystemPipeline.run(props)``，根据 ``SystemInput.heat_method`` 选择三种模式：
+``SystemPipeline.run(props)``，根据 ``SystemInput.heat_method`` 选择四种模式：
 
 | Mode | `heat_method` | 步骤 3（循环内部） | 步骤 4（系统级） |
 |------|---------------|---------------------|---------------------|
 | 1 | `"system_pinch"` | 跳过 | 冷源 + 循环全量吸热 vs 热源 + 循环全量放热 |
 | 2 | `"pinch"` | `analyze_pinch` 匹配循环自身换热，多余拆回 ProcessRecord | 冷源 + 未匹配吸热 vs 热源 + 未匹配放热 |
 | 3 | `"split_pinch"` | 同 Mode 2 | 未匹配吸热 vs 热源（`hot_match_pinch`）；冷源 vs 未匹配放热（`cold_match_pinch`） |
+| 4 | `"source_pinch"` | 跳过 | 热源 vs 循环吸热（`source_hot_pinch`）+ 冷源 vs 循环放热（`source_cold_pinch`），残差统一匹配（`system_pinch`） |
+
+**当前最优模式**：`"system_pinch"`——所有换热过程统一匹配，最低冷源流量、最低温度需求、最高输出功率。
 
 ### 9.3 输出
 
@@ -233,9 +236,11 @@ H1 = state("PS", P_u, S_k)["H"]
 | `heat_source_records` / `cold_source_records` | 外部源转换结果 |
 | `cycle_reports` | 各闭式循环性能报告 |
 | `cycle_pinch` | 循环内部夹点结果（``None`` = 未执行） |
-| `system_pinch` | 系统级夹点结果（Mode 1/2；Mode 3 为 ``None``） |
+| `system_pinch` | 系统级夹点结果（Mode 1/2/4；Mode 3 为 ``None``） |
 | `hot_match_pinch` | Mode 3：未匹配吸热 vs 热源夹点 |
 | `cold_match_pinch` | Mode 3：冷源 vs 未匹配放热夹点 |
+| `source_hot_pinch` | Mode 4：热源 vs 循环吸热夹点 |
+| `source_cold_pinch` | Mode 4：冷源 vs 循环放热夹点 |
 
 ---
 

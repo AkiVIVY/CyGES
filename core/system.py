@@ -72,7 +72,8 @@ class SystemInput:
     """系统换热处理方法：
     ``"system_pinch"`` — 所有换热在系统级统一匹配；
     ``"pinch"`` — 循环内部先匹配，未匹配部分 + 外部源在系统级匹配；
-    ``"split_pinch"`` — 循环内部先匹配，未匹配吸热 vs 热源、未匹配放热 vs 冷源分别匹配。"""
+    ``"split_pinch"`` — 循环内部先匹配，未匹配吸热 vs 热源、未匹配放热 vs 冷源分别匹配；
+    ``"source_pinch"`` — 热源先匹配循环吸热、冷源先匹配循环放热，剩余过程在系统级统一匹配。"""
     mechanical_method: str | None = None
     """系统机械边处理方法（预留）。"""
 
@@ -92,6 +93,10 @@ class SystemResult:
     """Mode ``"split_pinch"``：循环未匹配吸热 vs 热源的夹点结果。"""
     cold_match_pinch: PinchResult | None = None
     """Mode ``"split_pinch"``：冷源 vs 循环未匹配放热的夹点结果。"""
+    source_hot_pinch: PinchResult | None = None
+    """Mode ``"source_pinch"``：热源 vs 循环吸热的夹点结果。"""
+    source_cold_pinch: PinchResult | None = None
+    """Mode ``"source_pinch"``：冷源 vs 循环放热的夹点结果。"""
     objective: float | None = None
 
 
@@ -243,10 +248,12 @@ class SystemPipeline:
                         cycle_pinch.extra_absorption, props,
                     )
 
-        # 4. 系统级夹点（三种模式）
+        # 4. 系统级夹点（四种模式）
         system_pinch: PinchResult | None = None
         hot_match_pinch: PinchResult | None = None
         cold_match_pinch: PinchResult | None = None
+        source_hot_pinch: PinchResult | None = None
+        source_cold_pinch: PinchResult | None = None
         method = inp.heat_method
 
         if method == "system_pinch":
@@ -274,6 +281,49 @@ class SystemPipeline:
                     list(cold_records), cycle_unmatched_rej, inp.delta_T_min, props,
                 )
 
+        elif method == "source_pinch":
+            # Mode 4: 热源先匹配循环吸热、冷源先匹配循环放热，剩余统一匹配
+            source_residual_rej: list[ProcessRecord] = []
+            source_residual_abs: list[ProcessRecord] = []
+
+            # 热源（放热）vs 循环吸热
+            if cycle_all_abs and list(heat_records):
+                source_hot_pinch = analyze_pinch(
+                    cycle_all_abs, list(heat_records), inp.delta_T_min, props,
+                )
+                if source_hot_pinch.extra_rejection is not None:
+                    source_residual_rej.extend(
+                        split_tq_curve_to_records(source_hot_pinch.extra_rejection, props)
+                    )
+                if source_hot_pinch.extra_absorption is not None:
+                    source_residual_abs.extend(
+                        split_tq_curve_to_records(source_hot_pinch.extra_absorption, props)
+                    )
+            else:
+                # 无边时全量透传
+                source_residual_rej = list(heat_records)
+                source_residual_abs = cycle_all_abs
+
+            # 冷源（吸热）vs 循环放热
+            if list(cold_records) and cycle_all_rej:
+                source_cold_pinch = analyze_pinch(
+                    list(cold_records), cycle_all_rej, inp.delta_T_min, props,
+                )
+                if source_cold_pinch.extra_rejection is not None:
+                    source_residual_rej.extend(
+                        split_tq_curve_to_records(source_cold_pinch.extra_rejection, props)
+                    )
+                if source_cold_pinch.extra_absorption is not None:
+                    source_residual_abs.extend(
+                        split_tq_curve_to_records(source_cold_pinch.extra_absorption, props)
+                    )
+
+            # 残差统一匹配
+            if source_residual_abs and source_residual_rej:
+                system_pinch = analyze_pinch(
+                    source_residual_abs, source_residual_rej, inp.delta_T_min, props,
+                )
+
         return SystemResult(
             heat_source_records=heat_records,
             cold_source_records=cold_records,
@@ -282,5 +332,7 @@ class SystemPipeline:
             system_pinch=system_pinch,
             hot_match_pinch=hot_match_pinch,
             cold_match_pinch=cold_match_pinch,
+            source_hot_pinch=source_hot_pinch,
+            source_cold_pinch=source_cold_pinch,
             objective=None,
         )
