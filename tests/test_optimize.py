@@ -39,7 +39,6 @@ def _make_system_input() -> SystemInput:
     cycle_input = ClosedCycleTPInput(
         fluid="He", t_min=40.0, t_max=1000.0, p_min=2000.0, p_max=20000.0,
         t_quantiles=(0.5,), p_quantiles=(0.5,),
-        mass_flow_min=-10.0, mass_flow_max=50.0,
         subcycle_mass_flow_initial=20.0,
     )
     return SystemInput(
@@ -56,14 +55,15 @@ def test_optimize_min_max_utility() -> None:
     """差分进化优化，每代打印进度并绘制残差下降曲线。"""
     sys_inp = _make_system_input()
     props = PropertyRegistry()
-    opt = Optimizer(base_input=sys_inp, props=props, objective="min_max_utility")
+    opt = Optimizer(base_input=sys_inp, props=props, objective="min_max_utility",
+                    mf_step_fraction=0.0, quantile_step=0.0)
 
     print(f"\n维度: {len(opt.bounds)} (t_max + t_q + p_q + {opt._max_sc}×mf)")
-    print("CMA-ES, popsize=30, maxiter=300, seed=42\n")
+    print("DE, popsize=30, maxiter=300, seed=42, 无步长限制\n")
 
     history: list[tuple[int, float]] = []  # (gen, best_val)
 
-    def _on_gen(gen: int, best_x: list[float], best_val: float, n_evals: int) -> None:
+    def _on_gen(gen: int, restart: int, best_x: list[float], best_val: float, n_evals: int) -> None:
         history.append((gen, best_val))
         t_max, t_min, tq, pq = best_x[0], best_x[1], best_x[2], best_x[3]
         mf_str = ", ".join(f"{best_x[4+i]:.1f}" for i in range(6) if abs(best_x[4+i]) > 1e-6)
@@ -75,7 +75,7 @@ def test_optimize_min_max_utility() -> None:
 
     print("  开始优化...\n")
     result = opt.run(
-        method="cma", maxiter=300, seed=42, early_stop=30, sigma0=0.3,
+        method="de", popsize=30, maxiter=300, seed=42, early_stop=30,
         callback=_on_gen,
     )
 
@@ -210,7 +210,6 @@ def test_optimize_min_max_utility() -> None:
     tp_opt = ClosedCycleTPInput(
         fluid="He", t_min=t_min_opt, t_max=t_max_opt, p_min=2000.0, p_max=20000.0,
         t_quantiles=t_q_opt, p_quantiles=p_q_opt,
-        mass_flow_min=-10.0, mass_flow_max=50.0,
     )
     layer_opt = ClosedCycleLayer(tp_opt)
     mf_opt = [float(result.x_opt[4+i]) for i in range(min(len(layer_opt.subcycles), len(result.x_opt)-4))]

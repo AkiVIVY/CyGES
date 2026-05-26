@@ -51,8 +51,6 @@ def _make_system_input(use_non_ideal: bool) -> SystemInput:
         p_max=20000.0,
         t_quantiles=(0.5,),
         p_quantiles=(0.5,),
-        mass_flow_min=-10.0,
-        mass_flow_max=50.0,
         subcycle_mass_flow_initial=20.0,
     )
 
@@ -411,3 +409,4 @@ def test_system_full_visualization() -> None:
     fig5.tight_layout()
     fig5.savefig(TESTS_DIR / "full_05_system_pinch_composition.png", dpi=150)
     plt.close(fig5)
+test_system_full_visualization()

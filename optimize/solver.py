@@ -25,11 +25,11 @@ def _differential_evolution(
     CR: float = 0.9,
     seed: int | None = 42,
     early_stop: int = 30,
-    callback: Callable[[int, list[float], float, int], None] | None = None,
+    callback: Callable[[int, int, list[float], float, int], None] | None = None,
 ) -> tuple[list[float], float, int]:
     """DE/rand/1/bin 单目标差分进化。
 
-    :param callback: 每代末调用 ``callback(gen, best_x, best_val, n_evals)``；``None`` 不回调。
+    :param callback: 每代末调用 ``callback(gen, restart, best_x, best_val, n_evals)``；``None`` 不回调。
     :returns: ``(best_x, best_val, n_evaluations)``。
     """
     rng = random.Random(seed)
@@ -88,7 +88,7 @@ def _differential_evolution(
                 stall += 1
 
         if callback is not None:
-            callback(gen, best_x, best_val, n_evals)
+            callback(gen, 0, best_x, best_val, n_evals)
 
         if stall >= early_stop * popsize:
             break
@@ -105,10 +105,11 @@ def _cma_evolution(
     seed: int | None = 42,
     early_stop: int = 30,
     restarts: int = 5,
-    callback: Callable[[int, list[float], float, int], None] | None = None,
+    callback: Callable[[int, int, list[float], float, int], None] | None = None,
 ) -> tuple[list[float], float, int]:
     """CMA-ES + 多起点重启（BIPOP 风格），自动交替大小种群避免局部最优。
 
+    :param callback: 每代末调用 ``callback(gen, restart, best_x, best_val, n_evals)``。
     :returns: ``(best_x, best_val, n_evaluations)``。
     """
     import cma
@@ -168,7 +169,7 @@ def _cma_evolution(
                 stall += 1
 
             if callback is not None:
-                callback(gen_offset + gen, global_best_x, global_best_val, total_evals)
+                callback(gen, restart, global_best_x, global_best_val, total_evals)
 
             if gen >= maxiter or stall >= early_stop * len(solutions):
                 break
@@ -178,8 +179,20 @@ def _cma_evolution(
     return global_best_x, global_best_val, total_evals
 
 
+def _round_and_dedup(values: tuple[float, ...], step: float) -> tuple[float, ...]:
+    """舍入到 step 整数倍，去重，夹在 [step, 1-step] 内。
+
+    ``step <= 0`` 时不做离散化，原值返回。
+    """
+    if step <= 0.0:
+        return values
+    lo, hi = step, 1.0 - step
+    rounded = sorted(set(max(lo, min(hi, round(v / step) * step)) for v in values))
+    return tuple(rounded)
+
+
 class Optimizer:
-    """单目标差分进化优化器。
+    """单目标优化器，支持 DE 和 CMA-ES。
 
     用法::
 
@@ -194,6 +207,9 @@ class Optimizer:
         props: PropertyRegistry,
         objective: str | Callable[[SystemResult], float] = "min_max_utility",
         max_subcycles: int | None = None,
+        mf_step_fraction: float = 0.001,
+        quantile_step: float = 0.02,
+        mf_bounds: tuple[float, float] = (-10.0, 50.0),
     ):
         if not base_input.cycles:
             raise ValueError("base_input 须包含至少一个 CycleConfig")
@@ -202,6 +218,9 @@ class Optimizer:
         self._props = props
         self._base_cfg = base_input.cycles[0]
         self._base_tp = self._base_cfg.input
+        self._mf_step = mf_step_fraction
+        self._qstep = quantile_step
+        self._mf_lo, self._mf_hi = mf_bounds
 
         if isinstance(objective, str):
             if objective not in OBJECTIVES:
@@ -226,17 +245,17 @@ class Optimizer:
 
     @property
     def bounds(self) -> list[tuple[float, float]]:
-        """参数边界：t_max [500,1000] + t_min [40,100] + 分位 [0.005, 0.995] + 流量。"""
+        """参数边界：t_max [500,1000] + t_min [40,100] + 分位 [0.01, 0.99] + 流量。"""
         b: list[tuple[float, float]] = []
-        b.append((900.0, 1000.0))
+        b.append((500.0, 1000.0))
         b.append((40.0, 100.0))
         for _ in range(self._n_t_q):
-            b.append((0.005, 0.995))
+            b.append((0.01, 0.99))
         for _ in range(self._n_p_q):
-            b.append((0.005, 0.995))
+            b.append((0.01, 0.99))
 
-        mf_lo = float(self._base_tp.mass_flow_min)
-        mf_hi = float(self._base_tp.mass_flow_max)
+        mf_lo = self._mf_lo
+        mf_hi = self._mf_hi
         for _ in range(self._max_sc):
             b.append((mf_lo, mf_hi))
 
@@ -247,11 +266,16 @@ class Optimizer:
         idx = 0
         t_max = float(x[idx]); idx += 1
         t_min = float(x[idx]); idx += 1
-        t_q = tuple(x[idx + i] for i in range(self._n_t_q))
+        t_q = _round_and_dedup(tuple(x[idx + i] for i in range(self._n_t_q)), self._qstep)
         idx += self._n_t_q
-        p_q = tuple(x[idx + i] for i in range(self._n_p_q))
+        p_q = _round_and_dedup(tuple(x[idx + i] for i in range(self._n_p_q)), self._qstep)
         idx += self._n_p_q
         mf_all = x[idx:]
+
+        # 流量离散化
+        mf_step = self._mf_step * (self._mf_hi - self._mf_lo)
+        if mf_step > 0:
+            mf_all = [round(m / mf_step) * mf_step for m in mf_all]
 
         tp = ClosedCycleTPInput(
             fluid=self._base_tp.fluid,
@@ -261,9 +285,6 @@ class Optimizer:
             p_max=self._base_tp.p_max,
             t_quantiles=t_q,
             p_quantiles=p_q,
-            mass_flow_min=self._base_tp.mass_flow_min,
-            mass_flow_max=self._base_tp.mass_flow_max,
-            subcycle_mass_flow_step_fraction=self._base_tp.subcycle_mass_flow_step_fraction,
             subcycle_mass_flow_initial=self._base_tp.subcycle_mass_flow_initial,
         )
 
@@ -312,7 +333,7 @@ class Optimizer:
         sigma0: float = 0.3,
         seed: int | None = 42,
         early_stop: int = 30,
-        callback: Callable[[int, list[float], float, int], None] | None = None,
+        callback: Callable[[int, int, list[float], float, int], None] | None = None,
     ) -> OptimizationResult:
         """执行优化。
 
@@ -365,11 +386,15 @@ class Optimizer:
         idx = 0
         t_max = float(x[idx]); idx += 1
         t_min = float(x[idx]); idx += 1
-        t_q = tuple(x[idx + i] for i in range(self._n_t_q))
+        t_q = _round_and_dedup(tuple(x[idx + i] for i in range(self._n_t_q)), self._qstep)
         idx += self._n_t_q
-        p_q = tuple(x[idx + i] for i in range(self._n_p_q))
+        p_q = _round_and_dedup(tuple(x[idx + i] for i in range(self._n_p_q)), self._qstep)
         idx += self._n_p_q
         mf_all = x[idx:]
+
+        mf_step = self._mf_step * (self._mf_hi - self._mf_lo)
+        if mf_step > 0:
+            mf_all = [round(m / mf_step) * mf_step for m in mf_all]
 
         tp = ClosedCycleTPInput(
             fluid=self._base_tp.fluid,
@@ -379,9 +404,6 @@ class Optimizer:
             p_max=self._base_tp.p_max,
             t_quantiles=t_q,
             p_quantiles=p_q,
-            mass_flow_min=self._base_tp.mass_flow_min,
-            mass_flow_max=self._base_tp.mass_flow_max,
-            subcycle_mass_flow_step_fraction=self._base_tp.subcycle_mass_flow_step_fraction,
             subcycle_mass_flow_initial=self._base_tp.subcycle_mass_flow_initial,
         )
 

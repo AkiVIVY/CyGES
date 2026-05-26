@@ -4,18 +4,9 @@ CyGES 项目级可调数值参数（不含密钥）。
 运行拓扑等代码时请保证项目根在 ``PYTHONPATH`` 中，以便 ``import config``。
 """
 
-# 子循环质量流在 ``ClosedCycleLayer.analyze_topology`` 中的初值：
-# 每项 = mass_flow_min + SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX * (mass_flow_max - mass_flow_min)
-# （``mass_flow_min`` / ``mass_flow_max`` 见 ``ClosedCycleTPInput``）
-SUBCYCLE_INITIAL_MASS_FLOW_FRACTION_OF_MAX: float = 0.1
-
-# 子循环质量流量化：步长 = subcycle_mass_flow_step_fraction * (mass_flow_max - mass_flow_min)；
-# ``ClosedCycleTPInput`` 未显式传入 ``subcycle_mass_flow_step_fraction`` 时使用本默认值。
-SUBCYCLE_MASS_FLOW_STEP_FRACTION_DEFAULT: float = 0.001
-
-# 全层子循环质量流量边界默认值 [kg/s]；``ClosedCycleTPInput`` 未显式传入时使用。
-MASS_FLOW_MIN_DEFAULT: float = -5.0
-MASS_FLOW_MAX_DEFAULT: float = 10.0
+# 子循环质量流在 ``ClosedCycleLayer.analyze_topology`` 中的默认初值 [kg/s]；
+# ``ClosedCycleTPInput.subcycle_mass_flow_initial`` 非 ``None`` 时优先使用。
+SUBCYCLE_INITIAL_MASS_FLOW_DEFAULT: float = 0.0
 
 # 非理想精简「机械边」统一等熵效率 η_is ∈ (0, 1]。
 # 拓扑上 mechanical 边表示叶轮机械工作过程（压缩/膨胀等）；非理想层后续按该 η_is

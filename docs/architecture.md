@@ -335,7 +335,7 @@ h = props.enthalpy(rec.fluid, T, P)
 |------|------|
 | `hot_utility_demand` / `cold_utility_demand` | 公用工程需求 [kW] |
 | `matched_rejection` / `matched_absorption` | 匹配换热曲线（内部换热） |
-| `extra_absorption` / `extra_rejection` | 额外吸热/放热曲线（需公用工程）；低于 `config.PINCH_EXTRA_CURVE_FRACTION_THRESHOLD` 时为 `None` |
+| `extra_absorption` / `extra_rejection` | 额外吸热/放热曲线（需公用工程）；无对应非重叠段时为 `None` |
 | `pinch_T_hot` / `pinch_T_cold` / `delta_Q` | 夹点位置与平移量 |
 
 公用工程需求公式：

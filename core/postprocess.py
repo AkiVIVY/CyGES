@@ -100,9 +100,9 @@ class PinchResult:
     matched_absorption: HeatTQCurve
     """匹配的吸热段（内部换热）。"""
     extra_absorption: HeatTQCurve | None
-    """额外吸热曲线（需外部热源）；低于 ``config.PINCH_EXTRA_CURVE_FRACTION_THRESHOLD`` 时为 ``None``。"""
+    """额外吸热曲线（需外部热源）；无对应非重叠段时为 ``None``。"""
     extra_rejection: HeatTQCurve | None
-    """额外放热曲线（需外部冷源）；低于阈值时为 ``None``。"""
+    """额外放热曲线（需外部冷源）；无对应非重叠段时为 ``None``。"""
     pinch_T_hot: float
     """夹点处放热温度 [K]。"""
     pinch_T_cold: float
