@@ -66,6 +66,7 @@ from core.system import (
     SystemInput,
     SystemPipeline,
     SystemResult,
+    analyze_system_heat,
     convert_sources,
 )
 
@@ -116,5 +117,6 @@ __all__ = [
     "SystemInput",
     "SystemPipeline",
     "SystemResult",
+    "analyze_system_heat",
     "convert_sources",
 ]

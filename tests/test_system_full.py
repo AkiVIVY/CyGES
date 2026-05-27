@@ -22,6 +22,7 @@ from core import (
     SystemInput,
     SystemPipeline,
     SystemResult,
+    analyze_system_heat,
     build_heat_tq_curves,
 )
 
@@ -343,13 +344,13 @@ def test_system_full_visualization() -> None:
 
     # ── 理想 ──
     ideal_sys = _make_system_input(use_non_ideal=False)
-    ideal_result = SystemPipeline(ideal_sys).run(props)
+    ideal_result = analyze_system_heat(SystemPipeline(ideal_sys).run(props), ideal_sys, props)
     assert ideal_result.cycle_reports
     assert ideal_result.system_pinch is not None
 
     # ── 非理想 ──
     ni_sys = _make_system_input(use_non_ideal=True)
-    ni_result = SystemPipeline(ni_sys).run(props)
+    ni_result = analyze_system_heat(SystemPipeline(ni_sys).run(props), ni_sys, props)
     assert ni_result.cycle_reports
     assert ni_result.system_pinch is not None
 

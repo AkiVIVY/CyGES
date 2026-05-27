@@ -11,7 +11,13 @@ from typing import Any
 
 from core.closed_cycle_layer import ClosedCycleLayer, ClosedCycleTPInput
 from core.fluid_property_solver import PropertyRegistry
-from core.system import CycleConfig, SystemInput, SystemPipeline, SystemResult
+from core.system import (
+    CycleConfig,
+    SystemInput,
+    SystemPipeline,
+    SystemResult,
+    analyze_system_heat,
+)
 from optimize.objective import OBJECTIVES
 from optimize.types import OptimizationResult
 
@@ -325,7 +331,8 @@ def _eval_impl(x: tuple[float, ...], state: _EvalState, props: PropertyRegistry)
         heat_method=state.base_input.heat_method,
     )
     try:
-        result = SystemPipeline(sys_inp).run(props)
+        raw = SystemPipeline(sys_inp).run(props)
+        result = analyze_system_heat(raw, sys_inp, props)
     except Exception:
         return 1.0
     return OBJECTIVES[state.objective_name](result)
@@ -709,4 +716,5 @@ class Optimizer:
             heat_method=self._base.heat_method,
         )
 
-        return SystemPipeline(sys_inp).run(self._props)
+        raw = SystemPipeline(sys_inp).run(self._props)
+        return analyze_system_heat(raw, sys_inp, self._props)
