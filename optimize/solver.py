@@ -107,7 +107,7 @@ def _differential_evolution(
             if callback is not None:
                 callback(gen, 0, best_x, best_val, n_evals)
 
-            if stall >= early_stop * popsize:
+            if stall >= early_stop:
                 break
     finally:
         if _executor is not None:
@@ -125,12 +125,14 @@ def _cma_evolution(
     seed: int | None = 42,
     early_stop: int = 30,
     restarts: int = 5,
+    x0: list[float] | None = None,
     eval_state: _EvalState | None = None,
     n_workers: int = 1,
     callback: Callable[[int, int, list[float], float, int], None] | None = None,
 ) -> tuple[list[float], float, int]:
     """CMA-ES + 多起点重启（BIPOP 风格），自动交替大小种群避免局部最优。
 
+    :param x0: 初始点（``None``=用边界中点）。
     :param eval_state: 多进程评估状态（``None`` = 用主进程 fn 串行）。
     :param n_workers: 并行 worker 进程数。
     :param callback: 每代末调用 ``callback(gen, restart, best_x, best_val, n_evals)``。
@@ -142,7 +144,7 @@ def _cma_evolution(
     lo = [b[0] for b in bounds]
     hi = [b[1] for b in bounds]
     stds = [sigma0 * (hi[i] - lo[i]) for i in range(dim)]
-    x0_init = [(lo[i] + hi[i]) / 2 for i in range(dim)]
+    x0_init = x0 if x0 is not None else [(lo[i] + hi[i]) / 2 for i in range(dim)]
 
     executor = None
     if eval_state is not None and n_workers > 1:
@@ -256,23 +258,29 @@ class _EvalState:
     basis_centers: list[tuple[float, float]] | None = None
     basis_sigma: tuple[float, float] | None = None
     basis_mf_dim: int = 0
+    skip_pinch: bool = False
+    hx_dT_min: float = 10.0
+    hx_max_group_size: int | None = None
+    use_interp_he: bool = False
 
 
-def _eval_worker(x: tuple[float, ...], state: _EvalState) -> float:
+def _eval_worker(x: tuple[float, ...], state: _EvalState, he_solver: object | None = None) -> float:
     """Worker 进程入口：重建 props 后执行完整评估管线。"""
     props = PropertyRegistry()
-    return _eval_impl(tuple(x), state, props)
+    return _eval_impl(tuple(x), state, props, he_solver)
 
 
 def _eval_chunk(solutions_and_state: tuple[list[list[float]], _EvalState]) -> list[float]:
     """模块级 worker：评估一个 chunk 内的所有解（供 ProcessPoolExecutor spawn 调用）。"""
     import pickle
-    # reconstruct from tuple (ProcessPoolExecutor pickles args)
     solutions, state = solutions_and_state
-    return [_eval_worker(tuple(s), state) for s in solutions]
+    from core import InterpolatingHeliumSolver
+    he_solver = InterpolatingHeliumSolver() if state.use_interp_he else None
+    return [_eval_worker(tuple(s), state, he_solver) for s in solutions]
 
 
-def _eval_impl(x: tuple[float, ...], state: _EvalState, props: PropertyRegistry) -> float:
+def _eval_impl(x: tuple[float, ...], state: _EvalState, props: PropertyRegistry,
+               he_solver: object | None = None) -> float:
     """核心评估逻辑（复用主进程和 worker 进程）。"""
     import math
 
@@ -301,7 +309,7 @@ def _eval_impl(x: tuple[float, ...], state: _EvalState, props: PropertyRegistry)
     )
 
     try:
-        probe = ClosedCycleLayer(tp)
+        probe = ClosedCycleLayer(tp, properties=he_solver)
     except Exception:
         return 1.0
     n_sc = len(probe.subcycles)
@@ -331,10 +339,13 @@ def _eval_impl(x: tuple[float, ...], state: _EvalState, props: PropertyRegistry)
         heat_method=state.base_input.heat_method,
     )
     try:
-        raw = SystemPipeline(sys_inp).run(props)
-        result = analyze_system_heat(raw, sys_inp, props)
+        raw = SystemPipeline(sys_inp).run(props, cycle_properties=he_solver)
+        result = raw if state.skip_pinch else analyze_system_heat(raw, sys_inp, props)
     except Exception:
         return 1.0
+    import optimize.objective as _obj_mod
+    _obj_mod._HX_DT_MIN = state.hx_dT_min
+    _obj_mod._HX_MAX_GROUP_SIZE = state.hx_max_group_size
     return OBJECTIVES[state.objective_name](result)
 
 
@@ -403,6 +414,10 @@ class Optimizer:
         basis_s: int = 3,
         basis_p: int = 3,
         n_workers: int = 1,
+        skip_pinch: bool = False,
+        hx_dT_min: float = 10.0,
+        hx_max_group_size: int | None = None,
+        use_interp_he: bool = False,
     ):
         if not base_input.cycles:
             raise ValueError("base_input 须包含至少一个 CycleConfig")
@@ -418,6 +433,11 @@ class Optimizer:
         self._mf_lo, self._mf_hi = mf_bounds
         self._basis = basis_encoding
         self._n_workers = n_workers
+        self._skip_pinch = skip_pinch
+        self._hx_dT_min = hx_dT_min
+        self._hx_max_group_size = hx_max_group_size
+        self._use_interp_he = use_interp_he
+        self._he_solver_cache: object | None = None
 
         if isinstance(objective, str):
             if objective not in OBJECTIVES:
@@ -461,9 +481,13 @@ class Optimizer:
             n_t_q=self._n_t_q,
             n_p_q=self._n_p_q,
             basis=self._basis,
-            basis_centers=list(self._basis_centers) if self._basis else None,
-            basis_sigma=self._basis_sigma if self._basis else None,
-            basis_mf_dim=self._mf_dim if self._basis else 0,
+            basis_centers=self._basis_centers,
+            basis_sigma=self._basis_sigma,
+            basis_mf_dim=self._mf_dim,
+            skip_pinch=self._skip_pinch,
+            hx_dT_min=self._hx_dT_min,
+            hx_max_group_size=self._hx_max_group_size,
+            use_interp_he=self._use_interp_he,
         )
 
     def _build_basis_grid(self) -> None:
@@ -516,10 +540,10 @@ class Optimizer:
 
     @property
     def bounds(self) -> list[tuple[float, float]]:
-        """参数边界：t_max [500,1000] + t_min [40,100] + 分位 [0, 1] + 流量。"""
+        """参数边界：t_max [800,1100] + t_min [40,300] + 分位 [0,1] + 流量。"""
         b: list[tuple[float, float]] = []
         b.append((800.0, 1100.0))
-        b.append((40.0, 200.0))
+        b.append((40.0, 300.0))
         for _ in range(self._n_t_q):
             b.append((0.0, 1.0))
         for _ in range(self._n_p_q):
@@ -534,6 +558,11 @@ class Optimizer:
 
     def _evaluate(self, x: tuple[float, ...]) -> float:
         """解包 x → 构造系统 → 运行管线 → 返回目标值。"""
+        if self._use_interp_he and self._he_solver_cache is None:
+            from core import InterpolatingHeliumSolver
+            self._he_solver_cache = InterpolatingHeliumSolver()
+        he_solver = self._he_solver_cache
+
         idx = 0
         t_max = float(x[idx]); idx += 1
         t_min = float(x[idx]); idx += 1
@@ -565,7 +594,7 @@ class Optimizer:
 
         # 试跑拓扑获取实际子循环数
         try:
-            probe = ClosedCycleLayer(tp)
+            probe = ClosedCycleLayer(tp, properties=he_solver)
         except Exception:
             return 1.0
         n_sc = len(probe.subcycles)
@@ -594,10 +623,13 @@ class Optimizer:
         )
 
         try:
-            result = SystemPipeline(sys_inp).run(self._props)
+            result = SystemPipeline(sys_inp).run(self._props, cycle_properties=he_solver)
         except Exception:
             return 1.0
 
+        import optimize.objective as _obj_mod
+        _obj_mod._HX_DT_MIN = self._hx_dT_min
+        _obj_mod._HX_MAX_GROUP_SIZE = self._hx_max_group_size
         return self._objective_fn(result)
 
     def run(
@@ -611,16 +643,45 @@ class Optimizer:
         sigma0: float = 0.3,
         seed: int | None = 42,
         early_stop: int = 30,
+        restarts: int = 5,
         callback: Callable[[int, int, list[float], float, int], None] | None = None,
     ) -> OptimizationResult:
         """执行优化。
 
-        :param method: ``"de"`` = 差分进化，``"cma"`` = CMA-ES。
+        :param method: ``"de"`` = 差分进化，``"cma"`` = CMA-ES，``"de+cma"`` = DE 全局探路 + CMA 精搜。
         :param callback: 每代末回调 ``(gen, best_x, best_val, n_evals)``。
         :returns: ``OptimizationResult``（含最优参数与完整系统结果）。
         """
         bounds = self.bounds
-        if method == "cma":
+        if method == "de+cma":
+            # DE 探测：50 代，中等种群
+            de_x, de_val, de_evals = _differential_evolution(
+                self._evaluate,
+                bounds,
+                popsize=30,
+                maxiter=50,
+                seed=seed,
+                early_stop=early_stop,
+                eval_state=self._to_eval_state() if self._n_workers > 1 else None,
+                n_workers=self._n_workers,
+                callback=None,
+            )
+            # CMA 精搜：从 DE 最优出发，200 代，小 sigma 精细收敛
+            cma_x, cma_val, cma_evals = _cma_evolution(
+                self._evaluate,
+                bounds,
+                sigma0=0.15,
+                maxiter=maxiter,
+                seed=seed,
+                early_stop=early_stop,
+                restarts=restarts,
+                x0=list(de_x),
+                eval_state=self._to_eval_state() if self._n_workers > 1 else None,
+                n_workers=self._n_workers,
+                callback=callback,
+            )
+            best_x, best_val, n_evals = cma_x, cma_val, de_evals + cma_evals
+        elif method == "cma":
             best_x, best_val, n_evals = _cma_evolution(
                 self._evaluate,
                 bounds,
@@ -628,7 +689,7 @@ class Optimizer:
                 maxiter=maxiter,
                 seed=seed,
                 early_stop=early_stop,
-                restarts=5,
+                restarts=restarts,
                 eval_state=self._to_eval_state() if self._n_workers > 1 else None,
                 n_workers=self._n_workers,
                 callback=callback,
@@ -717,4 +778,6 @@ class Optimizer:
         )
 
         raw = SystemPipeline(sys_inp).run(self._props)
+        if self._skip_pinch:
+            return raw
         return analyze_system_heat(raw, sys_inp, self._props)

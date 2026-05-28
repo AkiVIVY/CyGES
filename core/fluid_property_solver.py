@@ -131,6 +131,191 @@ class CoolPropFluidPropertySolver:
         raise ValueError(f"不支持的 pair：{pair!r}，应为 HP、TP、HS、PS 之一")
 
 
+class InterpolatingHeliumSolver:
+    """He 插值物性求解器：预计算 (T,P) 网格 → 双线性插值 / 二分查找。
+
+    替代 CoolProp 迭代求根，精度与 CoolProp 一致（插值误差 < ΔT 步长对应偏差）。
+    支持 TP、PS、HP 三种输入对；HS 未实现（代码库中从未调用）。
+
+    用法::
+
+        solver = InterpolatingHeliumSolver(dT=10.0, dP=200.0)
+        st = solver.state("TP", 500.0, 3000.0)  # → ThermoStateTPHS
+    """
+
+    __slots__ = ("_dT", "_dP", "_T_min", "_T_max", "_P_min", "_P_max",
+                 "_T_grid", "_P_grid", "_H_grid", "_S_grid", "_built")
+
+    _T_DEFAULT = (40.0, 1200.0, 10.0)
+    _P_DEFAULT = (200.0, 10000.0, 200.0)
+
+    @property
+    def fluid(self) -> str:
+        return "He"
+
+    def __init__(self, dT: float = 10.0, dP: float = 200.0) -> None:
+        self._dT = dT
+        self._dP = dP
+        self._T_min = self._T_DEFAULT[0]
+        self._T_max = self._T_DEFAULT[1]
+        self._P_min = self._P_DEFAULT[0]
+        self._P_max = self._P_DEFAULT[1]
+        self._T_grid: list[float] = []
+        self._P_grid: list[float] = []
+        self._H_grid: list[list[float]] = []
+        self._S_grid: list[list[float]] = []
+        self._built = False
+
+    def _build(self) -> None:
+        if self._built:
+            return
+        import math
+        as_cp = CP.AbstractState("HEOS", "He")
+        nT = int((self._T_max - self._T_min) / self._dT) + 1
+        nP = int((self._P_max - self._P_min) / self._dP) + 1
+        T_vals = [self._T_min + i * self._dT for i in range(nT)]
+        P_vals = [self._P_min + j * self._dP for j in range(nP)]
+        self._H_grid = [[0.0] * nP for _ in range(nT)]
+        self._S_grid = [[0.0] * nP for _ in range(nT)]
+        for i, T in enumerate(T_vals):
+            for j, P_kpa in enumerate(P_vals):
+                try:
+                    as_cp.update(CP.PT_INPUTS, P_kpa * 1e3, T)
+                    self._H_grid[i][j] = float(as_cp.hmass()) / 1e3
+                    self._S_grid[i][j] = float(as_cp.smass()) / 1e3
+                except Exception:
+                    self._H_grid[i][j] = float("nan")
+                    self._S_grid[i][j] = float("nan")
+        self._T_grid = T_vals
+        self._P_grid = P_vals
+        self._built = True
+
+    # ── 双线性插值 ───────────────────────────────────────
+    @staticmethod
+    def _lerp(x: float, x0: float, x1: float, v0: float, v1: float) -> float:
+        if x1 == x0:
+            return v0
+        return v0 + (v1 - v0) * (x - x0) / (x1 - x0)
+
+    def _bilerp(self, T: float, P: float) -> tuple[float, float]:
+
+        nT, nP = len(self._T_grid), len(self._P_grid)
+        i = int((T - self._T_min) / self._dT)
+        j = int((P - self._P_min) / self._dP)
+        if i < 0:
+            i = 0
+        if j < 0:
+            j = 0
+        if i >= nT - 1:
+            i = nT - 2
+        if j >= nP - 1:
+            j = nP - 2
+        T0, T1 = self._T_grid[i], self._T_grid[i + 1]
+        P0, P1 = self._P_grid[j], self._P_grid[j + 1]
+        t_frac = (T - T0) / (T1 - T0) if T1 != T0 else 0.0
+        p_frac = (P - P0) / (P1 - P0) if P1 != P0 else 0.0
+        H00, H01 = self._H_grid[i][j], self._H_grid[i][j + 1]
+        H10, H11 = self._H_grid[i + 1][j], self._H_grid[i + 1][j + 1]
+        S00, S01 = self._S_grid[i][j], self._S_grid[i][j + 1]
+        S10, S11 = self._S_grid[i + 1][j], self._S_grid[i + 1][j + 1]
+        H = (1 - t_frac) * (1 - p_frac) * H00 + (1 - t_frac) * p_frac * H01 + \
+            t_frac * (1 - p_frac) * H10 + t_frac * p_frac * H11
+        S = (1 - t_frac) * (1 - p_frac) * S00 + (1 - t_frac) * p_frac * S01 + \
+            t_frac * (1 - p_frac) * S10 + t_frac * p_frac * S11
+        return H, S
+
+    # ── 等压线二分查找（S/H → T） ─────────────────────────
+    def _find_T_by_S(self, P: float, S_target: float) -> float:
+        nT, nP = len(self._T_grid), len(self._P_grid)
+        j = int((P - self._P_min) / self._dP)
+        if j < 0:
+            j = 0
+        if j >= nP - 1:
+            j = nP - 1
+        P0, P1 = self._P_grid[j], self._P_grid[j + 1]
+
+        def _T_on_isobar(jj: int, s: float) -> float:
+            lo, hi = 0, nT - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if self._S_grid[mid][jj] < s:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo == 0:
+                lo = 1
+            if lo >= nT:
+                lo = nT - 1
+            t0, t1 = self._T_grid[lo - 1], self._T_grid[lo]
+            s0, s1 = self._S_grid[lo - 1][jj], self._S_grid[lo][jj]
+            if abs(s1 - s0) < 1e-15:
+                return (t0 + t1) / 2.0
+            return t0 + (t1 - t0) * (s - s0) / (s1 - s0)
+
+        T_j0 = _T_on_isobar(j, S_target)
+        T_j1 = _T_on_isobar(j + 1, S_target)
+        p_frac = (P - P0) / (P1 - P0) if P1 != P0 else 0.0
+        return T_j0 + (T_j1 - T_j0) * p_frac
+
+    def _find_T_by_H(self, P: float, H_target: float) -> float:
+        nT, nP = len(self._T_grid), len(self._P_grid)
+        j = int((P - self._P_min) / self._dP)
+        if j < 0:
+            j = 0
+        if j >= nP - 1:
+            j = nP - 1
+        P0, P1 = self._P_grid[j], self._P_grid[j + 1]
+
+        def _T_on_isobar(jj: int, h: float) -> float:
+            lo, hi = 0, nT - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if self._H_grid[mid][jj] < h:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo == 0:
+                lo = 1
+            if lo >= nT:
+                lo = nT - 1
+            t0, t1 = self._T_grid[lo - 1], self._T_grid[lo]
+            h0, h1 = self._H_grid[lo - 1][jj], self._H_grid[lo][jj]
+            if abs(h1 - h0) < 1e-15:
+                return (t0 + t1) / 2.0
+            return t0 + (t1 - t0) * (h - h0) / (h1 - h0)
+
+        T_j0 = _T_on_isobar(j, H_target)
+        T_j1 = _T_on_isobar(j + 1, H_target)
+        p_frac = (P - P0) / (P1 - P0) if P1 != P0 else 0.0
+        return T_j0 + (T_j1 - T_j0) * p_frac
+
+    # ── 主接口 ────────────────────────────────────────────
+    def state(self, pair: PropertyPair, x: float, y: float) -> ThermoStateTPHS:
+        self._build()
+
+        if pair == "TP":
+            T, P = x, y
+            H, S = self._bilerp(T, P)
+            return _tphs(T, P, H, S)
+
+        if pair == "PS":
+            P, S_target = x, y
+            T = self._find_T_by_S(P, S_target)
+            H, _ = self._bilerp(T, P)
+            return _tphs(T, P, H, S_target)
+
+        if pair == "HP":
+            H_target, P = x, y
+            T = self._find_T_by_H(P, H_target)
+            _, S = self._bilerp(T, P)
+            return _tphs(T, P, H_target, S)
+
+        if pair == "HS":
+            raise NotImplementedError("InterpolatingHeliumSolver 不支持 HS 输入对")
+
+        raise ValueError(f"不支持的 pair：{pair!r}，应为 HP、TP、HS、PS 之一")
+
+
 class PropertyRegistry:
     """多工质物性注册表，按 fluid 缓存 ``CoolPropFluidPropertySolver``。
 

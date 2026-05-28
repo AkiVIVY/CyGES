@@ -16,7 +16,7 @@ from core.cycle_performance import (
     ProcessCategory,
     ProcessRecord,
 )
-from core.fluid_property_solver import PropertyRegistry, ThermoStateTPHS
+from core.fluid_property_solver import FluidPropertySolver, PropertyRegistry, ThermoStateTPHS
 from core.postprocess import (
     PinchResult,
     analyze_pinch,
@@ -122,13 +122,14 @@ class SystemPipeline:
     def __init__(self, system_input: SystemInput) -> None:
         self._input = system_input
 
-    def run(self, props: PropertyRegistry) -> SystemResult:
+    def run(self, props: PropertyRegistry, *,
+            cycle_properties: FluidPropertySolver | None = None) -> SystemResult:
         inp = self._input
         heat_records, cold_records = convert_sources(inp.heat_sources, inp.cold_sources, props)
 
         cycle_reports: list[CyclePerformanceReport] = []
         for cfg in inp.cycles:
-            layer = ClosedCycleLayer(cfg.input)
+            layer = ClosedCycleLayer(cfg.input, properties=cycle_properties)
             if cfg.subcycle_mass_flows:
                 layer.subcycle_mass_flows = cfg.subcycle_mass_flows
                 layer.commit_subcycle_mass_flows_to_topology()

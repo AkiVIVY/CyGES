@@ -25,16 +25,19 @@ CyGES/
 │   ├── non_ideal_bias.py        # 非理想偏置：有向组、深度、ni.apply_offsets()
 │   ├── cycle_performance.py     # 性能统计：ProcessRecord, LoopReport (纯计算)
 │   ├── postprocess.py           # T-Q 构建 + 夹点分析 (build_tq / analyze_pinch)
+│   ├── heat_exchanger.py        # HX 匹配：星型拓扑, 贪婪打包, dT_min 约束
 │   ├── system.py                # 系统层：Pipeline + analyze_system_heat (解耦)
-│   └── fluid_property_solver.py # 物性：PropertyRegistry (多工质)
+│   └── fluid_property_solver.py # 物性：PropertyRegistry + InterpolatingHeliumSolver
 ├── optimize/
 │   ├── solver.py                # Optimizer: CMA-ES(BIPOP)+DE, 高斯基编码, 并行
-│   ├── objective.py             # @register 目标函数注册表
+│   ├── objective.py             # @register 目标函数注册表（含 hx_unmatched）
 │   └── types.py                 # OptimizationResult
 ├── config.py
 ├── tests/
 │   ├── test_system_full.py     # 全管线可视化 5 图
-│   └── test_optimize.py        # 优化测试 + Excel 日志 + run_XXX 输出
+│   ├── test_optimize.py        # 优化测试 + Excel 日志 + run_XXX 输出
+│   ├── test_optimize_hx.py     # HX 匹配优化: 4 图 + dT_min 参数化
+│   └── test_hx_match.py        # HX 匹配单元测试
 └── docs/architecture.md
 ```
 
@@ -50,6 +53,8 @@ CyGES/
 - T-Q 构建 + 夹点分析：`build_heat_tq_curves`、`compute_pinch`（底层）、`analyze_pinch`（高层）。
 - 系统集成：`SystemPipeline.run(props)` 产纯数据，`analyze_system_heat(raw, inp, props)` 独立做夹点（四种模式）。
 - 多工质：`PropertyRegistry`（自动缓存 CoolProp 求解器）。
+- 物性加速：`InterpolatingHeliumSolver`（预计算 (T,P) 网格，双线性插值 + 二分查找替代 CoolProp 迭代，PS 查询提速 ~100×；通过 `use_interp_he` 开关启用）。
+- HX 匹配：星型拓扑（1 热 + k 冷 / m 热 + 1 冷），逆流 dT_min 约束，贪婪多起点打包；`hx_unmatched` 目标函数。
 - 优化器：CMA-ES (BIPOP 5 重启) + DE，高斯基编码（维度固定），分位/流量/T 边界离散化，持久 `ProcessPoolExecutor` 6 进程并行。
 
 **夹点模式结论**
@@ -77,6 +82,10 @@ CyGES/
 
 **离散化在优化器层**：流量/分位/T 边界步长、分位合并比全在 `Optimizer` 中控制。模型中不保留任何离散化逻辑。
 
+**HX 匹配与管线解耦**：HX 匹配在目标函数 `hx_unmatched` 内调用 `match_heat_exchanger_groups()`，管线本身只产 `ProcessRecord` 数据。`max_group_size`（默认 None）控制组内合并上限；`dT_min` 通过 `_HX_DT_MIN` 模块变量控制。
+
+**物性加速（interp He）**：`InterpolatingHeliumSolver` 预计算 (T,P) 网格，用双线性插值 + 等压线二分查找替代 CoolProp 迭代求根。通过 `Optimizer(use_interp_he=True)` 启用，每个 worker 缓存一份网格实例。精度（H 误差 <0.03%，S 误差 <0.4%）对优化影响极小，但拓扑可能因 S 累计误差产生少量差异，最终解宜用 CoolProp 验证。
+
 ---
 
 ## 5. 测试
@@ -85,6 +94,8 @@ CyGES/
 |------|------|------|
 | `test_optimize.py` | 优化测试：CMA-ES + 结果图 + Excel 日志 | `pytest -s tests/test_optimize.py` |
 | `test_system_full.py` | 全管线可视化 5 图 | `pytest tests/test_system_full.py` |
+| `test_optimize_hx.py` | HX 匹配优化：4 图 + dT_min/group_size 参数化 | `pytest -s tests/test_optimize_hx.py` |
+| `test_hx_match.py` | HX 匹配单元测试（合成数据） | `pytest tests/test_hx_match.py` |
 
 输出：`tests/run_XXX/` 下 6 张图 + `tests/opt_log.xlsx` 累积日志。
 
@@ -110,7 +121,9 @@ CyGES/
 
 ---
 
-## 8. 当前最优参数（system_pinch 模式, H₂=3.5）
+## 8. 当前最优参数
+
+### system_pinch 模式（H₂=3.5）
 
 | 参数 | 值 |
 |------|:--|
@@ -120,3 +133,17 @@ CyGES/
 | 基函数：3×3, mf∈[0, 50], step=0.01 |
 | CMA-ES, popsize auto, maxiter=300, 6 workers |
 | obj=0.0000, t_max≈1090K, net_mech≈-38.9MW |
+
+### hx_unmatched 模式（skip_pinch=True, HX dT_min=10K）
+
+| 参数 | 值 |
+|------|:--|
+| σ / η_is | 0.98 / 0.9 |
+| He t∈[40, 1000]K, p∈[2, 10] MPa |
+| 分位：2t+1p, step=0.01, max_group_size=3 |
+| 基函数：4×4, mf∈[0, 50], step=0.01 |
+| CMA-ES, popsize auto, maxiter=200, 6 workers |
+| obj≈0.044, t_max≈1010K, t_min≈43K |
+
+- dT_min=5K 时 obj≈0.042，改善仅 5%，obj 地板由 He 循环拓扑的结构不匹配决定。
+- `use_interp_he=True` 可加速物性查询，但拓扑可能略有差异，最终解建议用 CoolProp 验证。

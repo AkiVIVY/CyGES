@@ -28,6 +28,7 @@ from core.closed_cycle_layer import (
 from core.fluid_property_solver import (
     CoolPropFluidPropertySolver,
     FluidPropertySolver,
+    InterpolatingHeliumSolver,
     PropertyPair,
     PropertyRegistry,
     ThermoStateTPHS,
@@ -60,6 +61,11 @@ from core.postprocess import (
     compute_pinch,
     split_tq_curve_to_records,
 )
+from core.heat_exchanger import (
+    HXMatchResult,
+    HXUnit,
+    match_heat_exchanger_groups,
+)
 from core.system import (
     CycleConfig,
     ExternalSourceInput,
@@ -84,6 +90,7 @@ __all__ = [
     "FluidPropertySolver",
     "PropertyPair",
     "PropertyRegistry",
+    "InterpolatingHeliumSolver",
     "ThermoStateTPHS",
     "MERGED_ISOLATED_NODE_EDGE_KEY",
     "NonIdealClosedCycleLayer",
@@ -117,6 +124,9 @@ __all__ = [
     "SystemInput",
     "SystemPipeline",
     "SystemResult",
+    "HXUnit",
+    "HXMatchResult",
+    "match_heat_exchanger_groups",
     "analyze_system_heat",
     "convert_sources",
 ]
