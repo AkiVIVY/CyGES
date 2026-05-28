@@ -47,6 +47,10 @@ class CycleConfig:
     delta_T_min: float = 0.0
     heat_method: str | None = "pinch"
     mechanical_method: str | None = None
+    sigma: float | None = None
+    """换热总压恢复系数；None 时走 config.NON_IDEAL_HEAT_EFFICIENCY_DEFAULT（0.98）。"""
+    eta_is: float | None = None
+    """机械等熵效率；None 时走 config.NON_IDEAL_MECHANICAL_EFFICIENCY_DEFAULT（0.9）。"""
 
 
 @dataclass(frozen=True)
@@ -86,6 +90,7 @@ def _source_to_record(
     category: ProcessCategory,
     props: PropertyRegistry,
 ) -> ProcessRecord:
+    """将外部冷热源转换为 ProcessRecord；tail/head 用负索引占位（不关联 cycle nodes）。"""
     in_state: ThermoStateTPHS = props(src.fluid, "TP", src.T_in, src.P_in)
     out_state: ThermoStateTPHS = props(src.fluid, "TP", src.T_out, src.P_out)
 
@@ -123,19 +128,32 @@ class SystemPipeline:
         self._input = system_input
 
     def run(self, props: PropertyRegistry, *,
-            cycle_properties: FluidPropertySolver | None = None) -> SystemResult:
+            cycle_properties: FluidPropertySolver | None = None,
+            layers: list[ClosedCycleLayer] | None = None) -> SystemResult:
+        """执行管线：构建循环 → 赋流量 → 非理想偏置（可选） → 性能统计。
+
+        ``cycle_properties`` 传入自定义物性求解器（如 ``InterpolatingHeliumSolver``）以加速；
+        ``None`` 时使用默认 ``CoolPropFluidPropertySolver``。
+
+        ``layers`` 传入预建好的 ``ClosedCycleLayer`` 列表以复用拓扑（长度须与 ``cycles`` 一致）；
+        ``None`` 时内部新建。
+        """
         inp = self._input
         heat_records, cold_records = convert_sources(inp.heat_sources, inp.cold_sources, props)
 
         cycle_reports: list[CyclePerformanceReport] = []
-        for cfg in inp.cycles:
-            layer = ClosedCycleLayer(cfg.input, properties=cycle_properties)
+        for i, cfg in enumerate(inp.cycles):
+            if layers is not None and i < len(layers):
+                layer = layers[i]
+            else:
+                layer = ClosedCycleLayer(cfg.input, properties=cycle_properties)
             if cfg.subcycle_mass_flows:
+                # subcycle_mass_flows 非空时才提交（空列表/None 均保留 analyze_topology 的初值）
                 layer.subcycle_mass_flows = cfg.subcycle_mass_flows
                 layer.commit_subcycle_mass_flows_to_topology()
             if cfg.use_non_ideal:
                 ni = layer.ensure_non_ideal()
-                ni.apply_offsets()
+                ni.apply_offsets(sigma=cfg.sigma, eta_is=cfg.eta_is)
             cycle_reports.append(layer.performance_report())
 
         return SystemResult(
@@ -236,6 +254,52 @@ def analyze_system_heat(
                 residual_abs.extend(split_tq_curve_to_records(source_cold_pinch.extra_absorption, props))
         if residual_abs and residual_rej:
             system_pinch = analyze_pinch(residual_abs, residual_rej, system_input.delta_T_min, props)
+
+    elif method == "staged_pinch":
+        # 阶段 1: 外部热源 ↔ 循环吸热
+        residual_rej: list[ProcessRecord] = []
+        residual_abs: list[ProcessRecord] = []
+        if cycle_all_abs and heat_records:
+            source_hot_pinch = analyze_pinch(cycle_all_abs, heat_records, system_input.delta_T_min, props)
+            if source_hot_pinch.extra_rejection is not None:
+                residual_rej.extend(split_tq_curve_to_records(source_hot_pinch.extra_rejection, props))
+            if source_hot_pinch.extra_absorption is not None:
+                residual_abs.extend(split_tq_curve_to_records(source_hot_pinch.extra_absorption, props))
+        else:
+            residual_rej = list(heat_records)
+            residual_abs = list(cycle_all_abs)
+        # 阶段 2: 外部冷源 ↔ 循环放热
+        residual_abs_2: list[ProcessRecord] = []
+        residual_rej_2: list[ProcessRecord] = []
+        if cold_records and cycle_all_rej:
+            source_cold_pinch = analyze_pinch(cold_records, cycle_all_rej, system_input.delta_T_min, props)
+            if source_cold_pinch.extra_rejection is not None:
+                residual_rej_2.extend(split_tq_curve_to_records(source_cold_pinch.extra_rejection, props))
+            if source_cold_pinch.extra_absorption is not None:
+                residual_abs_2.extend(split_tq_curve_to_records(source_cold_pinch.extra_absorption, props))
+        else:
+            residual_rej_2 = list(cycle_all_rej)
+            residual_abs_2 = list(cold_records)
+        # 阶段 3: 阶段 1 残差消纳阶段 2 的残差（交叉配对）
+        if residual_rej_2 and residual_abs:
+            hot_match_pinch = analyze_pinch(residual_abs, residual_rej_2, system_input.delta_T_min, props)
+            if hot_match_pinch.extra_rejection is not None:
+                residual_rej.extend(split_tq_curve_to_records(hot_match_pinch.extra_rejection, props))
+            if hot_match_pinch.extra_absorption is not None:
+                residual_abs_2.extend(split_tq_curve_to_records(hot_match_pinch.extra_absorption, props))
+        if residual_abs_2 and residual_rej:
+            cold_match_pinch = analyze_pinch(residual_abs_2, residual_rej, system_input.delta_T_min, props)
+            if cold_match_pinch.extra_rejection is not None:
+                residual_rej_2.extend(split_tq_curve_to_records(cold_match_pinch.extra_rejection, props))
+            if cold_match_pinch.extra_absorption is not None:
+                residual_abs_2.extend(split_tq_curve_to_records(cold_match_pinch.extra_absorption, props))
+        # 最终残差统一夹点
+        final_abs = residual_abs_2 + residual_abs
+        final_rej = residual_rej_2 + residual_rej
+        final_abs = [r for r in final_abs if r.power_rate and abs(float(r.power_rate)) > 1e-12]
+        final_rej = [r for r in final_rej if r.power_rate and abs(float(r.power_rate)) > 1e-12]
+        if final_abs and final_rej:
+            system_pinch = analyze_pinch(final_abs, final_rej, system_input.delta_T_min, props)
 
     return SystemResult(
         heat_source_records=raw_result.heat_source_records,

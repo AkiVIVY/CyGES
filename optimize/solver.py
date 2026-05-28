@@ -278,35 +278,15 @@ def _eval_worker(x: tuple[float, ...], state: _EvalState, he_solver: object | No
 _CHUNK_CACHED_HE_SOLVER: object | None = None
 
 
-def _make_h2_source(original: tuple, h2_mf: float):
-    """用给定的 H₂ 流量重建冷源元组。"""
-    from core import ExternalSourceInput
-    new_colds = []
-    for src in original:
-        if src.fluid == "Hydrogen":
-            new_colds.append(ExternalSourceInput(
-                fluid="Hydrogen", mass_flow=h2_mf,
-                T_in=src.T_in, P_in=src.P_in, T_out=src.T_out, P_out=src.P_out,
-            ))
-        else:
-            new_colds.append(src)
-    return tuple(new_colds)
-
-
 def _eval_chunk(solutions_and_state: tuple[list[list[float]], _EvalState]) -> list[float]:
-    """模块级 worker：评估一个 chunk 内的所有解（供 ProcessPoolExecutor spawn 调用）。
-
-    每 worker 进程首次调用时构建并缓存 ``InterpolatingHeliumSolver``，
-    后续 chunk 复用同一实例，避免重复 CoolProp 建网格和 pickle 传输。
-    """
-    global _CHUNK_CACHED_HE_SOLVER
+    """模块级 worker：评估一个 chunk 内的所有解（供 ProcessPoolExecutor spawn 调用）。"""
     solutions, state = solutions_and_state
-    if state.he_solver_params is not None and _CHUNK_CACHED_HE_SOLVER is None:
+    he_solver = None
+    if state.he_solver_params is not None:
         from core import InterpolatingHeliumSolver
         t0, t1, p0, p1 = state.he_solver_params
-        _CHUNK_CACHED_HE_SOLVER = InterpolatingHeliumSolver(T_min=t0, T_max=t1, P_min=p0, P_max=p1)
-        _CHUNK_CACHED_HE_SOLVER._build()
-    he_solver = _CHUNK_CACHED_HE_SOLVER
+        he_solver = InterpolatingHeliumSolver(T_min=t0, T_max=t1, P_min=p0, P_max=p1)
+        he_solver._build()
     return [_eval_worker(tuple(s), state, he_solver) for s in solutions]
 
 
@@ -372,7 +352,8 @@ def _eval_impl(x: tuple[float, ...], state: _EvalState, props: PropertyRegistry,
         heat_method=state.base_input.heat_method,
     )
     try:
-        raw = SystemPipeline(sys_inp).run(props, cycle_properties=he_solver)
+        raw = SystemPipeline(sys_inp).run(
+            props, cycle_properties=he_solver, layers=[probe])
         result = raw if state.skip_pinch else analyze_system_heat(raw, sys_inp, props)
     except Exception:
         return 1.0
@@ -411,7 +392,7 @@ def _eval_batch(
     executor=None,
 ) -> list[float]:
     """评估一组解：有 executor 时用并行 chunk，否则串行。"""
-    if executor is not None and n_workers > 1 and len(solutions) >= n_workers * 2:
+    if executor is not None and n_workers > 1 and len(solutions) >= n_workers:
         chunk_size = max(1, len(solutions) // n_workers)
         chunks = [solutions[i : i + chunk_size] for i in range(0, len(solutions), chunk_size)]
         futures = [executor.submit(_eval_chunk, (ch, state)) for ch in chunks]
@@ -473,6 +454,7 @@ class Optimizer:
         self._use_interp_he = use_interp_he
         self._he_solver_cache = self._make_interp_he_solver() if use_interp_he else None
         self._h2_mf_bounds = h2_mf_bounds
+        self._last_sys_result: SystemResult | None = None
 
         if isinstance(objective, str):
             if objective not in OBJECTIVES:
@@ -515,6 +497,7 @@ class Optimizer:
 
     def _to_eval_state(self) -> _EvalState:
         """导出可 pickle 的评估状态（供多进程 worker 使用）。"""
+        tp = self._base_tp
         return _EvalState(
             base_input=self._base,
             objective_name=self._objective_name,
@@ -535,11 +518,8 @@ class Optimizer:
             hx_max_group_size=self._hx_max_group_size,
             use_interp_he=self._use_interp_he,
             he_solver_params=(
-                self._he_solver_cache._T_min,
-                self._he_solver_cache._T_max,
-                self._he_solver_cache._P_min,
-                self._he_solver_cache._P_max,
-            ) if self._he_solver_cache is not None else None,
+                tp.t_min, tp.t_max, tp.p_min, tp.p_max,
+            ) if self._use_interp_he else None,
             h2_mf_lo=self._h2_mf_bounds[0] if self._h2_mf_bounds else None,
             h2_mf_hi=self._h2_mf_bounds[1] if self._h2_mf_bounds else None,
         )
@@ -679,14 +659,17 @@ class Optimizer:
         )
 
         try:
-            result = SystemPipeline(sys_inp).run(self._props, cycle_properties=he_solver)
+            result = SystemPipeline(sys_inp).run(
+                self._props, cycle_properties=he_solver, layers=[probe])
         except Exception:
             return 1.0
 
         import optimize.objective as _obj_mod
         _obj_mod._HX_DT_MIN = self._hx_dT_min
         _obj_mod._HX_MAX_GROUP_SIZE = self._hx_max_group_size
-        return self._objective_fn(result)
+        obj = self._objective_fn(result)
+        self._last_sys_result = result
+        return obj
 
     def run(
         self,
@@ -767,8 +750,7 @@ class Optimizer:
 
         # 用最优参数再运行一次，获取完整 SystemResult
         best_val_final = self._evaluate(tuple(best_x))
-        # 重建一次获取 result（_evaluate 内部不返回 result，需单独跑）
-        sys_result = self._run_with_params(tuple(best_x))
+        sys_result = self._last_sys_result
 
         return OptimizationResult(
             x_opt=tuple(best_x),

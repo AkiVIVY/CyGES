@@ -64,7 +64,9 @@ from core.postprocess import (
 from core.heat_exchanger import (
     HXMatchResult,
     HXUnit,
+    match_constructive,
     match_heat_exchanger_groups,
+    match_heat_exchanger_staged,
 )
 from core.system import (
     CycleConfig,
@@ -127,6 +129,8 @@ __all__ = [
     "HXUnit",
     "HXMatchResult",
     "match_heat_exchanger_groups",
+    "match_constructive",
+    "match_heat_exchanger_staged",
     "analyze_system_heat",
     "convert_sources",
 ]

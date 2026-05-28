@@ -410,3 +410,256 @@ def match_heat_exchanger_groups(
         total_unmatched=base_unmatched,
         num_units=len(units),
     )
+
+
+# ============================================================
+# §7. 构造式候选生成 + 直接打包 (替代 combinations 枚举)
+# ============================================================
+
+
+def _solve_constructive(
+    hots: list[_RecInfo],
+    colds: list[_RecInfo],
+    dT_min: float,
+    n_restarts: int = 20,
+    max_group_size: int | None = 5,
+    seed: int | None = None,
+) -> tuple[list[HXUnit], list[_RecInfo], list[_RecInfo], float]:
+    """构造式双向遍历 + 多起点随机: 前向 H→C, 后向剩余 C→H。
+
+    每 restart: 同一 T_high 组内随机打乱排序 → 顺序配对。
+    O(R·(H + C)·avg_k)，avg_k 为每单元平均成员数。
+
+    :returns: ``(units, unassigned_hots, unassigned_colds, total_matched)``
+    """
+    import random as _random
+
+    rng = _random.Random(seed)
+
+    best_units: list[HXUnit] = []
+    best_ua_hots: list[_RecInfo] = []
+    best_ua_colds: list[_RecInfo] = []
+    best_matched = -1.0
+
+    for _ in range(n_restarts):
+        # 对各侧按 T_high 降序排列（同 T_high 组内随机打乱）
+        h_sorted = sorted(hots, key=lambda r: r.T_high, reverse=True)
+        c_sorted = sorted(colds, key=lambda r: r.T_high, reverse=True)
+
+        def _shuffle_by_tier(items: list[_RecInfo], rng) -> list[_RecInfo]:
+            tiers: dict[int, list[_RecInfo]] = {}
+            for item in items:
+                t = int(item.T_high)
+                tiers.setdefault(t, []).append(item)
+            result: list[_RecInfo] = []
+            for t in sorted(tiers, reverse=True):
+                tier_list = tiers[t]
+                rng.shuffle(tier_list)
+                result.extend(tier_list)
+            return result
+
+        h_pool = _shuffle_by_tier(list(h_sorted), rng)
+        c_pool = _shuffle_by_tier(list(c_sorted), rng)
+
+        h_assigned: set[int] = set()
+        c_assigned: set[int] = set()
+        units: list[HXUnit] = []
+
+        # ── 前向: 热→冷 (1H + kC) ──
+        for h in h_pool:
+            if h.idx in h_assigned:
+                continue
+            feasible = [c for c in c_pool
+                        if c.idx not in c_assigned
+                        and h.T_high > c.T_high + dT_min - 1e-9]
+            if not feasible:
+                continue
+
+            cold_subset: list[_RecInfo] = []
+            sum_c = 0.0
+            min_pinch = float("inf")
+
+            for c in feasible:
+                if max_group_size is not None and len(cold_subset) >= max_group_size:
+                    break
+                test_set = cold_subset + [c]
+                ok, pinch = _check_1hot_Ncold(h, test_set, dT_min)
+                if not ok:
+                    continue
+                cold_subset.append(c)
+                sum_c += c.Q
+                min_pinch = min(min_pinch, pinch)
+                if sum_c >= h.Q - 1e-12:
+                    break
+
+            if not cold_subset:
+                continue
+
+            matched = min(h.Q, sum_c)
+            units.append(HXUnit(
+                hot_records=(h.record,),
+                cold_records=tuple(c.record for c in cold_subset),
+                matched_heat=matched,
+                residual=abs(h.Q - sum_c),
+                internal_pinch=min_pinch,
+            ))
+            h_assigned.add(h.idx)
+            for c in cold_subset:
+                c_assigned.add(c.idx)
+
+        # ── 后向: 剩余冷→剩余热 (mH + 1C) ──
+        remaining_c = [c for c in c_pool if c.idx not in c_assigned]
+        for c in remaining_c:
+            if c.idx in c_assigned:
+                continue
+            feasible = [h for h in h_pool
+                        if h.idx not in h_assigned
+                        and h.T_high > c.T_high + dT_min - 1e-9]
+            if not feasible:
+                continue
+
+            hot_subset: list[_RecInfo] = []
+            sum_h = 0.0
+            min_pinch = float("inf")
+
+            for h in feasible:
+                if max_group_size is not None and len(hot_subset) >= max_group_size:
+                    break
+                test_set = hot_subset + [h]
+                ok, pinch = _check_Nhot_1cold(test_set, c, dT_min)
+                if not ok:
+                    continue
+                hot_subset.append(h)
+                sum_h += h.Q
+                min_pinch = min(min_pinch, pinch)
+                if sum_h >= c.Q - 1e-12:
+                    break
+
+            if not hot_subset:
+                continue
+
+            matched = min(sum_h, c.Q)
+            units.append(HXUnit(
+                hot_records=tuple(h.record for h in hot_subset),
+                cold_records=(c.record,),
+                matched_heat=matched,
+                residual=abs(sum_h - c.Q),
+                internal_pinch=min_pinch,
+            ))
+            c_assigned.add(c.idx)
+            for h in hot_subset:
+                h_assigned.add(h.idx)
+
+        total_matched = sum(u.matched_heat for u in units)
+        if total_matched > best_matched + 1e-9:
+            best_matched = total_matched
+            best_units = units
+            best_ua_hots = [h for h in hots if h.idx not in h_assigned]
+            best_ua_colds = [c for c in colds if c.idx not in c_assigned]
+
+    return best_units, best_ua_hots, best_ua_colds, best_matched
+
+
+def match_constructive(
+    hot_records: list[ProcessRecord],
+    cold_records: list[ProcessRecord],
+    dT_min: float = 10.0,
+    n_restarts: int = 20,
+    max_group_size: int | None = 5,
+    seed: int | None = None,
+) -> HXMatchResult:
+    """构造式换热匹配：双向遍历 + 多起点。O(R·N·avg_k)，无组合爆炸。
+
+    :param n_restarts: 随机重启次数（默认 20）。
+    :param seed: 随机种子；None 时使用系统熵。
+    """
+    recs, total_hot, total_cold = _normalize_records(hot_records, cold_records)
+
+    if not recs:
+        return HXMatchResult(
+            units=(), unassigned_hots=(), unassigned_colds=(),
+            total_matched=0.0, total_unmatched=0.0, num_units=0,
+        )
+
+    hots = [r for r in recs if r.is_hot]
+    colds = [r for r in recs if not r.is_hot]
+
+    units, ua_hots, ua_colds, total_matched = \
+        _solve_constructive(hots, colds, dT_min, n_restarts, max_group_size, seed)
+
+    total_unmatched = sum(r.Q for r in ua_hots + ua_colds)
+    for u in units:
+        total_unmatched += u.residual
+
+    return HXMatchResult(
+        units=tuple(units),
+        unassigned_hots=tuple(r.record for r in ua_hots),
+        unassigned_colds=tuple(r.record for r in ua_colds),
+        total_matched=total_matched,
+        total_unmatched=total_unmatched,
+        num_units=len(units),
+    )
+
+
+def match_heat_exchanger_staged(
+    src_hot_records: list[ProcessRecord],
+    src_cold_records: list[ProcessRecord],
+    cycle_rej_records: list[ProcessRecord],
+    cycle_abs_records: list[ProcessRecord],
+    dT_min: float = 10.0,
+    n_restarts: int = 20,
+    max_group_size: int | None = 5,
+    seed: int | None = None,
+) -> HXMatchResult:
+    """三阶段分步匹配：外部热源↔循环吸热 → 外部冷源↔循环放热 → 循环内部消纳。
+
+    与 ``match_heat_exchanger_groups`` 返回类型相同，可替换使用。
+    """
+    import copy
+
+    # 标记来源：用 mutable list 跟踪剩余
+    abs_rem = list(cycle_abs_records)
+    rej_rem = list(cycle_rej_records)
+
+    # ── 阶段 1: 外部热源 ↔ 循环吸热 ──
+    h1 = match_constructive(src_hot_records, abs_rem, dT_min, n_restarts, max_group_size, seed)
+    # 移除被匹配的循环吸热
+    matched_abs_keys = set()
+    for u in h1.units:
+        for cr in u.cold_records:
+            matched_abs_keys.add(cr.edge_key)
+    abs_rem = [r for r in abs_rem if r.edge_key not in matched_abs_keys]
+
+    # ── 阶段 2: 外部冷源 ↔ 循环放热 ──
+    h2 = match_constructive(src_cold_records, rej_rem, dT_min, n_restarts, max_group_size, seed)
+    # 移除被匹配的循环放热
+    matched_rej_keys = set()
+    for u in h2.units:
+        for hr in u.hot_records:
+            matched_rej_keys.add(hr.edge_key)
+    rej_rem = [r for r in rej_rem if r.edge_key not in matched_rej_keys]
+
+    # ── 阶段 3: 剩余循环内部消纳 ──
+    h3 = match_constructive(abs_rem, rej_rem, dT_min, n_restarts, max_group_size, seed)
+
+    # 合并
+    all_units = list(h1.units) + list(h2.units) + list(h3.units)
+    all_ua_hots = (list(h1.unassigned_hots) + list(h2.unassigned_hots)
+                   + list(h3.unassigned_hots))
+    all_ua_colds = (list(h1.unassigned_colds) + list(h2.unassigned_colds)
+                    + list(h3.unassigned_colds))
+
+    total_matched = sum(u.matched_heat for u in all_units)
+    total_unmatched = sum(r.power_rate and abs(float(r.power_rate)) or 0.0
+                          for r in all_ua_hots + all_ua_colds)
+    for u in all_units:
+        total_unmatched += u.residual
+
+    return HXMatchResult(
+        units=tuple(all_units),
+        unassigned_hots=tuple(all_ua_hots),
+        unassigned_colds=tuple(all_ua_colds),
+        total_matched=total_matched,
+        total_unmatched=total_unmatched,
+        num_units=len(all_units),
+    )

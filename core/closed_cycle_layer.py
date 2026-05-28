@@ -839,8 +839,9 @@ class ClosedCycleLayer:
     def _rebuild_simplified(self) -> None:
         """基于当前 ``nodes`` / ``edges`` / ``subcycles`` 重建 ``self.simplified``。
 
-        ``subcycles`` 为空时直接置空骨架并发出 ``RuntimeWarning``。
+        清空既有 ``non_ideal`` 快照；``subcycles`` 为空时直接置空骨架并发出 ``RuntimeWarning``。
         """
+        self._invalidate_non_ideal()
         if not self.subcycles:
             warnings.warn(
                 "ClosedCycleLayer: 当前没有子循环，simplified 置为空骨架（kept_nodes / simplified_edges / merged_into 均为空）。",
@@ -854,9 +855,21 @@ class ClosedCycleLayer:
             )
             return
         self.simplified = build_simplified_topology(self.nodes, self.edges, self.subcycles)
+        if not self.simplified.simplified_edges:
+            warnings.warn(
+                "ClosedCycleLayer: 子循环存在但精简后无边（可能所有边 mass_flow 为零），"
+                "simplified 置为空骨架。",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def sync_subcycle_mass_flows_to_subcycles(self) -> None:
         """将 ``subcycle_mass_flows[i]`` 写入 ``subcycles[i].mass_flow``；长度须一致。"""
+        if len(self.subcycle_mass_flows) != len(self.subcycles):
+            raise ValueError(
+                f"subcycle_mass_flows 长度 {len(self.subcycle_mass_flows)} "
+                f"与 subcycles 长度 {len(self.subcycles)} 不一致"
+            )
         for i, sc in enumerate(self.subcycles):
             sc.mass_flow = self.subcycle_mass_flows[i]
 
