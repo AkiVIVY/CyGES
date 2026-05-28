@@ -87,7 +87,10 @@ def hx_unmatched_ratio(result: SystemResult) -> float:
     温差约束由模块变量 ``_HX_DT_MIN`` 控制（默认 10 K）。
 
     .. math::
-        obj = \\frac{\\text{total\\_unmatched}}{\\Sigma |Q|}
+        obj = \\frac{\\text{total\\_unmatched} \\times (N+1)}{\\Sigma |Q|}
+
+    其中 *N* 为未匹配换热边总数（热+冷）。``N+1`` 倍的惩罚项
+    使优化器优先消除碎片化未匹配边，而非仅最小化未匹配功率总和。
 
     值为 0 表示全部换热过程均可配对成热平衡换热器。
     """
@@ -111,4 +114,5 @@ def hx_unmatched_ratio(result: SystemResult) -> float:
     total_q = sum(abs(float(r.power_rate)) for r in all_hots + all_colds if r.power_rate)
     if total_q < 1e-12:
         return 1.0
-    return hx.total_unmatched / total_q
+    N = len(hx.unassigned_hots) + len(hx.unassigned_colds)
+    return hx.total_unmatched / total_q * (N + 1)

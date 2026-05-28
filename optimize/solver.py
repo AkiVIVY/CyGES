@@ -225,6 +225,8 @@ def _round_and_dedup(values: tuple[float, ...], step: float, merge_ratio: float 
         return values
     lo, hi = 0.0, 1.0
     rounded = sorted(set(max(lo, min(hi, round(v / step) * step)) for v in values))
+    # 去除与边界重合的分位点（与 t_min/p_min 或 t_max/p_max 重叠导致重复节点）
+    rounded = [v for v in rounded if lo < v < hi]
     if merge_ratio <= 0.0:
         return tuple(rounded)
     # 合并相邻过近点
@@ -262,6 +264,7 @@ class _EvalState:
     hx_dT_min: float = 10.0
     hx_max_group_size: int | None = None
     use_interp_he: bool = False
+    he_solver_params: tuple[float, float, float, float] | None = None
 
 
 def _eval_worker(x: tuple[float, ...], state: _EvalState, he_solver: object | None = None) -> float:
@@ -270,12 +273,23 @@ def _eval_worker(x: tuple[float, ...], state: _EvalState, he_solver: object | No
     return _eval_impl(tuple(x), state, props, he_solver)
 
 
+_CHUNK_CACHED_HE_SOLVER: object | None = None
+
+
 def _eval_chunk(solutions_and_state: tuple[list[list[float]], _EvalState]) -> list[float]:
-    """模块级 worker：评估一个 chunk 内的所有解（供 ProcessPoolExecutor spawn 调用）。"""
-    import pickle
+    """模块级 worker：评估一个 chunk 内的所有解（供 ProcessPoolExecutor spawn 调用）。
+
+    每 worker 进程首次调用时构建并缓存 ``InterpolatingHeliumSolver``，
+    后续 chunk 复用同一实例，避免重复 CoolProp 建网格和 pickle 传输。
+    """
+    global _CHUNK_CACHED_HE_SOLVER
     solutions, state = solutions_and_state
-    from core import InterpolatingHeliumSolver
-    he_solver = InterpolatingHeliumSolver() if state.use_interp_he else None
+    if state.he_solver_params is not None and _CHUNK_CACHED_HE_SOLVER is None:
+        from core import InterpolatingHeliumSolver
+        t0, t1, p0, p1 = state.he_solver_params
+        _CHUNK_CACHED_HE_SOLVER = InterpolatingHeliumSolver(T_min=t0, T_max=t1, P_min=p0, P_max=p1)
+        _CHUNK_CACHED_HE_SOLVER._build()
+    he_solver = _CHUNK_CACHED_HE_SOLVER
     return [_eval_worker(tuple(s), state, he_solver) for s in solutions]
 
 
@@ -437,7 +451,7 @@ class Optimizer:
         self._hx_dT_min = hx_dT_min
         self._hx_max_group_size = hx_max_group_size
         self._use_interp_he = use_interp_he
-        self._he_solver_cache: object | None = None
+        self._he_solver_cache = self._make_interp_he_solver() if use_interp_he else None
 
         if isinstance(objective, str):
             if objective not in OBJECTIVES:
@@ -461,6 +475,17 @@ class Optimizer:
         self._max_sc = max_subcycles if not basis_encoding else 0
         self._n_t_q = len(self._base_tp.t_quantiles)
         self._n_p_q = len(self._base_tp.p_quantiles)
+
+    def _make_interp_he_solver(self):
+        """用闭式循环的 T/P 边界创建插值网格并立即构建。"""
+        from core import InterpolatingHeliumSolver
+        tp = self._base_tp
+        solver = InterpolatingHeliumSolver(
+            T_min=tp.t_min, T_max=tp.t_max,
+            P_min=tp.p_min, P_max=tp.p_max,
+        )
+        solver._build()
+        return solver
 
     def _probe_max_sc(self) -> int:
         """用初始分位探测子循环数，×1.5 安全系数作为 mf 维度上限。"""
@@ -488,6 +513,12 @@ class Optimizer:
             hx_dT_min=self._hx_dT_min,
             hx_max_group_size=self._hx_max_group_size,
             use_interp_he=self._use_interp_he,
+            he_solver_params=(
+                self._he_solver_cache._T_min,
+                self._he_solver_cache._T_max,
+                self._he_solver_cache._P_min,
+                self._he_solver_cache._P_max,
+            ) if self._he_solver_cache is not None else None,
         )
 
     def _build_basis_grid(self) -> None:
@@ -558,9 +589,6 @@ class Optimizer:
 
     def _evaluate(self, x: tuple[float, ...]) -> float:
         """解包 x → 构造系统 → 运行管线 → 返回目标值。"""
-        if self._use_interp_he and self._he_solver_cache is None:
-            from core import InterpolatingHeliumSolver
-            self._he_solver_cache = InterpolatingHeliumSolver()
         he_solver = self._he_solver_cache
 
         idx = 0

@@ -43,7 +43,7 @@ def _make_system_input() -> SystemInput:
     )
     cycle_input = ClosedCycleTPInput(
         fluid="He", t_min=40.0, t_max=1000.0, p_min=2000.0, p_max=10000.0,
-        t_quantiles=(0.33, 0.67), p_quantiles=(0.5,),
+        t_quantiles=(0.5,), p_quantiles=(0.5,),
         subcycle_mass_flow_initial=20.0,
     )
     return SystemInput(
@@ -330,24 +330,24 @@ def test_optimize_heat_balance_hx() -> None:
 
     hx_dT = 10.0
 
-    run_dir = TESTS_DIR / "run_hx_opt"
+    run_dir = TESTS_DIR / "run_hx_opt_1t1p_cp"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 60)
-    print("hx_unmatched 优化 (HX matching in obj, skip_pinch=True, CMA-ES 200代)")
+    print("hx_unmatched 优化 (1T+1P, CoolProp, CMA-ES 50代×3, 5x5 basis, N+1 penalty)")
     print("=" * 60)
     opt = Optimizer(
         base_input=sys_inp, props=props, objective="hx_unmatched",
         mf_step_fraction=0.01, quantile_step=0.01,
-        basis_encoding=True, basis_s=4, basis_p=4,
+        basis_encoding=True, basis_s=5, basis_p=5,
         mf_bounds=(0.0, 50.0), quantile_merge_ratio=0.0,
         n_workers=6, skip_pinch=True, hx_dT_min=hx_dT, hx_max_group_size=3,
     )
 
     dim = len(opt.bounds)
     print(f"维度: {dim} (t_max + t_min + {opt._n_t_q}t_q + {opt._n_p_q}p_q + {opt._mf_dim}×basis)")
-    print(f"CMA-ES maxiter=200 seed=42, {opt._n_workers} workers, "
-          f"dT_min={opt._hx_dT_min}K, skip_pinch={opt._skip_pinch}\n")
+    print(f"CMA-ES maxiter=50 restarts=3 early_stop=5 seed=42, {opt._n_workers} workers, "
+          f"dT_min={opt._hx_dT_min}K, max_group_size=3, CoolProp\n")
 
     best_val_log: list[float] = []
 
@@ -371,8 +371,8 @@ def test_optimize_heat_balance_hx() -> None:
     print("  开始优化...\n")
     t0 = time.time()
     opt_result = opt.run(
-        method="cma", maxiter=200, seed=42, early_stop=30, sigma0=0.3,
-        callback=_on_gen,
+        method="cma", maxiter=50, seed=42, early_stop=5, sigma0=0.3,
+        restarts=3, callback=_on_gen,
     )
     elapsed = time.time() - t0
 
@@ -381,10 +381,10 @@ def test_optimize_heat_balance_hx() -> None:
     # ── 单次系统评估 + HX 匹配计时 ──
     _hots_tmp, _colds_tmp = _collect_heat_records(raw, props)
     _t0 = time.time()
-    for _ in range(100):
-        match_heat_exchanger_groups(_hots_tmp, _colds_tmp, dT_min=hx_dT)
-    _t_hx_ms = (time.time() - _t0) / 100 * 1000
-    print(f"\n  计时: {len(_hots_tmp)+len(_colds_tmp)}条记录, 100次HX匹配 = {_t_hx_ms*100:.0f}ms → 单次 {_t_hx_ms:.2f}ms")
+    for _ in range(10):
+        match_heat_exchanger_groups(_hots_tmp, _colds_tmp, dT_min=hx_dT, max_group_size=3)
+    _t_hx_ms = (time.time() - _t0) / 10 * 1000
+    print(f"\n  计时: {len(_hots_tmp)+len(_colds_tmp)}条记录, 10次HX匹配 = {_t_hx_ms*10:.0f}ms → 单次 {_t_hx_ms:.2f}ms")
     print(f"  优化总耗时: {elapsed:.1f}s, 评估{opt_result.n_evaluations}次 → 每评 {elapsed/opt_result.n_evaluations*1000:.0f}ms")
 
     report = raw.cycle_reports[0]
@@ -457,15 +457,11 @@ def test_optimize_heat_balance_hx() -> None:
         p_min=opt._base_tp.p_min, p_max=opt._base_tp.p_max,
         t_quantiles=tq_dedup, p_quantiles=pq_dedup,
     )
-    layer_ideal = ClosedCycleLayer(tp_opt)
+    layer_ideal = ClosedCycleLayer(tp_opt, properties=opt._he_solver_cache)
     weights = list(opt_result.x_opt[4:4 + opt._mf_dim])
     mf_opt = opt._decode_basis_flows(layer_ideal, weights)
     layer_ideal.subcycle_mass_flows = mf_opt
     layer_ideal.commit_subcycle_mass_flows_to_topology()
-    print(f"\n  子循环数: {len(layer_ideal.subcycles)}, "
-          f"流量 (kg/s): {[f'{f:.2f}' for f in mf_opt]}")
-
-    # 非理想层
     ni = layer_ideal.ensure_non_ideal()
     ni.apply_offsets()
     ni_report = layer_ideal.performance_report()

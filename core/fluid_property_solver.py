@@ -153,13 +153,22 @@ class InterpolatingHeliumSolver:
     def fluid(self) -> str:
         return "He"
 
-    def __init__(self, dT: float = 10.0, dP: float = 200.0) -> None:
+    def __init__(
+        self,
+        dT: float = 10.0,
+        dP: float = 200.0,
+        *,
+        T_min: float | None = None,
+        T_max: float | None = None,
+        P_min: float | None = None,
+        P_max: float | None = None,
+    ) -> None:
         self._dT = dT
         self._dP = dP
-        self._T_min = self._T_DEFAULT[0]
-        self._T_max = self._T_DEFAULT[1]
-        self._P_min = self._P_DEFAULT[0]
-        self._P_max = self._P_DEFAULT[1]
+        self._T_min = T_min if T_min is not None else self._T_DEFAULT[0]
+        self._T_max = T_max if T_max is not None else self._T_DEFAULT[1]
+        self._P_min = P_min if P_min is not None else self._P_DEFAULT[0]
+        self._P_max = P_max if P_max is not None else self._P_DEFAULT[1]
         self._T_grid: list[float] = []
         self._P_grid: list[float] = []
         self._H_grid: list[list[float]] = []
