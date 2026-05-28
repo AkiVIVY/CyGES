@@ -1,6 +1,6 @@
-"""hx_unmatched 优化 + HX 匹配测试: Air/H₂/He 系统, CMA-ES 200 代, skip_pinch。
+r"""CMA-ES 全参数优化: t_min/t_max/t_q/p_q/H2_mf + 基函数权重, 2P+1T, CoolProp.
 
-HX 匹配已集成入目标函数 (dT_min=10K)；优化后打印匹配明细并输出 3 张 PNG。
+  目标: hx_unmatched (无 N+1 惩罚), CMA-ES 30代×3重启, 4×4 basis.
 """
 
 from __future__ import annotations
@@ -17,33 +17,27 @@ from core import (
     CycleConfig,
     ExternalSourceInput,
     ProcessCategory,
-    ProcessRecord,
     PropertyRegistry,
     SystemInput,
 )
-from core.heat_exchanger import match_heat_exchanger_groups, HXMatchResult
+from core.heat_exchanger import match_heat_exchanger_groups
 from optimize import Optimizer
 
 TESTS_DIR = Path(__file__).resolve().parent
 
 
-# ============================================================
-# 输入构造（与 test_optimize 一致）
-# ============================================================
-
-
-def _make_system_input() -> SystemInput:
+def _make_system_input(h2_mf: float = 4.3) -> SystemInput:
     hot = ExternalSourceInput(
         fluid="Air", mass_flow=100.0,
         T_in=1250.0, P_in=200.0, T_out=500.0, P_out=180.0,
     )
     cold = ExternalSourceInput(
-        fluid="Hydrogen", mass_flow=4.3,
+        fluid="Hydrogen", mass_flow=h2_mf,
         T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0,
     )
     cycle_input = ClosedCycleTPInput(
         fluid="He", t_min=40.0, t_max=1000.0, p_min=2000.0, p_max=10000.0,
-        t_quantiles=(0.5,), p_quantiles=(0.5,),
+        t_quantiles=(0.5,), p_quantiles=(0.33, 0.67),
         subcycle_mass_flow_initial=20.0,
     )
     return SystemInput(
@@ -56,291 +50,154 @@ def _make_system_input() -> SystemInput:
     )
 
 
-# ============================================================
-# 图 1: 理想骨架 TP/PS（子循环多边形 + 流量）
-# ============================================================
-
-
-def _draw_ideal_grid(layer: ClosedCycleLayer, out_path: Path) -> None:
-    matplotlib = pytest.importorskip("matplotlib")
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, (ax_ts, ax_ps) = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle("Ideal Topology — Subcycle Grid & Flows", fontsize=12, fontweight="bold")
-
-    colors_sc = plt.cm.tab10.colors
-    for n in layer.nodes.values():
-        ax_ts.scatter(n.S, n.T, s=10, color="0.4", zorder=1)
-        ax_ps.scatter(n.S, n.P, s=10, color="0.4", zorder=1)
-
-    for i, sc in enumerate(layer.subcycles):
-        c = colors_sc[i % len(colors_sc)]
-        q = sc.mass_flow if sc.mass_flow is not None else 0.0
-        n0, n1, n2, n3 = [layer.nodes[idx] for idx in sc.nodes]
-        for ax, y_fn in [(ax_ts, lambda n: n.T), (ax_ps, lambda n: n.P)]:
-            xs = [n0.S, n1.S, n2.S, n3.S, n0.S]
-            ys = [y_fn(n0), y_fn(n1), y_fn(n2), y_fn(n3), y_fn(n0)]
-            ax.plot(xs, ys, "-", color=c, lw=1.2, alpha=0.5)
-            cx = (n0.S + n2.S) / 2
-            cy = (y_fn(n0) + y_fn(n2)) / 2
-            ax.annotate(f"SC{i}\n{q:.1f}", (cx, cy), ha="center", va="center",
-                        fontsize=6, color=c, fontweight="bold")
-
-    ax_ts.set_xlabel("S [kJ/(kg·K)]"); ax_ts.set_ylabel("T [K]")
-    ax_ts.grid(True, alpha=0.25); ax_ts.set_title("T–S", fontsize=10)
-    ax_ps.set_xlabel("S [kJ/(kg·K)]"); ax_ps.set_ylabel("P [kPa]")
-    ax_ps.grid(True, alpha=0.25); ax_ps.set_title("P–S", fontsize=10)
-
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-# ============================================================
-# 图 2: 非理想 TS + PS（kept_nodes + simplified_edges）
-# ============================================================
-
-
-def _draw_non_ideal(report, out_path: Path) -> None:
-    matplotlib = pytest.importorskip("matplotlib")
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, (ax_ts, ax_ps) = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle("Non-Ideal Cycle — T–S & P–S", fontsize=12, fontweight="bold")
-
-    for _, snap in report.nodes:
-        ax_ts.scatter(snap.S, snap.T, s=12, color="0.3", zorder=2)
-        ax_ps.scatter(snap.S, snap.P, s=12, color="0.3", zorder=2)
-
-    for _, rec in report.by_edge:
-        c = "tab:orange" if rec.kind == "mechanical" else "tab:green"
-        ax_ts.plot([rec.tail_state.S, rec.head_state.S],
-                    [rec.tail_state.T, rec.head_state.T],
-                    color=c, lw=1.2, alpha=0.7)
-        ax_ps.plot([rec.tail_state.S, rec.head_state.S],
-                    [rec.tail_state.P, rec.head_state.P],
-                    color=c, lw=1.2, alpha=0.7)
-        fr, to = 0.38, 0.62
-        ax_ts.annotate("", xytext=(
-            rec.tail_state.S + fr * (rec.head_state.S - rec.tail_state.S),
-            rec.tail_state.T + fr * (rec.head_state.T - rec.tail_state.T),
-        ), xy=(
-            rec.tail_state.S + to * (rec.head_state.S - rec.tail_state.S),
-            rec.tail_state.T + to * (rec.head_state.T - rec.tail_state.T),
-        ), arrowprops=dict(arrowstyle="->", color="0.3", lw=1.0, alpha=0.6))
-        ax_ps.annotate("", xytext=(
-            rec.tail_state.S + fr * (rec.head_state.S - rec.tail_state.S),
-            rec.tail_state.P + fr * (rec.head_state.P - rec.tail_state.P),
-        ), xy=(
-            rec.tail_state.S + to * (rec.head_state.S - rec.tail_state.S),
-            rec.tail_state.P + to * (rec.head_state.P - rec.tail_state.P),
-        ), arrowprops=dict(arrowstyle="->", color="0.3", lw=1.0, alpha=0.6))
-        mx_s = (rec.tail_state.S + rec.head_state.S) / 2
-        mx_t = (rec.tail_state.T + rec.head_state.T) / 2
-        mx_p = (rec.tail_state.P + rec.head_state.P) / 2
-        ax_ts.annotate(rec.edge_key, (mx_s, mx_t), fontsize=5, color="0.4",
-                       ha="center", xytext=(0, 4), textcoords="offset points")
-        ax_ps.annotate(rec.edge_key, (mx_s, mx_p), fontsize=5, color="0.4",
-                       ha="center", xytext=(0, 4), textcoords="offset points")
-
-    ax_ts.set_xlabel("S [kJ/(kg·K)]"); ax_ts.set_ylabel("T [K]")
-    ax_ts.grid(True, alpha=0.25); ax_ts.set_title("T–S", fontsize=10)
-    ax_ps.set_xlabel("S [kJ/(kg·K)]"); ax_ps.set_ylabel("P [kPa]")
-    ax_ps.grid(True, alpha=0.25); ax_ps.set_title("P–S", fontsize=10)
-
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-# ============================================================
-# 图 3: HX 匹配 T-Q 图（概览 + 每组详情）
-# ============================================================
-
-
-def _draw_hx_match(
-    result: HXMatchResult,
-    hot_recs, cold_recs,
-    out_path: Path,
-) -> None:
-    matplotlib = pytest.importorskip("matplotlib")
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-
-    n_units = max(len(result.units), 1)
-    n_rows = (n_units + 2) // 3
-    if n_rows == 0:
-        n_rows = 1
-
-    fig = plt.figure(figsize=(max(14, 5 * min(n_units, 3)), 3.0 + 3.5 * n_rows))
-    fig.suptitle(
-        f"HX Chain Matching | matched={result.total_matched:.0f}kW  "
-        f"unmatched={result.total_unmatched:.0f}kW  {result.num_units} units",
-        fontsize=12, fontweight="bold",
-    )
-
-    gs = fig.add_gridspec(n_rows + 1, 1, height_ratios=[1] + [2] * n_rows,
-                          hspace=0.45, top=0.92)
-
-    # ── 概览（所有记录沿 T_high 降序）──
-    ax_ov = fig.add_subplot(gs[0])
-
-    from core.heat_exchanger import _normalize_records
-    recs, _, _ = _normalize_records(hot_recs, cold_recs)
-    sorted_recs = sorted(recs, key=lambda r: (r.T_high, 0 if r.is_hot else 1), reverse=True)
-
-    unit_colors = ["#FFD0D0", "#D0D0FF", "#D0FFD0", "#FFFFD0",
-                   "#FFD0FF", "#D0FFFF", "#FFE8D0", "#E8D0FF"]
-    unit_keys: list[set[str]] = []
-    for u in result.units:
-        keys: set[str] = set()
-        for r in u.hot_records:
-            keys.add(r.edge_key)
-        for r in u.cold_records:
-            keys.add(r.edge_key)
-        unit_keys.append(keys)
-
-    ua_keys: set[str] = set()
-    for r in result.unassigned_hots:
-        ua_keys.add(r.edge_key)
-    for r in result.unassigned_colds:
-        ua_keys.add(r.edge_key)
-
-    cum_q = 0.0
-    for r in sorted_recs:
-        color = "tab:red" if r.is_hot else "tab:blue"
-        label = r.record.edge_key
-        ax_ov.plot([cum_q, cum_q + r.Q], [r.T_high, r.T_low],
-                    color=color, lw=2.2, marker="o", ms=4)
-        mid_q = cum_q + r.Q / 2
-        mid_t = (r.T_high + r.T_low) / 2
-
-        in_unit = -1
-        for ui, keys in enumerate(unit_keys):
-            if label in keys:
-                in_unit = ui
-                break
-        if in_unit >= 0:
-            bg = unit_colors[in_unit % len(unit_colors)]
-        elif label in ua_keys:
-            bg = "#EEEEEE"
-        else:
-            bg = "white"
-        ax_ov.annotate(f"{label} {r.Q:.0f}kW", (mid_q, mid_t),
-                        fontsize=5.5, ha="center", color=color,
-                        bbox=dict(boxstyle="round,pad=0.1", facecolor=bg, alpha=0.85))
-        cum_q += r.Q
-
-    ax_ov.set_xlabel("Cumulative Q (T_high ↓) [kW]")
-    ax_ov.set_ylabel("T [K]")
-    ax_ov.grid(True, alpha=0.2)
-    ax_ov.legend(handles=[
-        mpatches.Patch(color="tab:red", label="hot"),
-        mpatches.Patch(color="tab:blue", label="cold"),
-    ], fontsize=8, loc="upper left")
-    ax_ov.set_title("Overview — all records (sorted by T_high)", fontsize=9, loc="left")
-
-    # ── 每组详情 ──
-    for ui, unit in enumerate(result.units):
-        row = 1 + ui // 3
-        col = ui % 3
-        n_sub = min(n_units - (ui // 3) * 3, 3)
-        sub_gs = gs[row].subgridspec(1, n_sub, wspace=0.35)
-        ax = fig.add_subplot(sub_gs[0, col])
-
-        h_sorted = sorted(unit.hot_records,
-                          key=lambda rr: max(rr.tail_state.T, rr.head_state.T), reverse=True)
-        c_sorted = sorted(unit.cold_records,
-                          key=lambda rr: max(rr.tail_state.T, rr.head_state.T), reverse=True)
-
-        x = 0.0
-        for hr in h_sorted:
-            Th = max(hr.tail_state.T, hr.head_state.T)
-            Tl = min(hr.tail_state.T, hr.head_state.T)
-            Qh = abs(hr.power_rate) if hr.power_rate else 0.0
-            ax.plot([x, x + Qh], [Th, Tl], "o-", color="tab:red", lw=2.2, ms=3)
-            ax.annotate(f"{hr.edge_key}\n({Qh:.0f}kW)", (x + Qh / 2, (Th + Tl) / 2),
-                        fontsize=5, color="darkred", ha="center",
-                        xytext=(0, 6), textcoords="offset points")
-            x += Qh
-
-        x = 0.0
-        for cr in c_sorted:
-            Tc_l = min(cr.tail_state.T, cr.head_state.T)
-            Tc_h = max(cr.tail_state.T, cr.head_state.T)
-            Qc = abs(cr.power_rate) if cr.power_rate else 0.0
-            # 逆流: 冷出口(左,高温) → 冷入口(右,低温)
-            ax.plot([x, x + Qc], [Tc_h, Tc_l], "s--", color="tab:blue", lw=1.8, ms=3)
-            ax.annotate(f"{cr.edge_key}\n({Qc:.0f}kW)", (x + Qc / 2, (Tc_h + Tc_l) / 2),
-                        fontsize=5, color="darkblue", ha="center",
-                        xytext=(0, -10), textcoords="offset points")
-            x += Qc
-
-        ax.set_title(f"U{ui + 1}  matched={unit.matched_heat:.0f}kW  "
-                     f"resid={unit.residual:.1f}kW  pinch={unit.internal_pinch:.0f}K",
-                     fontsize=7.5, fontweight="bold")
-        ax.set_xlabel("Q [kW]"); ax.set_ylabel("T [K]")
-        ax.grid(True, alpha=0.2)
-
-    fig.subplots_adjust(left=0.05, right=0.97, bottom=0.05)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-# ============================================================
-# 辅助: 收集换热 ProcessRecord
-# ============================================================
-
-
-def _collect_heat_records(system_result, props):
-    """从 SystemResult 收集所有换热过程 (HOT=REJECTION, COLD=ABSORPTION)。"""
-    hots: list[ProcessRecord] = []
-    colds: list[ProcessRecord] = []
-
-    from core.fluid_property_solver import PropertyRegistry as PR
-
-    for rec in system_result.heat_source_records:
-        hots.append(rec)
-    for rec in system_result.cold_source_records:
-        colds.append(rec)
-
-    for report in system_result.cycle_reports:
-        for _, rec in report.by_edge:
-            if rec.kind != "heat" or rec.power_rate is None:
-                continue
-            if rec.category == ProcessCategory.HEAT_REJECTION:
-                hots.append(rec)
-            elif rec.category == ProcessCategory.HEAT_ABSORPTION:
-                colds.append(rec)
-
-    return hots, colds
-
-
-# ============================================================
-# 主测试
-# ============================================================
-
-
-def test_optimize_heat_balance_hx() -> None:
-    """占位测试：验证 Optimizer 可正常创建（具体优化参数待讨论后配置）。"""
+def test_cma_full_opt() -> None:
     sys_inp = _make_system_input()
     props = PropertyRegistry()
+    hx_dT = 10.0
+
+    run_dir = TESTS_DIR / "run_cma_full"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "=" * 60)
+    print("CMA-ES 全参数优化 (2P+1T, H2 3-6, 4x4 basis, CoolProp)")
+    print("=" * 60)
+
     opt = Optimizer(
         base_input=sys_inp, props=props, objective="hx_unmatched",
         mf_step_fraction=0.01, quantile_step=0.01,
         basis_encoding=True, basis_s=4, basis_p=4,
         mf_bounds=(0.0, 50.0), quantile_merge_ratio=0.0,
-        n_workers=1, skip_pinch=True, hx_dT_min=10.0, hx_max_group_size=3,
-        use_interp_he=True,
+        n_workers=6, skip_pinch=True, hx_dT_min=hx_dT, hx_max_group_size=3,
+        h2_mf_bounds=(3.0, 6.0),
     )
-    assert len(opt.bounds) > 0
-    assert opt._n_t_q == 1
-    assert opt._n_p_q == 1
-    print(f"  Optimizer OK: dim={len(opt.bounds)}, objective={opt._objective_name}")
+
+    dim = len(opt.bounds)
+    print(f"  维度: {dim} (t_max+t_min+{opt._n_t_q}t_q+{opt._n_p_q}p_q+{opt._mf_dim}basis+1 H2)")
+    print(f"  CMA-ES maxiter=30 restarts=3 seed=42, {opt._n_workers} workers")
+    print(f"  dT_min={opt._hx_dT_min}K, max_group_size=3, CoolProp\n")
+
+    best_val_log: list[float] = []
+
+    def _on_gen(gen: int, restart: int, best_x: list[float],
+                best_val: float, n_evals: int) -> None:
+        best_val_log.append(best_val)
+        idx = 0
+        t_mx, t_mn = best_x[idx], best_x[idx + 1]; idx += 2
+        tq = ", ".join(f"{best_x[idx+i]:.3f}" for i in range(opt._n_t_q))
+        idx += opt._n_t_q
+        pq = ", ".join(f"{best_x[idx+i]:.3f}" for i in range(opt._n_p_q))
+        idx += opt._n_p_q
+        wm = sum(best_x[idx:idx + opt._mf_dim]) / max(1, opt._mf_dim)
+        h2 = best_x[idx + opt._mf_dim] if len(best_x) > idx + opt._mf_dim else 0
+        sys.stdout.write(
+            f"  gen {gen:3d} | r{restart} | obj={best_val:.5f} | "
+            f"t_max={t_mx:.0f} t_min={t_mn:.0f} | "
+            f"t_q=[{tq}] p_q=[{pq}] | w_mean={wm:.1f} H2={h2:.2f} | evals={n_evals}\n"
+        )
+        sys.stdout.flush()
+
+    print("  开始优化...\n")
+    t0 = time.time()
+    opt_result = opt.run(
+        method="cma", maxiter=30, seed=42, early_stop=5, sigma0=0.3,
+        restarts=3, callback=_on_gen,
+    )
+    elapsed = time.time() - t0
+
+    raw = opt_result.system_result
+
+    # 计时
+    hots_tmp, colds_tmp = [], []
+    for rec in raw.heat_source_records:
+        hots_tmp.append(rec)
+    for rec in raw.cold_source_records:
+        colds_tmp.append(rec)
+    for report in raw.cycle_reports:
+        for _, rec in report.by_edge:
+            if rec.kind == "heat" and rec.power_rate is not None:
+                if rec.category == ProcessCategory.HEAT_REJECTION:
+                    hots_tmp.append(rec)
+                else:
+                    colds_tmp.append(rec)
+
+    _t0 = time.time()
+    for _ in range(10):
+        match_heat_exchanger_groups(hots_tmp, colds_tmp, dT_min=hx_dT, max_group_size=3)
+    t_hx_ms = (time.time() - _t0) / 10 * 1000
+    print(f"\n  计时: {len(hots_tmp)+len(colds_tmp)}条, 10次HX={t_hx_ms*10:.0f}ms → 单次{t_hx_ms:.2f}ms")
+    print(f"  优化总耗时: {elapsed:.1f}s, {opt_result.n_evaluations}次 → {elapsed/opt_result.n_evaluations*1000:.0f}ms/eval")
+
+    # 最优解
+    print("\n" + "=" * 55)
+    print("最优解")
+    print("=" * 55)
+    idx = 0
+    t_max_o = opt_result.x_opt[idx]; idx += 1
+    t_min_o = opt_result.x_opt[idx]; idx += 1
+    tq_o = [f"{opt_result.x_opt[idx+i]:.4f}" for i in range(opt._n_t_q)]
+    idx += opt._n_t_q
+    pq_o = [f"{opt_result.x_opt[idx+i]:.4f}" for i in range(opt._n_p_q)]
+    idx += opt._n_p_q
+    h2_o = opt_result.x_opt[idx + opt._mf_dim] if len(opt_result.x_opt) > idx + opt._mf_dim else 4.3
+    print(f"  t_max / t_min = {t_max_o:.1f} / {t_min_o:.1f} K")
+    print(f"  t_q = [{', '.join(tq_o)}]")
+    print(f"  p_q = [{', '.join(pq_o)}]")
+    print(f"  H2 = {h2_o:.2f} kg/s")
+    print(f"  obj = {opt_result.objective:.5f}")
+    ct = raw.cycle_reports[0].cycle_totals
+    print(f"  net_mech = {ct.net_mechanical_power:.1f} kW")
+    print(f"  n_evals = {opt_result.n_evaluations}")
+
+    # HX
+    hots, colds = [], []
+    for rec in raw.heat_source_records:
+        hots.append(rec)
+    for rec in raw.cold_source_records:
+        colds.append(rec)
+    for report in raw.cycle_reports:
+        for _, rec in report.by_edge:
+            if rec.kind == "heat" and rec.power_rate is not None:
+                if rec.category == ProcessCategory.HEAT_REJECTION:
+                    hots.append(rec)
+                else:
+                    colds.append(rec)
+    Q_h = sum(abs(float(r.power_rate)) for r in hots if r.power_rate)
+    Q_c = sum(abs(float(r.power_rate)) for r in colds if r.power_rate)
+    print(f"\n  放热={Q_h:.0f}kW  吸热={Q_c:.0f}kW  不平衡={abs(Q_h-Q_c):.0f}kW")
+    print(f"  hot({len(hots)}): {[r.edge_key for r in hots]}")
+    print(f"  cold({len(colds)}): {[r.edge_key for r in colds]}")
+
+    hx_result = match_heat_exchanger_groups(hots, colds, dT_min=hx_dT, max_group_size=3)
+    print(f"\n  HX(dT_min={hx_dT}K): {hx_result.num_units}组")
+    print(f"  matched={hx_result.total_matched:.0f}kW  unmatched={hx_result.total_unmatched:.0f}kW  "
+          f"ratio={hx_result.total_unmatched/(Q_h+Q_c):.4f}")
+    N_ua = len(hx_result.unassigned_hots) + len(hx_result.unassigned_colds)
+    print(f"  原始匹配率 = {hx_result.total_unmatched/(Q_h+Q_c):.4f}  (N+1) = {hx_result.total_unmatched/(Q_h+Q_c)*(N_ua+1):.4f}")
+    for ui, unit in enumerate(hx_result.units):
+        h_l = ", ".join(r.edge_key for r in unit.hot_records)
+        c_l = ", ".join(r.edge_key for r in unit.cold_records)
+        print(f"    U{ui+1}: hot=[{h_l}] cold=[{c_l}] matched={unit.matched_heat:.0f}kW resid={unit.residual:.1f}kW pinch={unit.internal_pinch:.0f}K")
+    if hx_result.unassigned_hots:
+        print(f"    未分配热: {[r.edge_key for r in hx_result.unassigned_hots]}")
+    if hx_result.unassigned_colds:
+        print(f"    未分配冷: {[r.edge_key for r in hx_result.unassigned_colds]}")
+
+    # 收敛曲线
+    if best_val_log:
+        matplotlib = pytest.importorskip("matplotlib")
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(range(1, len(best_val_log)+1), best_val_log, "o-", ms=2, lw=1, color="tab:blue")
+        ax.set_xlabel("Generation"); ax.set_ylabel("hx_unmatched")
+        ax.set_title("CMA-ES 30×3, 2P+1T, 4×4 basis, H2 3-6, CoolProp")
+        ax.grid(True, alpha=0.25); ax.set_ylim(bottom=0)
+        path = run_dir / "convergence.png"
+        fig.tight_layout(); fig.savefig(path, dpi=150); plt.close(fig)
+        print(f"\n  收敛曲线: {path}")
+
+    assert opt_result.n_evaluations > 0
 
 
 if __name__ == "__main__":
-    test_optimize_heat_balance_hx()
+    test_cma_full_opt()

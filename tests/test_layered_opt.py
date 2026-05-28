@@ -1,10 +1,8 @@
-r"""分层优化测试：外层 LHS 采样分位空间 → 内层 CMA 优化子循环流量。
+r"""分层优化 (加速版): 外层 LHS → 内层 CMA 复用拓扑 (maxiter=10, restarts=1), 外层多进程并行。
 
-   外层: t_min, t_max, t_q[], p_q[] — LHS 200点
-   内层: mf[N] 直接变量（无基函数）, interp He 快跑
-   验证: top-5 用 CoolProp 重新评估
-
-   Usage:  python tests/test_layered_opt.py
+   A. 内层: 固定拓扑后只更新流量+非理想+性能+HX, ~50μs/eval
+   B. 外层: ProcessPoolExecutor 并行 6 进程
+   C. 减代数: maxiter=10, restarts=1
 """
 
 from __future__ import annotations
@@ -27,10 +25,24 @@ from core import (
     PropertyRegistry,
     SystemInput,
 )
-from core.heat_exchanger import match_heat_exchanger_groups, HXMatchResult
-from optimize import Optimizer
+from core.heat_exchanger import (
+    _RecInfo,
+    _normalize_records,
+    HXMatchResult,
+    HXUnit,
+    match_heat_exchanger_groups,
+)
 
 TESTS_DIR = Path(__file__).resolve().parent
+
+_DEFAULT_HP = {
+    "sigma0": 15.0, "early_stop": 5,
+    "p_min": 2000.0, "hx_max_group_size": 3,
+    "flow_step": 0.05, "h2_step": 0.01,
+    "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
+    "mf_lo": 0.0, "mf_hi": 50.0,
+    "n_workers": 6,
+}
 
 # ──────────────────────────────────────────────────────────────────
 # 系统输入
@@ -42,14 +54,10 @@ def _make_system_input(
     p_quantiles: tuple[float, ...] = (0.33, 0.67),
     h2_mass_flow: float = 4.3,
 ) -> SystemInput:
-    hot = ExternalSourceInput(
-        fluid="Air", mass_flow=100.0,
-        T_in=1250.0, P_in=200.0, T_out=500.0, P_out=180.0,
-    )
-    cold = ExternalSourceInput(
-        fluid="Hydrogen", mass_flow=h2_mass_flow,
-        T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0,
-    )
+    hot = ExternalSourceInput(fluid="Air", mass_flow=100.0,
+                              T_in=1250.0, P_in=200.0, T_out=500.0, P_out=180.0)
+    cold = ExternalSourceInput(fluid="Hydrogen", mass_flow=h2_mass_flow,
+                               T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0)
     cycle_input = ClosedCycleTPInput(
         fluid="He", t_min=40.0, t_max=1000.0, p_min=2000.0, p_max=10000.0,
         t_quantiles=t_quantiles, p_quantiles=p_quantiles,
@@ -57,10 +65,8 @@ def _make_system_input(
     )
     return SystemInput(
         heat_sources=(hot,), cold_sources=(cold,),
-        cycles=(CycleConfig(
-            input=cycle_input, use_non_ideal=True,
-            delta_T_min=20.0, heat_method=None,
-        ),),
+        cycles=(CycleConfig(input=cycle_input, use_non_ideal=True,
+                            delta_T_min=20.0, heat_method=None),),
         delta_T_min=20.0, heat_method="system_pinch",
     )
 
@@ -71,18 +77,11 @@ def _make_system_input(
 
 
 def _lhs(n: int, bounds: list[tuple[float, float]], seed: int = 42) -> list[list[float]]:
-    """Latin Hypercube Sampling.
-
-    :param n: 样本数
-    :param bounds: 各维 (lo, hi) 边界
-    :returns: n 个采样点
-    """
     d = len(bounds)
     rng = random.Random(seed)
     samples: list[list[float]] = [[0.0] * d for _ in range(n)]
     for dim in range(d):
         lo, hi = bounds[dim]
-        # 分成 n 个等距桶，每桶内随机采一点
         bucket_order = list(range(n))
         rng.shuffle(bucket_order)
         for i in range(n):
@@ -94,7 +93,7 @@ def _lhs(n: int, bounds: list[tuple[float, float]], seed: int = 42) -> list[list
 
 
 # ──────────────────────────────────────────────────────────────────
-# 分层优化器
+# 数据结构
 # ──────────────────────────────────────────────────────────────────
 
 
@@ -114,111 +113,96 @@ class LayerResult:
     runtime: float
 
 
-def _eval_inner_direct(
-    tp_input: ClosedCycleTPInput,
-    mf_flows: list[float],
-    sys_inp_template: SystemInput,
-    props: PropertyRegistry,
-    hx_dT: float,
-    he_solver=None,
-) -> float:
-    """固定拓扑下，用给定子循环流量评估 hx_unmatched 目标。"""
-    from optimize.objective import _HX_DT_MIN, _HX_MAX_GROUP_SIZE
-    _HX_DT_MIN = hx_dT
-    _HX_MAX_GROUP_SIZE = 3
+# ──────────────────────────────────────────────────────────────────
+# A. 快速内层 eval: 复用已构建 layer, 只更新流量
+# ──────────────────────────────────────────────────────────────────
 
-    tp = tp_input
+
+def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, sys_inp_template: SystemInput,
+               hp: dict) -> float:
+    """固定拓扑下：更新流量 → 非理想 → 性能 → HX。不重建 ClosedCycleLayer。"""
+    from core.system import SystemPipeline
+    from core import InterpolatingHeliumSolver
+
+    props = PropertyRegistry()
     try:
-        layer = ClosedCycleLayer(tp, properties=he_solver)
-    except Exception:
-        return 1e9
-    n_sc = len(layer.subcycles)
-    if n_sc == 0:
-        return 1e9
-    trunc = mf_flows[:n_sc]
-    h2_mf = mf_flows[n_sc] if len(mf_flows) > n_sc else 4.3
-
-    # 用可变 H2 流量重建冷源
-    cold_src = ExternalSourceInput(
-        fluid="Hydrogen", mass_flow=h2_mf,
-        T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0,
-    )
-
-    cfg = CycleConfig(
-        input=tp,
-        use_non_ideal=True,
-        subcycle_mass_flows=trunc,
-        delta_T_min=20.0,
-        heat_method=None,
-    )
-    si = SystemInput(
-        heat_sources=sys_inp_template.heat_sources,
-        cold_sources=(cold_src,),
-        cycles=(cfg,),
-        delta_T_min=20.0,
-        heat_method="system_pinch",
-    )
-    try:
-        from core.system import SystemPipeline
-        raw = SystemPipeline(si).run(props, cycle_properties=he_solver)
+        ni = layer.ensure_non_ideal()
+        ni.apply_offsets()
     except Exception:
         return 1e9
 
-    # hx_unmatched with N+1 penalty
-    all_hots = list(raw.heat_source_records)
-    all_colds = list(raw.cold_source_records)
-    for report in raw.cycle_reports:
-        for _, rec in report.by_edge:
-            if rec.kind == "heat" and rec.power_rate is not None:
-                if rec.category == ProcessCategory.HEAT_REJECTION:
-                    all_hots.append(rec)
-                else:
-                    all_colds.append(rec)
-    total_q = sum(abs(float(r.power_rate)) for r in all_hots + all_colds if r.power_rate)
+    cold_src = ExternalSourceInput(fluid="Hydrogen", mass_flow=h2_mf,
+                                   T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0)
+
+    report = layer.performance_report()
+    hots: list = []
+    colds: list = []
+    for _, rec in report.by_edge:
+        if rec.kind == "heat" and rec.power_rate is not None:
+            if rec.category == ProcessCategory.HEAT_REJECTION:
+                hots.append(rec)
+            else:
+                colds.append(rec)
+
+    from core.system import convert_sources
+    src_hots, _ = convert_sources(sys_inp_template.heat_sources, (), props)
+    _, src_colds = convert_sources((), (cold_src,), props)
+    hots[:0] = src_hots
+    colds[:0] = src_colds
+
+    total_q = sum(abs(float(r.power_rate)) for r in hots + colds if r.power_rate)
     if total_q < 1e-12:
         return 1.0
-    hx = match_heat_exchanger_groups(all_hots, all_colds, dT_min=hx_dT, max_group_size=3)
+    hx = match_heat_exchanger_groups(hots, colds, dT_min=hp["hx_dT"],
+                                     max_group_size=hp["hx_max_group_size"])
     return hx.total_unmatched / total_q
 
 
-def _inner_cma(
-    tp_input: ClosedCycleTPInput,
-    sys_inp: SystemInput,
-    props: PropertyRegistry,
-    hx_dT: float,
-    *,
-    maxiter: int = 20,
-    restarts: int = 2,
-    early_stop: int = 5,
-    sigma0: float = 15.0,
-    seed: int = 42,
-) -> LayerResult:
-    """内层 CMA：固定拓扑，优化子循环流量。"""
-    import cma
+# ──────────────────────────────────────────────────────────────────
+# B. 内层 CMA: 复用拓扑
+# ──────────────────────────────────────────────────────────────────
 
-    from optimize.solver import _round_and_dedup
+
+def _inner_cma_fast(
+    tp_in: ClosedCycleTPInput,
+    sys_inp: SystemInput,
+    hp: dict,
+    *,
+    seed: int = 42,
+    layer: ClosedCycleLayer | None = None,
+) -> tuple[LayerResult, ClosedCycleLayer]:
+    """内层 CMA 优化子循环流量 + H2 流量；可选复用预建 layer。"""
+    import cma
     from core import InterpolatingHeliumSolver
 
     t0 = time.perf_counter()
     he_solver = InterpolatingHeliumSolver(
-        T_min=tp_input.t_min, T_max=tp_input.t_max,
-        P_min=tp_input.p_min, P_max=tp_input.p_max,
+        T_min=tp_in.t_min, T_max=tp_in.t_max,
+        P_min=tp_in.p_min, P_max=tp_in.p_max,
     )
     he_solver._build()
-    probe = ClosedCycleLayer(tp_input, properties=he_solver)
-    n_sc = len(probe.subcycles)
-    dim = n_sc + 1  # 子循环流量 + H2 流量
 
-    lo = [0.0] * n_sc + [3.0]   # 子循环 mf∈[0,50], H2 mf∈[3,6]
-    hi = [50.0] * n_sc + [6.0]
-    stds = [sigma0 * (hi[i] - lo[i]) for i in range(dim)]
+    if layer is not None:
+        base_layer = layer
+    else:
+        base_layer = ClosedCycleLayer(tp_in, properties=he_solver)
+    if len(base_layer.subcycles) == 0:
+        # InterpHe 近似 S 值可能导致拓扑断裂，回退 CoolProp
+        base_layer = ClosedCycleLayer(tp_in)
+    n_sc = len(base_layer.subcycles)
+    dim = n_sc + 1
+
+    mf_lo = hp["mf_lo"]; mf_hi = hp["mf_hi"]
+    lo = [mf_lo] * n_sc + [hp["h2_mf_lo"]]
+    hi = [mf_hi] * n_sc + [hp["h2_mf_hi"]]
+    stds = [hp["sigma0"] * (hi[i] - lo[i]) for i in range(dim)]
     x0_init = [(lo[i] + hi[i]) / 2 for i in range(dim)]
 
     global_best_val = float("inf")
     global_best_x = x0_init[:]
     total_evals = 0
 
-    for restart in range(restarts):
+    for restart in range(hp["restarts_inner"]):
         if restart % 2 == 0:
             p = max(4, int(4 + 3 * math.log2(max(dim, 2))))
         else:
@@ -231,8 +215,9 @@ def _inner_cma(
             "verbose": -9,
             "seed": seed + restart if seed is not None else None,
         }
-        x0 = x0_init if restart == 0 else [random.Random(seed + restart).uniform(lo[j], hi[j]) for j in range(dim)]
-        es = cma.CMAEvolutionStrategy(x0, sigma0, opts)
+        x0 = x0_init if restart == 0 else [
+            random.Random(seed + restart).uniform(lo[j], hi[j]) for j in range(dim)]
+        es = cma.CMAEvolutionStrategy(x0, hp["sigma0"], opts)
         stall = 0
         gen = 0
 
@@ -240,7 +225,15 @@ def _inner_cma(
             solutions = es.ask()
             scores = []
             for sol in solutions:
-                scores.append(_eval_inner_direct(tp_input, list(sol), sys_inp, props, hx_dT, he_solver))
+                flows = list(sol[:n_sc])
+                h2_mf = sol[n_sc]
+                try:
+                    base_layer.subcycle_mass_flows = flows
+                    base_layer.commit_subcycle_mass_flows_to_topology()
+                except Exception:
+                    scores.append(1e9)
+                    continue
+                scores.append(_eval_fast(base_layer, h2_mf, sys_inp, hp))
             es.tell(solutions, scores)
             total_evals += len(solutions)
             gen += 1
@@ -254,306 +247,700 @@ def _inner_cma(
                     stall = 0
             if not improved:
                 stall += 1
-            if gen >= maxiter or stall >= early_stop * len(solutions):
+            if gen >= hp["maxiter_inner"] or stall >= hp["early_stop"] * len(solutions):
                 break
 
-        if callback_progress:
-            rt = time.perf_counter() - t0
-            sys.stdout.write(
-                f"    r{restart}: gen={gen} obj={global_best_val:.4f} "
-                f"evals={total_evals} n_sc={n_sc} dim={dim} "
-                f"best_flow_sum={sum(global_best_x[:-1]):.0f} H2={global_best_x[-1]:.1f}\n"
-            )
-            sys.stdout.flush()
+        sys.stdout.write(
+            f"    r{restart}: gen={gen} obj={global_best_val:.5f} "
+            f"evals={total_evals} dim={dim} n_sc={n_sc} "
+            f"best_flow_sum={sum(global_best_x[:-1]):.0f} H2={global_best_x[-1]:.1f}\n"
+        )
+        sys.stdout.flush()
 
     flows = global_best_x[:n_sc]
-    flows = [round(f / 0.5) * 0.5 for f in flows]
-    h2_mf = round(global_best_x[-1] * 10) / 10  # 0.1 精度
-    full_x = flows + [h2_mf]
-    obj_final = _eval_inner_direct(tp_input, full_x, sys_inp, props, hx_dT, he_solver)
+    flow_step = hp["flow_step"]
+    flows = [round(f / flow_step) * flow_step for f in flows]
+    h2_mf = round(global_best_x[-1] / hp["h2_step"]) * hp["h2_step"]
+
+    try:
+        base_layer.subcycle_mass_flows = flows
+        base_layer.commit_subcycle_mass_flows_to_topology()
+    except Exception:
+        pass
+    obj_final = _eval_fast(base_layer, h2_mf, sys_inp, hp)
     runtime = time.perf_counter() - t0
 
     return LayerResult(
-        n=n_sc,
-        t_min=tp_input.t_min, t_max=tp_input.t_max, p_max=tp_input.p_max,
-        t_q=tp_input.t_quantiles, p_q=tp_input.p_quantiles,
+        n=n_sc, t_min=tp_in.t_min, t_max=tp_in.t_max, p_max=tp_in.p_max,
+        t_q=tp_in.t_quantiles, p_q=tp_in.p_quantiles,
         flows=flows, h2_mf=h2_mf, obj=obj_final,
         n_subcycles=n_sc, n_evals=total_evals, runtime=runtime,
+    ), base_layer
+
+
+# ──────────────────────────────────────────────────────────────────
+# C. 外层样本评估 (供 ProcessPoolExecutor 并行调用)
+# ──────────────────────────────────────────────────────────────────
+
+
+def _sample_worker(args: tuple) -> LayerResult:
+    """模块级 worker: 评估一个外层 LHS 样本。"""
+    (t_min, t_max, t_q_vals, p_q_vals, p_max, sys_inp, hp, seed) = args
+
+    tp_in = ClosedCycleTPInput(
+        fluid="He", t_min=t_min, t_max=t_max,
+        p_min=hp["p_min"], p_max=p_max,
+        t_quantiles=t_q_vals, p_quantiles=p_q_vals,
     )
 
-
-# ──────────────────────────────────────────────────────────────────
-# 图表
-# ──────────────────────────────────────────────────────────────────
-
-
-def _draw_layered_charts(
-    result: LayerResult,
-    sys_inp: SystemInput,
-    props: PropertyRegistry,
-    run_dir: Path,
-    hx_dT: float,
-) -> None:
-    """输出 2 张图：HX 匹配 + 收敛散点。"""
-    from optimize.solver import _round_and_dedup
-    from core.system import SystemPipeline, convert_sources
     from core import InterpolatingHeliumSolver
+    try:
+        _he = InterpolatingHeliumSolver(
+            T_min=t_min, T_max=t_max, P_min=hp["p_min"], P_max=p_max)
+        _he._build()
+        probe = ClosedCycleLayer(tp_in, properties=_he)
+        if len(probe.subcycles) == 0:
+            probe = ClosedCycleLayer(tp_in)
+    except Exception:
+        probe = ClosedCycleLayer(tp_in)
+    if len(probe.subcycles) == 0:
+        return LayerResult(n=0, t_min=t_min, t_max=t_max, p_max=p_max,
+                           t_q=t_q_vals, p_q=p_q_vals, flows=[], h2_mf=0,
+                           obj=1e9, n_subcycles=0, n_evals=0, runtime=0)
 
-    matplotlib = pytest.importorskip("matplotlib")
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
+    result, _ = _inner_cma_fast(tp_in, sys_inp, hp, seed=seed)
+    return result
 
-    tq_dedup = _round_and_dedup(result.t_q, 0.01, 0.0)
-    pq_dedup = _round_and_dedup(result.p_q, 0.01, 0.0)
-    tp = ClosedCycleTPInput(
-        fluid="He", t_min=result.t_min, t_max=result.t_max,
-        p_min=2000.0, p_max=result.p_max,
-        t_quantiles=tq_dedup, p_quantiles=pq_dedup,
+
+# ──────────────────────────────────────────────────────────────────
+# D. 外层 DE 并行 worker
+# ──────────────────────────────────────────────────────────────────
+
+
+def _de_trial_worker(args: tuple) -> tuple[float, LayerResult]:
+    """模块级 worker: 外层参数 → 内层 CMA → (obj, LayerResult)。"""
+    (x_outer, sys_inp, hp, seed) = args
+
+    t_min = round(x_outer[0])
+    t_max = round(x_outer[1])
+    idx = 2
+    tq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
+               for j in range(hp["n_t_q"]))
+    idx += hp["n_t_q"]
+    pq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
+               for j in range(hp["n_p_q"]))
+    idx += hp["n_p_q"]
+    p_max = round(x_outer[idx])
+
+    tp_in = ClosedCycleTPInput(
+        fluid="He", t_min=t_min, t_max=t_max,
+        p_min=hp["p_min"], p_max=p_max,
+        t_quantiles=tq, p_quantiles=pq,
     )
+    from core import InterpolatingHeliumSolver
+    try:
+        _he = InterpolatingHeliumSolver(
+            T_min=t_min, T_max=t_max, P_min=hp["p_min"], P_max=p_max)
+        _he._build()
+        probe = ClosedCycleLayer(tp_in, properties=_he)
+        if len(probe.subcycles) == 0:
+            probe = ClosedCycleLayer(tp_in)
+    except Exception:
+        probe = ClosedCycleLayer(tp_in)
+    if len(probe.subcycles) == 0:
+        return 1e9, LayerResult(n=0, t_min=t_min, t_max=t_max, p_max=p_max,
+                                t_q=tq, p_q=pq, flows=[], h2_mf=0,
+                                obj=1e9, n_subcycles=0, n_evals=0, runtime=0)
+
+    result, _ = _inner_cma_fast(tp_in, sys_inp, hp, seed=seed)
+    return result.obj, result
+
+
+# ──────────────────────────────────────────────────────────────────
+# E. 最优解重建 + CoolProp 验证
+# ──────────────────────────────────────────────────────────────────
+
+
+def _rebuild_result(x_outer: list[float], sys_inp: SystemInput,
+                    hp: dict, best_inner: LayerResult,
+                    *, use_coolprop: bool = False) -> tuple:
+    """用最优参数重建层、获取 report + HX；可选 CoolProp 模式。"""
+    props = PropertyRegistry()
+    t_min = round(x_outer[0])
+    t_max = round(x_outer[1])
+    idx = 2
+    tq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
+               for j in range(hp["n_t_q"]))
+    idx += hp["n_t_q"]
+    pq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
+               for j in range(hp["n_p_q"]))
+    idx += hp["n_p_q"]
+    p_max = round(x_outer[idx])
+
+    tp_in = ClosedCycleTPInput(
+        fluid="He", t_min=t_min, t_max=t_max,
+        p_min=hp["p_min"], p_max=p_max,
+        t_quantiles=tq, p_quantiles=pq,
+    )
+    from core import InterpolatingHeliumSolver
     he_solver = InterpolatingHeliumSolver(
-        T_min=result.t_min, T_max=result.t_max,
-        P_min=2000.0, P_max=result.p_max,
-    )
+        T_min=t_min, T_max=t_max, P_min=hp["p_min"], P_max=p_max)
     he_solver._build()
-    layer = ClosedCycleLayer(tp, properties=he_solver)
-    n_sc = len(layer.subcycles)
-    # pad or truncate flows to match actual subcycle count
-    if len(result.flows) > n_sc:
-        flows = result.flows[:n_sc]
-    else:
-        flows = list(result.flows) + [0.0] * (n_sc - len(result.flows))
-    layer.subcycle_mass_flows = flows
-    layer.commit_subcycle_mass_flows_to_topology()
+    layer = ClosedCycleLayer(tp_in, properties=he_solver)
+    if len(layer.subcycles) == 0:
+        layer = ClosedCycleLayer(tp_in)
+
+    result, layer = _inner_cma_fast(tp_in, sys_inp, hp, seed=0, layer=layer)
+
+    if use_coolprop:
+        layer_cp = ClosedCycleLayer(tp_in)
+        try:
+            if len(layer_cp.subcycles) == len(result.flows):
+                layer_cp.subcycle_mass_flows = list(result.flows)
+                layer_cp.commit_subcycle_mass_flows_to_topology()
+        except Exception:
+            pass
+        ideal_rep_cp = layer_cp.performance_report()
+        ni_cp = layer_cp.ensure_non_ideal()
+        ni_cp.apply_offsets()
+        ni_rep_cp = layer_cp.performance_report()
+        return result, None, ideal_rep_cp, ni_rep_cp, layer_cp, [], []
+
+    ideal_report = layer.performance_report()
     ni = layer.ensure_non_ideal()
     ni.apply_offsets()
-
-    # 直接从已构建 layer 收集换热记录（跳过 SystemPipeline 避免 CoolProp 重建）
-    report = layer.performance_report()
+    ni_report = layer.performance_report()
     hots: list = []
     colds: list = []
-    for _, rec in report.by_edge:
+    for _, rec in ni_report.by_edge:
         if rec.kind == "heat" and rec.power_rate is not None:
             if rec.category == ProcessCategory.HEAT_REJECTION:
                 hots.append(rec)
             else:
                 colds.append(rec)
-    # 冷热源转换 — 使用优化后的 H2 流量
     from core.system import convert_sources
+    cold_src = ExternalSourceInput(fluid="Hydrogen", mass_flow=result.h2_mf,
+                                   T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0)
     src_hots, _ = convert_sources(sys_inp.heat_sources, (), props)
-    # 用优化的 H2 流量重建冷源
-    opt_cold = ExternalSourceInput(
-        fluid="Hydrogen", mass_flow=result.h2_mf,
-        T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0,
-    )
-    _, src_colds = convert_sources((), (opt_cold,), props)
+    _, src_colds = convert_sources((), (cold_src,), props)
     hots[:0] = src_hots
     colds[:0] = src_colds
-    hx = match_heat_exchanger_groups(hots, colds, dT_min=hx_dT, max_group_size=3)
+    hx = match_heat_exchanger_groups(hots, colds, dT_min=hp["hx_dT"],
+                                     max_group_size=hp["hx_max_group_size"])
+    return result, hx, ideal_report, ni_report, layer, hots, colds
 
-    # ── 图 1: 理想骨架 ──
-    fig1, (ax_ts, ax_ps) = plt.subplots(1, 2, figsize=(14, 6))
-    fig1.suptitle(f"Layered Opt — Ideal Topology ({result.n_subcycles} subcycles)", fontsize=12, fontweight="bold")
-    colors = plt.cm.tab10.colors
-    for n in layer.nodes.values():
-        ax_ts.scatter(n.S, n.T, s=10, color="0.4", zorder=1)
-        ax_ps.scatter(n.S, n.P, s=10, color="0.4", zorder=1)
+
+# ──────────────────────────────────────────────────────────────────
+# 绘图函数
+# ──────────────────────────────────────────────────────────────────
+
+
+def _draw_cycle_ts_ps(report, layer, label: str, out_path: Path,
+                       ni_nodes: dict | None = None) -> None:
+    """绘制单个循环 TS/PS 图（带子循环多边形覆盖 + 流量标注）。
+    
+    非理想图传入 ``ni_nodes`` 以正确对齐子循环多边形位置。
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    overlay_nodes = ni_nodes if ni_nodes is not None else layer.nodes
+
+    fig, (ax_ts, ax_ps) = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle(f"Cycle T\u2013S & P\u2013S [{label}]", fontsize=11)
+
+    for _, snap in report.nodes:
+        ax_ts.scatter(snap.S, snap.T, s=10, color="0.3", zorder=2)
+        ax_ps.scatter(snap.S, snap.P, s=10, color="0.3", zorder=2)
+
+    for _, rec in report.by_edge:
+        c = "tab:orange" if rec.kind == "mechanical" else "tab:green"
+        ax_ts.plot(
+            [rec.tail_state.S, rec.head_state.S],
+            [rec.tail_state.T, rec.head_state.T],
+            color=c, linewidth=1.0, alpha=0.7,
+        )
+        ax_ps.plot(
+            [rec.tail_state.S, rec.head_state.S],
+            [rec.tail_state.P, rec.head_state.P],
+            color=c, linewidth=1.0, alpha=0.7,
+        )
+        ts_fr, ts_to = 0.38, 0.62
+        for ax, y1, y2 in [
+            (ax_ts, rec.tail_state.T, rec.head_state.T),
+            (ax_ps, rec.tail_state.P, rec.head_state.P),
+        ]:
+            ax.annotate(
+                "", xytext=(
+                    rec.tail_state.S + ts_fr * (rec.head_state.S - rec.tail_state.S),
+                    y1 + ts_fr * (y2 - y1),
+                ), xy=(
+                    rec.tail_state.S + ts_to * (rec.head_state.S - rec.tail_state.S),
+                    y1 + ts_to * (y2 - y1),
+                ), arrowprops=dict(arrowstyle="->", color="0.3", lw=1.2, alpha=0.7))
+        mx_s = (rec.tail_state.S + rec.head_state.S) / 2
+        ax_ts.annotate(rec.edge_key, (
+            mx_s, (rec.tail_state.T + rec.head_state.T) / 2),
+            textcoords="offset points", xytext=(3, 3), fontsize=5, color="0.4")
+
+    colors_sc = plt.cm.tab10.colors
     for i, sc in enumerate(layer.subcycles):
-        c = colors[i % len(colors)]
+        c = colors_sc[i % len(colors_sc)]
         q = sc.mass_flow if sc.mass_flow is not None else 0.0
-        n0, n1, n2, n3 = [layer.nodes[idx] for idx in sc.nodes]
-        for ax, y_fn in [(ax_ts, lambda n: n.T), (ax_ps, lambda n: n.P)]:
+        n0, n1, n2, n3 = [overlay_nodes[idx] for idx in sc.nodes]
+        for ax, y_get in [(ax_ts, lambda n: n.T), (ax_ps, lambda n: n.P)]:
             xs = [n0.S, n1.S, n2.S, n3.S, n0.S]
-            ys = [y_fn(n0), y_fn(n1), y_fn(n2), y_fn(n3), y_fn(n0)]
-            ax.plot(xs, ys, "-", color=c, lw=1.2, alpha=0.5)
+            ys = [y_get(n0), y_get(n1), y_get(n2), y_get(n3), y_get(n0)]
+            ax.plot(xs, ys, "-", color=c, linewidth=1.2, alpha=0.5)
             cx = (n0.S + n2.S) / 2
-            cy = (y_fn(n0) + y_fn(n2)) / 2
+            cy = (y_get(n0) + y_get(n2)) / 2
             ax.annotate(f"SC{i}\n{q:.1f}", (cx, cy), ha="center", va="center",
                         fontsize=6, color=c, fontweight="bold")
-    ax_ts.set_xlabel("S [kJ/(kg·K)]"); ax_ts.set_ylabel("T [K]")
-    ax_ts.grid(True, alpha=0.25); ax_ts.set_title("T–S", fontsize=10)
-    ax_ps.set_xlabel("S [kJ/(kg·K)]"); ax_ps.set_ylabel("P [kPa]")
-    ax_ps.grid(True, alpha=0.25); ax_ps.set_title("P–S", fontsize=10)
-    fig1.tight_layout(rect=[0, 0, 1, 0.95])
-    fig1.savefig(run_dir / "01_ideal_grid.png", dpi=150)
-    plt.close(fig1)
 
-    # ── 图 2: HX 匹配 ──
-    n_units = max(len(hx.units), 1)
+    ax_ts.set_xlabel("S [kJ/(kg·K)]"); ax_ts.set_ylabel("T [K]")
+    ax_ts.set_title(f"{label} T\u2013S"); ax_ts.grid(True, alpha=0.25)
+    ax_ps.set_xlabel("S [kJ/(kg·K)]"); ax_ps.set_ylabel("P [kPa]")
+    ax_ps.set_title(f"{label} P\u2013S"); ax_ps.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _draw_hx_tq(hots: list, colds: list, hx_result: HXMatchResult,
+                out_path: Path) -> None:
+    """绘制 HX 匹配 T-Q 图：概览 + 每单元详情。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    all_recs, _, _ = _normalize_records(list(hots), list(colds))
+    if not all_recs:
+        return
+    sorted_recs = sorted(all_recs, key=lambda r: (r.T_high, 0 if r.is_hot else 1),
+                         reverse=True)
+
+    unit_rec_keys: list[set[str]] = []
+    for u in hx_result.units:
+        keys: set[str] = set()
+        for r in u.hot_records:
+            keys.add(r.edge_key)
+        for r in u.cold_records:
+            keys.add(r.edge_key)
+        unit_rec_keys.append(keys)
+    ua_keys: set[str] = set()
+    for r in hx_result.unassigned_hots:
+        ua_keys.add(r.edge_key)
+    for r in hx_result.unassigned_colds:
+        ua_keys.add(r.edge_key)
+
+    unit_colors = ["#FFD0D0", "#D0D0FF", "#D0FFD0", "#FFFFD0",
+                   "#FFD0FF", "#D0FFFF", "#FFE8D0", "#E8D0FF"]
+
+    n_units = max(len(hx_result.units), 1)
     n_rows = (n_units + 2) // 3
-    fig2 = plt.figure(figsize=(max(14, 5 * min(n_units, 3)), 3.0 + 3.5 * n_rows))
-    fig2.suptitle(
-        f"Layered Best — matched={hx.total_matched:.0f}kW "
-        f"unmatched={hx.total_unmatched:.0f}kW {hx.num_units} units | "
-        f"obj={result.obj:.4f}",
+    fig = plt.figure(figsize=(max(14, 5 * min(n_units, 3)), 3.5 + 3.5 * n_rows))
+    fig.suptitle(
+        f"HX Optimal Matching | {len(hots) + len(colds)} records, "
+        f"{hx_result.num_units} units | "
+        f"matched={hx_result.total_matched / 1e3:.1f}kW, "
+        f"unmatched={hx_result.total_unmatched / 1e3:.1f}kW",
         fontsize=12, fontweight="bold")
-    gs = fig2.add_gridspec(n_rows + 1, 1, height_ratios=[1] + [2] * n_rows, hspace=0.45, top=0.92)
-    ax_ov = fig2.add_subplot(gs[0])
-    from core.heat_exchanger import _normalize_records
-    recs, _, _ = _normalize_records(hots, colds)
-    sorted_recs = sorted(recs, key=lambda r: (r.T_high, 0 if r.is_hot else 1), reverse=True)
+
+    gs = fig.add_gridspec(n_rows + 1, 1, height_ratios=[1] + [2] * n_rows,
+                          hspace=0.45, top=0.90)
+
+    # ── Row 0: 概览 ──
+    ax_ov = fig.add_subplot(gs[0])
     cum_q = 0.0
     for r in sorted_recs:
         color = "tab:red" if r.is_hot else "tab:blue"
-        ax_ov.plot([cum_q, cum_q + r.Q], [r.T_high, r.T_low], color=color, lw=2.2, marker="o", ms=4)
-        mid_q = cum_q + r.Q / 2
-        ax_ov.annotate(f"{r.record.edge_key}", (mid_q, (r.T_high + r.T_low) / 2),
-                       fontsize=5.5, ha="center", color=color)
+        ax_ov.plot([cum_q, cum_q + r.Q], [r.T_high, r.T_low],
+                   color=color, linewidth=2.2, marker="o", markersize=4)
+        label = r.record.edge_key
+        in_unit = -1
+        for ui, keys in enumerate(unit_rec_keys):
+            if label in keys:
+                in_unit = ui
+                break
+        if in_unit >= 0:
+            ax_ov.annotate(f"{label}\n{r.Q / 1e3:.1f}kW",
+                           (cum_q + r.Q / 2, (r.T_high + r.T_low) / 2),
+                           fontsize=6, ha="center", color=color,
+                           bbox=dict(boxstyle="round,pad=0.1",
+                                     facecolor=unit_colors[in_unit % len(unit_colors)],
+                                     alpha=0.85))
+        else:
+            ax_ov.annotate(f"{label}\n{r.Q / 1e3:.1f}kW",
+                           (cum_q + r.Q / 2, (r.T_high + r.T_low) / 2),
+                           fontsize=6, ha="center", color="gray",
+                           bbox=dict(boxstyle="round,pad=0.1",
+                                     facecolor="#EEEEEE", alpha=0.7))
         cum_q += r.Q
     ax_ov.set_xlabel("Cumulative Q [kW]"); ax_ov.set_ylabel("T [K]")
     ax_ov.grid(True, alpha=0.2)
-    ax_ov.legend(handles=[mpatches.Patch(color="tab:red", label="hot"),
-                          mpatches.Patch(color="tab:blue", label="cold")],
-                 fontsize=8, loc="upper left")
-    for ui, unit in enumerate(hx.units):
+    ax_ov.legend(handles=[
+        mpatches.Patch(color="tab:red", label="hot"),
+        mpatches.Patch(color="tab:blue", label="cold"),
+        mpatches.Patch(color="gray", label="unassigned"),
+    ], fontsize=8, loc="upper left", ncol=3)
+    ax_ov.set_title("Overview — all records (sorted by T_high)", fontsize=9, loc="left")
+
+    # ── 每单元详情 ──
+    for ui, unit in enumerate(hx_result.units):
         row = 1 + ui // 3
         col = ui % 3
-        n_sub = min(n_units - (ui // 3) * 3, 3)
-        sub_gs = gs[row].subgridspec(1, n_sub, wspace=0.35)
-        ax = fig2.add_subplot(sub_gs[0, col])
-        h_sorted = sorted(unit.hot_records, key=lambda rr: max(rr.tail_state.T, rr.head_state.T), reverse=True)
-        c_sorted = sorted(unit.cold_records, key=lambda rr: max(rr.tail_state.T, rr.head_state.T), reverse=True)
+        sub_gs = gs[row].subgridspec(1, min(n_units - (ui // 3) * 3, 3), wspace=0.35)
+        ax = fig.add_subplot(sub_gs[0, col])
+
+        h_sorted = sorted(unit.hot_records,
+                          key=lambda rr: max(rr.tail_state.T, rr.head_state.T), reverse=True)
+        c_sorted = sorted(unit.cold_records,
+                          key=lambda rr: max(rr.tail_state.T, rr.head_state.T), reverse=True)
+
         x = 0.0
         for hr in h_sorted:
-            Th = max(hr.tail_state.T, hr.head_state.T)
-            Tl = min(hr.tail_state.T, hr.head_state.T)
+            Th_h, Th_l = max(hr.tail_state.T, hr.head_state.T), min(hr.tail_state.T, hr.head_state.T)
             Qh = abs(hr.power_rate) if hr.power_rate else 0.0
-            ax.plot([x, x + Qh], [Th, Tl], "o-", color="tab:red", lw=2.2, ms=3)
+            ax.plot([x, x + Qh], [Th_h, Th_l], "o-", color="tab:red", lw=2.2, ms=3.5)
+            ax.annotate(f"{hr.edge_key}\n({Qh / 1e3:.1f}kW)",
+                        (x + Qh / 2, (Th_h + Th_l) / 2),
+                        fontsize=5, color="darkred", ha="center",
+                        xytext=(0, 8), textcoords="offset points")
             x += Qh
+        q_max = x
         x = 0.0
         for cr in c_sorted:
-            Tc_h = max(cr.tail_state.T, cr.head_state.T)
-            Tc_l = min(cr.tail_state.T, cr.head_state.T)
+            Tc_l, Tc_h = min(cr.tail_state.T, cr.head_state.T), max(cr.tail_state.T, cr.head_state.T)
             Qc = abs(cr.power_rate) if cr.power_rate else 0.0
-            ax.plot([x, x + Qc], [Tc_h, Tc_l], "s--", color="tab:blue", lw=1.8, ms=3)
+            ax.plot([x, x + Qc], [Tc_h, Tc_l], "s--", color="tab:blue", lw=1.8, ms=3.5)
+            ax.annotate(f"{cr.edge_key}\n({Qc / 1e3:.1f}kW)",
+                        (x + Qc / 2, (Tc_h + Tc_l) / 2),
+                        fontsize=5, color="darkblue", ha="center",
+                        xytext=(0, -12), textcoords="offset points")
             x += Qc
-        ax.set_title(f"U{ui + 1}  matched={unit.matched_heat:.0f}kW  resid={unit.residual:.1f}kW  pinch={unit.internal_pinch:.0f}K",
-                     fontsize=7.5, fontweight="bold")
+
+        ax.set_title(f"Unit {ui + 1}  matched={unit.matched_heat / 1e3:.1f}kW  "
+                     f"pinch={unit.internal_pinch:.0f}K", fontsize=8, fontweight="bold")
         ax.set_xlabel("Q [kW]"); ax.set_ylabel("T [K]")
         ax.grid(True, alpha=0.2)
-    fig2.tight_layout()
-    fig2.savefig(run_dir / "02_hx_match.png", dpi=150)
-    plt.close(fig2)
+        ax.set_xlim(0, max(max(q_max, x), 1))
 
-    print(f"  Charts: {run_dir / '01_ideal_grid.png'}, {run_dir / '02_hx_match.png'}")
+    fig.subplots_adjust(left=0.05, right=0.97, bottom=0.05)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _draw_perf_bars(report, label: str, out_path: Path) -> None:
+    """绘制循环性能柱状图（机械功率 + 类别汇总）。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, (ax_mech, ax_cat) = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle(f"Cycle performance [{label}]", fontsize=11)
+
+    mech_data = []
+    cat_sums = {pc: 0.0 for pc in (
+        ProcessCategory.COMPRESSION, ProcessCategory.EXPANSION,
+        ProcessCategory.HEAT_ABSORPTION, ProcessCategory.HEAT_REJECTION)}
+    for _, rec in report.by_edge:
+        if rec.power_rate is None:
+            continue
+        cat_sums[rec.category] += rec.power_rate
+        if rec.kind == "mechanical":
+            signed = abs(rec.power_rate) if rec.category == ProcessCategory.COMPRESSION else -abs(rec.power_rate)
+            mech_data.append((rec.edge_key, signed, abs(rec.power_rate)))
+    mech_data.sort(key=lambda x: x[2])
+    if mech_data:
+        labels, vals_m = zip(*[(r[0], r[1]) for r in mech_data])
+        colors = ["tab:blue" if v >= 0 else "tab:orange" for v in vals_m]
+        ax_mech.bar(range(len(labels)), vals_m, color=colors, alpha=0.9)
+        ax_mech.set_xticks(range(len(labels)))
+        ax_mech.set_xticklabels(labels, rotation=60, ha="right", fontsize=6)
+    ax_mech.axhline(0, color="0.2"); ax_mech.set_title("mechanical [kW]")
+    ax_mech.grid(True, axis="y", alpha=0.25)
+
+    cn = ["compression", "expansion", "absorption", "rejection"]
+    cv = [cat_sums[pc] for pc in (
+        ProcessCategory.COMPRESSION, ProcessCategory.EXPANSION,
+        ProcessCategory.HEAT_ABSORPTION, ProcessCategory.HEAT_REJECTION)]
+    ax_cat.bar(cn, cv, color=["tab:orange", "tab:blue", "tab:red", "tab:green"], alpha=0.9)
+    ax_cat.axhline(0, color="0.2"); ax_cat.set_title("category sums [kW]")
+    ax_cat.grid(True, axis="y", alpha=0.25)
+    ax_cat.text(3.5, max(abs(v) for v in cv) * 0.9,
+                f"sum mech={cv[0] + cv[1]:.0f}\nsum heat={cv[2] + cv[3]:.0f}",
+                fontsize=8, ha="center",
+                bbox=dict(boxstyle="round", alpha=0.2))
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 # ──────────────────────────────────────────────────────────────────
-# 回调
-# ──────────────────────────────────────────────────────────────────
-
-callback_progress: bool = True
-
-
-# ──────────────────────────────────────────────────────────────────
-# 主流程
+# 主测试: LHS 种子 + DE 外层
 # ──────────────────────────────────────────────────────────────────
 
 
 def test_layered_optimization() -> None:
-    """分层优化测试：LHS 外层 + CMA 内层。"""
-    # ── 配置 ──
-    hp = {"n_t_q": 0, "n_p_q": 2, "n_lhs": 400, "hx_dT": 10.0,
-          "maxiter_inner": 20, "restarts_inner": 2}
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 0, "n_p_q": 2, "n_lhs": 50, "hx_dT": 10.0,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 15, "de_maxiter": 20, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001}
+    _run_layered(hp, tag="2P0T")
+
+
+def test_layered_1t2p() -> None:
+    """外层加 1 个 T 分位 → 更多拓扑自由度。"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 1, "n_p_q": 2, "n_lhs": 80, "hx_dT": 10.0,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 20, "de_maxiter": 25, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001}
+    _run_layered(hp, tag="1T2P")
+
+
+def test_layered_2p0t_long() -> None:
+    """2P+0T 长跑: 更多 LHS 种子 + 更多 DE 代数。"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 0, "n_p_q": 2, "n_lhs": 100, "hx_dT": 10.0,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 20, "de_maxiter": 40, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001}
+    _run_layered(hp, tag="2P0T_long")
+
+
+def test_layered_0p0t() -> None:
+    """0P+0T 基线: 无分位，仅调 t_min/t_max/p_max。"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 0, "n_p_q": 0, "n_lhs": 30, "hx_dT": 10.0,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 10, "de_maxiter": 15, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001}
+    _run_layered(hp, tag="0P0T")
+
+
+def _run_layered(hp: dict, tag: str = "") -> None:
+    hp = {**_DEFAULT_HP, **hp}
+    tq_tag = f"{hp['n_t_q']}T{hp['n_p_q']}P"
     print("=" * 60)
-    print("分层优化 (LHS + CMA inner)")
-    print(f"  T分位={hp['n_t_q']}, P分位={hp['n_p_q']}, LHS={hp['n_lhs']}点")
-    print(f"  inner CMA: maxiter={hp['maxiter_inner']}, restarts={hp['restarts_inner']}")
-    print(f"  H2 mf: 3-6 kg/s  |  p_max: 8000-15000 kPa")
+    print(f"分层优化 (LHS+DE并行) [{tag}] {tq_tag}")
+    print(f"  LHS={hp['n_lhs']}点 DE={hp['de_popsize']}x{hp['de_maxiter']} "
+          f"p_min={hp['p_min']} hx_dT={hp['hx_dT']} "
+          f"H2∈[{hp['h2_mf_lo']},{hp['h2_mf_hi']}] mf∈[{hp['mf_lo']},{hp['mf_hi']}]")
     print("=" * 60)
 
-    props = PropertyRegistry()
     base = _make_system_input()
-    hx_dT = hp["hx_dT"]
 
-    # ── 外层 LHS 采样 ──
-    outer_bounds: list[tuple[float, float]] = []
-    outer_bounds.append((40.0, 300.0))
-    outer_bounds.append((800.0, 1100.0))
+    outer_bounds = [(40.0, 500.0), (800.0, 1100.0)]
     for _ in range(hp["n_t_q"]):
         outer_bounds.append((0.01, 0.99))
     for _ in range(hp["n_p_q"]):
         outer_bounds.append((0.01, 0.99))
-    outer_bounds.append((8000.0, 15000.0))  # p_max
+    outer_bounds.append((8000.0, 15000.0))
+    dim = len(outer_bounds)
 
-    lhs_samples = _lhs(hp["n_lhs"], outer_bounds, seed=42)
+    import concurrent.futures, multiprocessing, random as _rnd_
+    ctx = multiprocessing.get_context("spawn")
+    n_workers = hp["n_workers"]
 
-    # ── 遍历外层 ──
-    global_best = LayerResult(n=0, t_min=0, t_max=0, p_max=0, t_q=(), p_q=(), flows=[], h2_mf=0,
-                              obj=float("inf"), n_subcycles=0, n_evals=0, runtime=0)
-    all_results: list[LayerResult] = []
+    t0_all = time.perf_counter()
+    best_inner: LayerResult | None = None
 
-    t0_total = time.perf_counter()
-    for i, row in enumerate(lhs_samples):
-        t_min = round(row[0])
-        t_max = round(row[1])
-        idx = 2
-        t_q_vals = tuple(round(row[idx + j], 4) for j in range(hp["n_t_q"]))
-        idx += hp["n_t_q"]
-        p_q_vals = tuple(round(row[idx + j], 4) for j in range(hp["n_p_q"]))
-        idx += hp["n_p_q"]
-        p_max = round(row[idx])
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
+        # ── 阶段1: LHS 并行采样 ──
+        print(f"\n  [阶段1] LHS {hp['n_lhs']} 点并行采样...")
+        lhs_samples = _lhs(hp["n_lhs"], outer_bounds, seed=42)
+        tasks = []
+        for i, row in enumerate(lhs_samples):
+            t_min = round(row[0]); t_max = round(row[1])
+            idx = 2
+            t_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
+                             for j in range(hp["n_t_q"]))
+            idx += hp["n_t_q"]
+            p_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
+                             for j in range(hp["n_p_q"]))
+            idx += hp["n_p_q"]
+            p_max = round(row[idx])
+            tasks.append((t_min, t_max, t_q_vals, p_q_vals, p_max,
+                          base, hp, 42 + i))
 
-        tp_in = ClosedCycleTPInput(
-            fluid="He", t_min=t_min, t_max=t_max,
-            p_min=2000.0, p_max=p_max,
-            t_quantiles=t_q_vals, p_quantiles=p_q_vals,
-        )
+        lhs_results: list[LayerResult] = []
+        futures = [ex.submit(_sample_worker, t) for t in tasks]
+        for fut in futures:
+            r = fut.result(timeout=600)
+            if r.obj < 1e8 and r.n_subcycles > 0:
+                lhs_results.append(r)
 
-        try:
-            from core import InterpolatingHeliumSolver
-            _he = InterpolatingHeliumSolver(T_min=t_min, T_max=t_max, P_min=2000.0, P_max=p_max)
-            _he._build()
-            probe = ClosedCycleLayer(tp_in, properties=_he)
-        except Exception:
-            continue
-        if len(probe.subcycles) == 0:
-            continue
+        lhs_objs = sorted(lhs_results, key=lambda r: r.obj)
+        if not lhs_objs:
+            print("  LHS: 0 有效 — 拓扑无子循环，终止")
+            assert False, "所有 LHS 样本均无有效拓扑"
+        print(f"  LHS: {len(lhs_results)} 有效, best={lhs_objs[0].obj:.5f}")
 
-        sys.stdout.write(f"\n[{i+1}/{hp['n_lhs']}] t_min={t_min} t_max={t_max} "
-                         f"t_q={[f'{v:.3f}' for v in t_q_vals]} p_q={[f'{v:.3f}' for v in p_q_vals]} "
-                         f"p_max={p_max:.0f} n_sc={len(probe.subcycles)} ")
-        sys.stdout.flush()
+        # ── 阶段2: DE 并行评估 ──
+        print(f"\n  [阶段2] DE 并行 (popsize={hp['de_popsize']}, maxiter={hp['de_maxiter']})...")
+        rng = _rnd_.Random(42)
+        lo = [b[0] for b in outer_bounds]
+        hi = [b[1] for b in outer_bounds]
 
-        res = _inner_cma(tp_in, base, props, hx_dT,
-                         maxiter=hp["maxiter_inner"],
-                         restarts=hp["restarts_inner"],
-                         seed=42 + i)
-        all_results.append(res)
+        pop: list[list[float]] = []
+        for r in lhs_objs[:hp['de_popsize']]:
+            x = [r.t_min, r.t_max]
+            for q in r.t_q:
+                x.append(q)
+            for q in r.p_q:
+                x.append(q)
+            x.append(r.p_max)
+            pop.append(x)
+        while len(pop) < hp['de_popsize']:
+            pop.append([rng.uniform(lo[d], hi[d]) for d in range(dim)])
 
-        if res.obj < global_best.obj:
-            global_best = res
-            sys.stdout.write(" ← NEW BEST\n")
-        else:
-            sys.stdout.write("\n")
-        sys.stdout.flush()
+        g0_args = [(p, base, hp, 0) for p in pop]
+        g0_futures = [ex.submit(_de_trial_worker, a) for a in g0_args]
+        g0_results = [f.result(timeout=600) for f in g0_futures]
+        scores = [r[0] for r in g0_results]
 
-    t_total = time.perf_counter() - t0_total
+        best_idx = min(range(len(scores)), key=lambda i: scores[i])
+        best_x = pop[best_idx][:]
+        best_val = scores[best_idx]
+        best_inner = g0_results[best_idx][1]
+        stall = 0
+        n_evals = len(scores)
+        conv_history: list[float] = [best_val]
+        print(f"  DE gen 0: best={best_val:.5f}")
+
+        for gen in range(hp["de_maxiter"]):
+            trials: list[tuple[int, list[float]]] = []
+            for i in range(hp["de_popsize"]):
+                pool = [j for j in range(hp["de_popsize"]) if j != i]
+                a, b, c = rng.sample(pool, 3)
+                v = [pop[a][d] + hp["de_F"] * (pop[b][d] - pop[c][d]) for d in range(dim)]
+                for d in range(dim):
+                    v[d] = max(lo[d], min(hi[d], v[d]))
+                jr = rng.randrange(dim)
+                u = [v[d] if rng.random() < hp["de_CR"] or d == jr else pop[i][d]
+                     for d in range(dim)]
+                trials.append((i, u))
+
+            trial_args = [(t, base, hp, 0) for _, t in trials]
+            t_futures = [ex.submit(_de_trial_worker, a) for a in trial_args]
+            trial_results = [f.result(timeout=600) for f in t_futures]
+            n_evals += len(trial_results)
+
+            improved = False
+            for (i, u), (us, u_result) in zip(trials, trial_results):
+                if us < scores[i]:
+                    pop[i] = u
+                    scores[i] = us
+                    if us < best_val:
+                        best_val = us
+                        best_x = u[:]
+                        best_inner = u_result
+                        improved = True
+                        stall = 0
+            if not improved:
+                stall += hp["de_popsize"]
+            conv_history.append(best_val)
+
+            sys.stdout.write(f"  DE gen {gen+1:2d}: best={best_val:.5f} "
+                             f"stall={stall}/{hp['de_popsize']*hp['de_maxiter']} "
+                             f"t_max={best_x[1]:.0f} t_min={best_x[0]:.0f} "
+                             f"pmax={best_x[-1]:.0f}\n")
+            sys.stdout.flush()
+
+            if stall >= hp["de_popsize"] * hp["de_maxiter"] * 2:
+                break
+
+    t_total = time.perf_counter() - t0_all
 
     # ── 汇总 ──
     print("\n" + "=" * 55)
-    print(f"分层优化完成: {len(all_results)}/{hp['n_lhs']} 有效解, {t_total:.1f}s")
-    best = global_best
-    print(f"  t_max={best.t_max:.0f}K  t_min={best.t_min:.0f}K  p_max={best.p_max:.0f}kPa")
-    print(f"  t_q={[f'{v:.3f}' for v in best.t_q]}  p_q={[f'{v:.3f}' for v in best.p_q]}")
-    print(f"  obj={best.obj:.4f}  n_sc={best.n_subcycles}  flows_sum={sum(best.flows):.0f} kg/s  H2={best.h2_mf:.1f} kg/s")
-    print(f"  内层总 eval: {sum(r.n_evals for r in all_results)}")
+    print(f"优化完成: LHS{len(lhs_results)} + DE{hp['de_popsize']}x{gen+1}gen "
+          f"= {n_evals} eval, {t_total:.1f}s")
+    idx = 2
+    tq_out = tuple(round(best_x[idx + j], 4) for j in range(hp["n_t_q"]))
+    idx += hp["n_t_q"]
+    pq_out = tuple(round(best_x[idx + j], 4) for j in range(hp["n_p_q"]))
+    print(f"  t_max={best_x[1]:.0f}K  t_min={best_x[0]:.0f}K  p_max={best_x[-1]:.0f}kPa")
+    print(f"  t_q={[f'{v:.3f}' for v in tq_out]}  p_q={[f'{v:.3f}' for v in pq_out]}")
+    print(f"  obj={best_val:.5f}  flows={[f'{v:.1f}' for v in best_inner.flows]} "
+          f"H2={best_inner.h2_mf:.2f}kg/s  n_sc={best_inner.n_subcycles}")
 
-    # top-5
-    sorted_res = sorted([r for r in all_results if r.obj < 1e8], key=lambda r: r.obj)[:5]
-    print(f"\n  Top-5:")
-    for rank, r in enumerate(sorted_res):
-        print(f"  #{rank+1} obj={r.obj:.4f} t_min={r.t_min:.0f} t_max={r.t_max:.0f} "
-              f"n_sc={r.n_subcycles} flows_sum={sum(r.flows):.0f} H2={r.h2_mf:.1f}")
+    # ── CoolProp 验证 ──
+    print("\n  [CoolProp 验证]")
+    try:
+        cp_result, _, cp_ir, cp_nr, cp_layer, _, _ = \
+            _rebuild_result(best_x, base, hp, best_inner, use_coolprop=True)
+        if cp_nr.nodes:
+            cp_p_min = min(snap.P for _, snap in cp_nr.nodes)
+            cp_p_max = max(snap.P for _, snap in cp_nr.nodes)
+            print(f"    interp He: obj={best_val:.5f} n_sc={best_inner.n_subcycles} "
+                  f"H2={best_inner.h2_mf:.2f}")
+            print(f"    CoolProp:  n_sc={len(cp_layer.subcycles)} "
+                  f"P∈[{cp_p_min:.0f},{cp_p_max:.0f}]kPa "
+                  f"T∈[{min(snap.T for _, snap in cp_nr.nodes):.0f},"
+                  f"{max(snap.T for _, snap in cp_nr.nodes):.0f}]K")
+        else:
+            print("    (CoolProp 与 InterpHe 拓扑不一致，跳过详细对比)")
+    except Exception as e:
+        print(f"    CoolProp 验证失败: {e}")
 
-    # ── 图表 ──
-    run_dir = TESTS_DIR / "run_layered_opt"
+    # ── 绘图 ──
+    run_dir = TESTS_DIR / "run_layered_fast"
     run_dir.mkdir(parents=True, exist_ok=True)
-    _draw_layered_charts(best, base, props, run_dir, hx_dT)
 
-    assert best.obj < 1e3
-    assert best.n_subcycles > 0
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig1, ax1 = plt.subplots(figsize=(8, 4))
+    ax1.plot(range(len(conv_history)), conv_history, "o-", ms=4, color="tab:blue")
+    ax1.axhline(y=best_val, color="tab:red", lw=1, ls="--", label=f"best={best_val:.5f}")
+    ax1.set_xlabel("DE generation"); ax1.set_ylabel("obj (unmatched/total_Q)")
+    ax1.set_title(f"DE convergence [{tag}] {tq_tag}")
+    ax1.legend(); ax1.grid(True, alpha=0.2)
+    fig1.tight_layout(); fig1.savefig(run_dir / f"conv_{tag}.png", dpi=150); plt.close(fig1)
+    print(f"  收敛图: {run_dir / f'conv_{tag}.png'}")
+
+    try:
+        _, best_hx, ideal_rep, ni_rep, best_layer, _hots, _colds = \
+            _rebuild_result(best_x, base, hp, best_inner)
+
+        # 理想 TS/PS
+        _draw_cycle_ts_ps(ideal_rep, best_layer,
+                          f"{tag} ideal", run_dir / f"ideal_ts_ps_{tag}.png")
+        # 非理想 TS/PS — 传入 ni_nodes 使子循环多边形对齐
+        _draw_cycle_ts_ps(ni_rep, best_layer,
+                          f"{tag} non-ideal", run_dir / f"nonideal_ts_ps_{tag}.png",
+                          ni_nodes=best_layer.non_ideal.nodes)
+        # HX T-Q
+        _draw_hx_tq(_hots, _colds, best_hx, run_dir / f"hx_tq_{tag}.png")
+
+        print(f"  理想 TS/PS: {run_dir / f'ideal_ts_ps_{tag}.png'}")
+        print(f"  非理想 TS/PS: {run_dir / f'nonideal_ts_ps_{tag}.png'}")
+        print(f"  HX T-Q: {run_dir / f'hx_tq_{tag}.png'}")
+        print(f"  HX单元={len(best_hx.units)} "
+              f"未匹配={float(best_hx.total_unmatched)/1e6:.3f}MW "
+              f"总匹配={best_hx.total_matched/1e6:.3f}MW")
+    except Exception as e:
+        import traceback
+        print(f"  绘图异常: {e}")
+        traceback.print_exc()
+
+    assert best_val < 1e3
 
 
 if __name__ == "__main__":
-    test_layered_optimization()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "1t2p":
+        test_layered_1t2p()
+    elif len(sys.argv) > 1 and sys.argv[1] == "long":
+        test_layered_2p0t_long()
+    elif len(sys.argv) > 1 and sys.argv[1] == "0p0t":
+        test_layered_0p0t()
+    else:
+        test_layered_optimization()

@@ -265,6 +265,8 @@ class _EvalState:
     hx_max_group_size: int | None = None
     use_interp_he: bool = False
     he_solver_params: tuple[float, float, float, float] | None = None
+    h2_mf_lo: float | None = None
+    h2_mf_hi: float | None = None
 
 
 def _eval_worker(x: tuple[float, ...], state: _EvalState, he_solver: object | None = None) -> float:
@@ -274,6 +276,21 @@ def _eval_worker(x: tuple[float, ...], state: _EvalState, he_solver: object | No
 
 
 _CHUNK_CACHED_HE_SOLVER: object | None = None
+
+
+def _make_h2_source(original: tuple, h2_mf: float):
+    """用给定的 H₂ 流量重建冷源元组。"""
+    from core import ExternalSourceInput
+    new_colds = []
+    for src in original:
+        if src.fluid == "Hydrogen":
+            new_colds.append(ExternalSourceInput(
+                fluid="Hydrogen", mass_flow=h2_mf,
+                T_in=src.T_in, P_in=src.P_in, T_out=src.T_out, P_out=src.P_out,
+            ))
+        else:
+            new_colds.append(src)
+    return tuple(new_colds)
 
 
 def _eval_chunk(solutions_and_state: tuple[list[list[float]], _EvalState]) -> list[float]:
@@ -308,7 +325,8 @@ def _eval_impl(x: tuple[float, ...], state: _EvalState, props: PropertyRegistry,
     idx += state.n_t_q
     p_q = _round_and_dedup(tuple(x[idx + i] for i in range(state.n_p_q)), state.qstep, state.qmerge)
     idx += state.n_p_q
-    mf_all = x[idx:]
+    mf_all = x[idx:idx + state.basis_mf_dim]
+    h2_mf = x[idx + state.basis_mf_dim] if state.h2_mf_lo is not None and len(x) > idx + state.basis_mf_dim else None
 
     if state.mf_step > 0:
         mf_all = [round(m / state.mf_step) * state.mf_step for m in mf_all]
@@ -345,9 +363,10 @@ def _eval_impl(x: tuple[float, ...], state: _EvalState, props: PropertyRegistry,
         delta_T_min=state.base_input.cycles[0].delta_T_min,
         heat_method=state.base_input.cycles[0].heat_method,
     )
+    cold_in = _make_h2_source(state.base_input.cold_sources, h2_mf) if h2_mf is not None else state.base_input.cold_sources
     sys_inp = SystemInput(
         heat_sources=state.base_input.heat_sources,
-        cold_sources=state.base_input.cold_sources,
+        cold_sources=cold_in,
         cycles=(cfg,),
         delta_T_min=state.base_input.delta_T_min,
         heat_method=state.base_input.heat_method,
@@ -432,6 +451,7 @@ class Optimizer:
         hx_dT_min: float = 10.0,
         hx_max_group_size: int | None = None,
         use_interp_he: bool = False,
+        h2_mf_bounds: tuple[float, float] | None = None,
     ):
         if not base_input.cycles:
             raise ValueError("base_input 须包含至少一个 CycleConfig")
@@ -452,6 +472,7 @@ class Optimizer:
         self._hx_max_group_size = hx_max_group_size
         self._use_interp_he = use_interp_he
         self._he_solver_cache = self._make_interp_he_solver() if use_interp_he else None
+        self._h2_mf_bounds = h2_mf_bounds
 
         if isinstance(objective, str):
             if objective not in OBJECTIVES:
@@ -519,6 +540,8 @@ class Optimizer:
                 self._he_solver_cache._P_min,
                 self._he_solver_cache._P_max,
             ) if self._he_solver_cache is not None else None,
+            h2_mf_lo=self._h2_mf_bounds[0] if self._h2_mf_bounds else None,
+            h2_mf_hi=self._h2_mf_bounds[1] if self._h2_mf_bounds else None,
         )
 
     def _build_basis_grid(self) -> None:
@@ -585,6 +608,9 @@ class Optimizer:
         for _ in range(self._mf_dim):
             b.append((mf_lo, mf_hi))
 
+        if self._h2_mf_bounds:
+            b.append(self._h2_mf_bounds)
+
         return b
 
     def _evaluate(self, x: tuple[float, ...]) -> float:
@@ -602,7 +628,8 @@ class Optimizer:
         idx += self._n_t_q
         p_q = _round_and_dedup(tuple(x[idx + i] for i in range(self._n_p_q)), self._qstep, self._qmerge)
         idx += self._n_p_q
-        mf_all = x[idx:]
+        mf_all = x[idx:idx + self._mf_dim]
+        h2_mf = x[idx + self._mf_dim] if self._h2_mf_bounds and len(x) > idx + self._mf_dim else None
 
         # 流量离散化
         mf_step = self._mf_step * (self._mf_hi - self._mf_lo)
@@ -642,9 +669,10 @@ class Optimizer:
             heat_method=self._base_cfg.heat_method,
         )
 
+        cold_in = _make_h2_source(self._base.cold_sources, h2_mf) if h2_mf is not None else self._base.cold_sources
         sys_inp = SystemInput(
             heat_sources=self._base.heat_sources,
-            cold_sources=self._base.cold_sources,
+            cold_sources=cold_in,
             cycles=(cfg,),
             delta_T_min=self._base.delta_T_min,
             heat_method=self._base.heat_method,
@@ -764,7 +792,8 @@ class Optimizer:
         idx += self._n_t_q
         p_q = _round_and_dedup(tuple(x[idx + i] for i in range(self._n_p_q)), self._qstep, self._qmerge)
         idx += self._n_p_q
-        mf_all = x[idx:]
+        mf_all = x[idx:idx + self._mf_dim]
+        h2_mf = x[idx + self._mf_dim] if self._h2_mf_bounds and len(x) > idx + self._mf_dim else None
 
         mf_step = self._mf_step * (self._mf_hi - self._mf_lo)
         if mf_step > 0:
@@ -797,9 +826,10 @@ class Optimizer:
             heat_method=self._base_cfg.heat_method,
         )
 
+        cold_in = _make_h2_source(self._base.cold_sources, h2_mf) if h2_mf is not None else self._base.cold_sources
         sys_inp = SystemInput(
             heat_sources=self._base.heat_sources,
-            cold_sources=self._base.cold_sources,
+            cold_sources=cold_in,
             cycles=(cfg,),
             delta_T_min=self._base.delta_T_min,
             heat_method=self._base.heat_method,
