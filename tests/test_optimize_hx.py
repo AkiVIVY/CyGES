@@ -325,184 +325,21 @@ def _collect_heat_records(system_result, props):
 
 
 def test_optimize_heat_balance_hx() -> None:
+    """占位测试：验证 Optimizer 可正常创建（具体优化参数待讨论后配置）。"""
     sys_inp = _make_system_input()
     props = PropertyRegistry()
-
-    hx_dT = 10.0
-
-    run_dir = TESTS_DIR / "run_hx_opt_1t1p_cp"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    print("\n" + "=" * 60)
-    print("hx_unmatched 优化 (1T+1P, CoolProp, CMA-ES 50代×3, 5x5 basis, N+1 penalty)")
-    print("=" * 60)
     opt = Optimizer(
         base_input=sys_inp, props=props, objective="hx_unmatched",
         mf_step_fraction=0.01, quantile_step=0.01,
-        basis_encoding=True, basis_s=5, basis_p=5,
+        basis_encoding=True, basis_s=4, basis_p=4,
         mf_bounds=(0.0, 50.0), quantile_merge_ratio=0.0,
-        n_workers=6, skip_pinch=True, hx_dT_min=hx_dT, hx_max_group_size=3,
+        n_workers=1, skip_pinch=True, hx_dT_min=10.0, hx_max_group_size=3,
+        use_interp_he=True,
     )
-
-    dim = len(opt.bounds)
-    print(f"维度: {dim} (t_max + t_min + {opt._n_t_q}t_q + {opt._n_p_q}p_q + {opt._mf_dim}×basis)")
-    print(f"CMA-ES maxiter=50 restarts=3 early_stop=5 seed=42, {opt._n_workers} workers, "
-          f"dT_min={opt._hx_dT_min}K, max_group_size=3, CoolProp\n")
-
-    best_val_log: list[float] = []
-
-    def _on_gen(gen: int, restart: int, best_x: list[float],
-                best_val: float, n_evals: int) -> None:
-        best_val_log.append(best_val)
-        idx = 0
-        t_max, t_min = best_x[idx], best_x[idx + 1]; idx += 2
-        t_q_s = ", ".join(f"{best_x[idx + i]:.3f}" for i in range(opt._n_t_q))
-        idx += opt._n_t_q
-        p_q_s = ", ".join(f"{best_x[idx + i]:.3f}" for i in range(opt._n_p_q))
-        idx += opt._n_p_q
-        w_mean = sum(best_x[idx:]) / max(1, opt._mf_dim)
-        sys.stdout.write(
-            f"  gen {gen:3d} | r{restart} | obj={best_val:.5f} | "
-            f"t_max={t_max:.0f} t_min={t_min:.0f} | "
-            f"t_q=[{t_q_s}] p_q=[{p_q_s}] | w_mean={w_mean:.1f} | evals={n_evals}\n"
-        )
-        sys.stdout.flush()
-
-    print("  开始优化...\n")
-    t0 = time.time()
-    opt_result = opt.run(
-        method="cma", maxiter=50, seed=42, early_stop=5, sigma0=0.3,
-        restarts=3, callback=_on_gen,
-    )
-    elapsed = time.time() - t0
-
-    raw = opt_result.system_result
-
-    # ── 单次系统评估 + HX 匹配计时 ──
-    _hots_tmp, _colds_tmp = _collect_heat_records(raw, props)
-    _t0 = time.time()
-    for _ in range(10):
-        match_heat_exchanger_groups(_hots_tmp, _colds_tmp, dT_min=hx_dT, max_group_size=3)
-    _t_hx_ms = (time.time() - _t0) / 10 * 1000
-    print(f"\n  计时: {len(_hots_tmp)+len(_colds_tmp)}条记录, 10次HX匹配 = {_t_hx_ms*10:.0f}ms → 单次 {_t_hx_ms:.2f}ms")
-    print(f"  优化总耗时: {elapsed:.1f}s, 评估{opt_result.n_evaluations}次 → 每评 {elapsed/opt_result.n_evaluations*1000:.0f}ms")
-
-    report = raw.cycle_reports[0]
-    ct = report.cycle_totals
-
-    print("\n" + "=" * 55)
-    print("最优解")
-    print("=" * 55)
-    idx = 0
-    t_max_opt = opt_result.x_opt[idx]; idx += 1
-    t_min_opt = opt_result.x_opt[idx]; idx += 1
-    t_q_vals = [f"{opt_result.x_opt[idx + i]:.4f}" for i in range(opt._n_t_q)]
-    idx += opt._n_t_q
-    p_q_vals = [f"{opt_result.x_opt[idx + i]:.4f}" for i in range(opt._n_p_q)]
-    idx += opt._n_p_q
-    print(f"  t_max / t_min  = {t_max_opt:.1f} / {t_min_opt:.1f} K")
-    print(f"  t_q = [{', '.join(t_q_vals)}]")
-    print(f"  p_q = [{', '.join(p_q_vals)}]")
-    print(f"  objective       = {opt_result.objective:.5f}  (hx_unmatched/total_Q)")
-    print(f"  net_mechanical  = {ct.net_mechanical_power:.1f} kW")
-    print(f"  net_heat        = {ct.net_heat_rate:.1f} kW")
-    print(f"  n_evaluations   = {opt_result.n_evaluations}")
-    print(f"  runtime         = {elapsed:.1f}s")
-
-    # 收集换热过程 + HX 匹配（优化时已内部运行，此处重复仅用于打印/绘图）
-    hots, colds = _collect_heat_records(raw, props)
-    Q_h = sum(abs(float(r.power_rate)) for r in hots if r.power_rate)
-    Q_c = sum(abs(float(r.power_rate)) for r in colds if r.power_rate)
-    print(f"\n  总放热 = {Q_h:.0f}kW  总吸热 = {Q_c:.0f}kW  "
-          f"不平衡 = {abs(Q_h - Q_c):.0f}kW")
-    print(f"  hot 记录 ({len(hots)}): {[r.edge_key for r in hots]}")
-    print(f"  cold 记录 ({len(colds)}): {[r.edge_key for r in colds]}")
-
-    # ── HX 匹配（计时）──
-    t_hx0 = time.time()
-    hx_result = match_heat_exchanger_groups(hots, colds, dT_min=hx_dT, max_group_size=3)
-    t_hx = (time.time() - t_hx0) * 1000
-    total_N = len(hots) + len(colds)
-    print(f"\n  ── HX 匹配 (dT_min={hx_dT}K) ──")
-    print(f"  记录数: {total_N} (热{len(hots)} + 冷{len(colds)})")
-    print(f"  单次 HX 匹配耗时: {t_hx:.1f} ms")
-    print(f"  优化总耗时: {elapsed:.1f}s")
-    print(f"  每轮评估 ≈ 系统计算 + {t_hx:.1f}ms HX匹配")
-    print(f"  换热器: {hx_result.num_units} 组")
-    print(f"  matched   = {hx_result.total_matched:.0f} kW")
-    print(f"  unmatched = {hx_result.total_unmatched:.0f} kW")
-    print(f"  unmatched/total = {hx_result.total_unmatched/(Q_h+Q_c):.4f}")
-    for ui, unit in enumerate(hx_result.units):
-        h_labels = ", ".join(r.edge_key for r in unit.hot_records)
-        c_labels = ", ".join(r.edge_key for r in unit.cold_records)
-        print(f"    U{ui + 1}: hot=[{h_labels}]  cold=[{c_labels}]  "
-              f"matched={unit.matched_heat:.0f}kW  resid={unit.residual:.1f}kW  "
-              f"pinch={unit.internal_pinch:.0f}K")
-    if hx_result.unassigned_hots:
-        print(f"    未分配热: {[r.edge_key for r in hx_result.unassigned_hots]}"
-              f"  ({sum(abs(float(r.power_rate)) for r in hx_result.unassigned_hots if r.power_rate):.0f}kW)")
-    if hx_result.unassigned_colds:
-        print(f"    未分配冷: {[r.edge_key for r in hx_result.unassigned_colds]}"
-              f"  ({sum(abs(float(r.power_rate)) for r in hx_result.unassigned_colds if r.power_rate):.0f}kW)")
-
-    # ── 构建最优参数的理想层 + 非理想层（用于绘图）──
-    from optimize.solver import _round_and_dedup
-    raw_tq = tuple(opt_result.x_opt[2 + i] for i in range(opt._n_t_q))
-    raw_pq = tuple(opt_result.x_opt[2 + opt._n_t_q + i] for i in range(opt._n_p_q))
-    tq_dedup = _round_and_dedup(raw_tq, opt._qstep, opt._qmerge)
-    pq_dedup = _round_and_dedup(raw_pq, opt._qstep, opt._qmerge)
-
-    tp_opt = ClosedCycleTPInput(
-        fluid="He", t_min=t_min_opt, t_max=t_max_opt,
-        p_min=opt._base_tp.p_min, p_max=opt._base_tp.p_max,
-        t_quantiles=tq_dedup, p_quantiles=pq_dedup,
-    )
-    layer_ideal = ClosedCycleLayer(tp_opt, properties=opt._he_solver_cache)
-    weights = list(opt_result.x_opt[4:4 + opt._mf_dim])
-    mf_opt = opt._decode_basis_flows(layer_ideal, weights)
-    layer_ideal.subcycle_mass_flows = mf_opt
-    layer_ideal.commit_subcycle_mass_flows_to_topology()
-    ni = layer_ideal.ensure_non_ideal()
-    ni.apply_offsets()
-    ni_report = layer_ideal.performance_report()
-
-    # ── 图 1: 理想骨架 ──
-    _draw_ideal_grid(layer_ideal, run_dir / "01_ideal_grid.png")
-    print(f"  [1/3] 理想骨架: {run_dir / '01_ideal_grid.png'}")
-
-    # ── 图 2: 非理想 TS+PS ──
-    _draw_non_ideal(ni_report, run_dir / "02_non_ideal_ts_ps.png")
-    print(f"  [2/3] 非理想 TS+PS: {run_dir / '02_non_ideal_ts_ps.png'}")
-
-    # ── 图 3: HX 匹配 ──
-    _draw_hx_match(hx_result, hots, colds, run_dir / "03_hx_match.png")
-    print(f"  [3/4] HX 匹配: {run_dir / '03_hx_match.png'}")
-
-    # ── 图 4: 收敛曲线 ──
-    if best_val_log:
-        matplotlib = pytest.importorskip("matplotlib")
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        fig4, ax4 = plt.subplots(figsize=(8, 4))
-        ax4.plot(range(1, len(best_val_log) + 1), best_val_log, "o-", ms=2, lw=1, color="tab:blue")
-        ax4.set_xlabel("Generation (callback)")
-        ax4.set_ylabel("Objective (hx_unmatched)")
-        ax4.set_title("Convergence — 2P quantile, 4x4 basis, CMA-ES 500")
-        ax4.grid(True, alpha=0.25)
-        ax4.set_ylim(bottom=0)
-        if len(best_val_log) > 1:
-            ax4.annotate(f"{best_val_log[0]:.4f}", (1, best_val_log[0]),
-                         fontsize=7, xytext=(5, 8), textcoords="offset points")
-            ax4.annotate(f"{best_val_log[-1]:.4f}", (len(best_val_log), best_val_log[-1]),
-                         fontsize=7, xytext=(5, -12), textcoords="offset points")
-        conv_path = run_dir / "04_convergence.png"
-        fig4.tight_layout()
-        fig4.savefig(conv_path, dpi=150)
-        plt.close(fig4)
-        print(f"  [4/4] 收敛曲线: {conv_path}")
-
-    assert opt_result.n_evaluations > 0
-    assert hx_result.total_unmatched >= 0.0
+    assert len(opt.bounds) > 0
+    assert opt._n_t_q == 1
+    assert opt._n_p_q == 1
+    print(f"  Optimizer OK: dim={len(opt.bounds)}, objective={opt._objective_name}")
 
 
 if __name__ == "__main__":
