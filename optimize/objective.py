@@ -114,5 +114,4 @@ def hx_unmatched_ratio(result: SystemResult) -> float:
     total_q = sum(abs(float(r.power_rate)) for r in all_hots + all_colds if r.power_rate)
     if total_q < 1e-12:
         return 1.0
-    N = len(hx.unassigned_hots) + len(hx.unassigned_colds)
-    return hx.total_unmatched / total_q * (N + 1)
+    return hx.total_unmatched / total_q
