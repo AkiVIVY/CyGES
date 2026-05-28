@@ -442,24 +442,22 @@ def _solve_constructive(
     best_matched = -1.0
 
     for _ in range(n_restarts):
-        # 对各侧按 T_high 降序排列（同 T_high 组内随机打乱）
-        h_sorted = sorted(hots, key=lambda r: r.T_high, reverse=True)
-        c_sorted = sorted(colds, key=lambda r: r.T_high, reverse=True)
-
         def _shuffle_by_tier(items: list[_RecInfo], rng) -> list[_RecInfo]:
-            tiers: dict[int, list[_RecInfo]] = {}
+            """Q 优先排序：大热量先匹配，同热量组内随机打乱。"""
+            tiers: dict[tuple[int, int], list[_RecInfo]] = {}
             for item in items:
-                t = int(item.T_high)
-                tiers.setdefault(t, []).append(item)
+                q_key = int(item.Q)
+                t_key = int(item.T_high)
+                tiers.setdefault((q_key, t_key), []).append(item)
             result: list[_RecInfo] = []
-            for t in sorted(tiers, reverse=True):
-                tier_list = tiers[t]
+            for (q_key, t_key) in sorted(tiers, key=lambda x: (-x[0], -x[1])):
+                tier_list = tiers[(q_key, t_key)]
                 rng.shuffle(tier_list)
                 result.extend(tier_list)
             return result
 
-        h_pool = _shuffle_by_tier(list(h_sorted), rng)
-        c_pool = _shuffle_by_tier(list(c_sorted), rng)
+        h_pool = _shuffle_by_tier(list(hots), rng)
+        c_pool = _shuffle_by_tier(list(colds), rng)
 
         h_assigned: set[int] = set()
         c_assigned: set[int] = set()
@@ -478,6 +476,10 @@ def _solve_constructive(
             cold_subset: list[_RecInfo] = []
             sum_c = 0.0
             min_pinch = float("inf")
+            best_cs: list[_RecInfo] = []
+            best_sum_c = 0.0
+            best_pinch = float("inf")
+            best_residual = float("inf")
 
             for c in feasible:
                 if max_group_size is not None and len(cold_subset) >= max_group_size:
@@ -489,22 +491,28 @@ def _solve_constructive(
                 cold_subset.append(c)
                 sum_c += c.Q
                 min_pinch = min(min_pinch, pinch)
+                residual = abs(h.Q - sum_c)
+                if residual < best_residual - 1e-9:
+                    best_residual = residual
+                    best_cs = list(cold_subset)
+                    best_sum_c = sum_c
+                    best_pinch = min_pinch
                 if sum_c >= h.Q - 1e-12:
                     break
 
-            if not cold_subset:
+            if not best_cs:
                 continue
 
-            matched = min(h.Q, sum_c)
+            matched = min(h.Q, best_sum_c)
             units.append(HXUnit(
                 hot_records=(h.record,),
-                cold_records=tuple(c.record for c in cold_subset),
+                cold_records=tuple(c.record for c in best_cs),
                 matched_heat=matched,
-                residual=abs(h.Q - sum_c),
-                internal_pinch=min_pinch,
+                residual=abs(h.Q - best_sum_c),
+                internal_pinch=best_pinch,
             ))
             h_assigned.add(h.idx)
-            for c in cold_subset:
+            for c in best_cs:
                 c_assigned.add(c.idx)
 
         # ── 后向: 剩余冷→剩余热 (mH + 1C) ──
@@ -521,6 +529,10 @@ def _solve_constructive(
             hot_subset: list[_RecInfo] = []
             sum_h = 0.0
             min_pinch = float("inf")
+            best_hs: list[_RecInfo] = []
+            best_sum_h = 0.0
+            best_pinch_back = float("inf")
+            best_residual_back = float("inf")
 
             for h in feasible:
                 if max_group_size is not None and len(hot_subset) >= max_group_size:
@@ -532,22 +544,28 @@ def _solve_constructive(
                 hot_subset.append(h)
                 sum_h += h.Q
                 min_pinch = min(min_pinch, pinch)
+                residual = abs(c.Q - sum_h)
+                if residual < best_residual_back - 1e-9:
+                    best_residual_back = residual
+                    best_hs = list(hot_subset)
+                    best_sum_h = sum_h
+                    best_pinch_back = min_pinch
                 if sum_h >= c.Q - 1e-12:
                     break
 
-            if not hot_subset:
+            if not best_hs:
                 continue
 
-            matched = min(sum_h, c.Q)
+            matched = min(best_sum_h, c.Q)
             units.append(HXUnit(
-                hot_records=tuple(h.record for h in hot_subset),
+                hot_records=tuple(h.record for h in best_hs),
                 cold_records=(c.record,),
                 matched_heat=matched,
-                residual=abs(sum_h - c.Q),
-                internal_pinch=min_pinch,
+                residual=abs(best_sum_h - c.Q),
+                internal_pinch=best_pinch_back,
             ))
             c_assigned.add(c.idx)
-            for h in hot_subset:
+            for h in best_hs:
                 h_assigned.add(h.idx)
 
         total_matched = sum(u.matched_heat for u in units)

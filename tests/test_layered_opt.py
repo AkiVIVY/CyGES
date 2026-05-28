@@ -42,7 +42,29 @@ _DEFAULT_HP = {
     "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
     "mf_lo": 0.0, "mf_hi": 50.0,
     "n_workers": 6,
+    # 外层搜索边界
+    "t_min_lo": 40.0, "t_min_hi": 500.0,
+    "t_max_lo": 800.0, "t_max_hi": 1100.0,
+    "p_min_lo": 2000.0, "p_min_hi": 5000.0,
+    "p_max_lo": 8000.0, "p_max_hi": 15000.0,
+    # 外部源参数
+    "air_mf": 100.0, "air_T_in": 1250.0, "air_P_in": 200.0,
+    "air_T_out": 500.0, "air_P_out": 180.0,
+    "h2_T_in": 20.0, "h2_P_in": 5000.0,
+    "h2_T_out": 900.0, "h2_P_out": 4500.0,
+    "h2_T_out_lo": 400.0, "h2_T_out_hi": 900.0,
+    "use_non_ideal": True,
 }
+
+
+def _make_h2_source(hp: dict, h2_mf: float, h2_T_out: float | None = None) -> ExternalSourceInput:
+    """用 hp 中的 H₂ 参数 + 可变流量/出口温构造冷源。"""
+    return ExternalSourceInput(
+        fluid="Hydrogen", mass_flow=h2_mf,
+        T_in=hp["h2_T_in"], P_in=hp["h2_P_in"],
+        T_out=h2_T_out if h2_T_out is not None else hp["h2_T_out"],
+        P_out=hp["h2_P_out"],
+    )
 
 # ──────────────────────────────────────────────────────────────────
 # 系统输入
@@ -50,22 +72,27 @@ _DEFAULT_HP = {
 
 
 def _make_system_input(
+    hp: dict,
     t_quantiles: tuple[float, ...] = (),
     p_quantiles: tuple[float, ...] = (0.33, 0.67),
     h2_mass_flow: float = 4.3,
 ) -> SystemInput:
-    hot = ExternalSourceInput(fluid="Air", mass_flow=100.0,
-                              T_in=1250.0, P_in=200.0, T_out=500.0, P_out=180.0)
+    hot = ExternalSourceInput(fluid="Air",
+                              mass_flow=hp["air_mf"],
+                              T_in=hp["air_T_in"], P_in=hp["air_P_in"],
+                              T_out=hp["air_T_out"], P_out=hp["air_P_out"])
     cold = ExternalSourceInput(fluid="Hydrogen", mass_flow=h2_mass_flow,
-                               T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0)
+                               T_in=hp["h2_T_in"], P_in=hp["h2_P_in"],
+                               T_out=hp["h2_T_out"], P_out=hp["h2_P_out"])
     cycle_input = ClosedCycleTPInput(
-        fluid="He", t_min=40.0, t_max=1000.0, p_min=2000.0, p_max=10000.0,
+        fluid="He", t_min=hp["t_min_lo"], t_max=hp["t_max_hi"],
+        p_min=hp["p_min"], p_max=hp["p_max_hi"],
         t_quantiles=t_quantiles, p_quantiles=p_quantiles,
         subcycle_mass_flow_initial=20.0,
     )
     return SystemInput(
         heat_sources=(hot,), cold_sources=(cold,),
-        cycles=(CycleConfig(input=cycle_input, use_non_ideal=True,
+        cycles=(CycleConfig(input=cycle_input, use_non_ideal=hp["use_non_ideal"],
                             delta_T_min=20.0, heat_method=None),),
         delta_T_min=20.0, heat_method="system_pinch",
     )
@@ -102,15 +129,17 @@ class LayerResult:
     n: int
     t_min: float
     t_max: float
+    p_min: float
     p_max: float
     t_q: tuple[float, ...]
     p_q: tuple[float, ...]
     flows: list[float]
     h2_mf: float
-    obj: float
-    n_subcycles: int
-    n_evals: int
-    runtime: float
+    h2_T_out: float = 900.0
+    obj: float = 1e9
+    n_subcycles: int = 0
+    n_evals: int = 0
+    runtime: float = 0.0
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -118,21 +147,21 @@ class LayerResult:
 # ──────────────────────────────────────────────────────────────────
 
 
-def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, sys_inp_template: SystemInput,
-               hp: dict) -> float:
+def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, h2_T_out: float,
+               sys_inp_template: SystemInput, hp: dict) -> float:
     """固定拓扑下：更新流量 → 非理想 → 性能 → HX。不重建 ClosedCycleLayer。"""
     from core.system import SystemPipeline
     from core import InterpolatingHeliumSolver
 
     props = PropertyRegistry()
-    try:
-        ni = layer.ensure_non_ideal()
-        ni.apply_offsets()
-    except Exception:
-        return 1e9
+    if hp["use_non_ideal"]:
+        try:
+            ni = layer.ensure_non_ideal()
+            ni.apply_offsets()
+        except Exception:
+            return 1e9
 
-    cold_src = ExternalSourceInput(fluid="Hydrogen", mass_flow=h2_mf,
-                                   T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0)
+    cold_src = _make_h2_source(hp, h2_mf, h2_T_out)
 
     report = layer.performance_report()
     hots: list = []
@@ -190,11 +219,11 @@ def _inner_cma_fast(
         # InterpHe 近似 S 值可能导致拓扑断裂，回退 CoolProp
         base_layer = ClosedCycleLayer(tp_in)
     n_sc = len(base_layer.subcycles)
-    dim = n_sc + 1
+    dim = n_sc + 2  # 子循环流量 + H2 流量 + h2_T_out
 
     mf_lo = hp["mf_lo"]; mf_hi = hp["mf_hi"]
-    lo = [mf_lo] * n_sc + [hp["h2_mf_lo"]]
-    hi = [mf_hi] * n_sc + [hp["h2_mf_hi"]]
+    lo = [mf_lo] * n_sc + [hp["h2_mf_lo"], hp["h2_T_out_lo"]]
+    hi = [mf_hi] * n_sc + [hp["h2_mf_hi"], hp["h2_T_out_hi"]]
     stds = [hp["sigma0"] * (hi[i] - lo[i]) for i in range(dim)]
     x0_init = [(lo[i] + hi[i]) / 2 for i in range(dim)]
 
@@ -227,13 +256,14 @@ def _inner_cma_fast(
             for sol in solutions:
                 flows = list(sol[:n_sc])
                 h2_mf = sol[n_sc]
+                h2_T_out = sol[n_sc + 1]
                 try:
                     base_layer.subcycle_mass_flows = flows
                     base_layer.commit_subcycle_mass_flows_to_topology()
                 except Exception:
                     scores.append(1e9)
                     continue
-                scores.append(_eval_fast(base_layer, h2_mf, sys_inp, hp))
+                scores.append(_eval_fast(base_layer, h2_mf, h2_T_out, sys_inp, hp))
             es.tell(solutions, scores)
             total_evals += len(solutions)
             gen += 1
@@ -253,27 +283,31 @@ def _inner_cma_fast(
         sys.stdout.write(
             f"    r{restart}: gen={gen} obj={global_best_val:.5f} "
             f"evals={total_evals} dim={dim} n_sc={n_sc} "
-            f"best_flow_sum={sum(global_best_x[:-1]):.0f} H2={global_best_x[-1]:.1f}\n"
+            f"best_flow_sum={sum(global_best_x[:n_sc]):.0f} "
+            f"H2={global_best_x[n_sc]:.1f} "
+            f"h2tout={global_best_x[n_sc+1]:.0f}\n"
         )
         sys.stdout.flush()
 
     flows = global_best_x[:n_sc]
     flow_step = hp["flow_step"]
     flows = [round(f / flow_step) * flow_step for f in flows]
-    h2_mf = round(global_best_x[-1] / hp["h2_step"]) * hp["h2_step"]
+    h2_mf = round(global_best_x[n_sc] / hp["h2_step"]) * hp["h2_step"]
+    h2_T_out = round(global_best_x[n_sc + 1])
 
     try:
         base_layer.subcycle_mass_flows = flows
         base_layer.commit_subcycle_mass_flows_to_topology()
     except Exception:
         pass
-    obj_final = _eval_fast(base_layer, h2_mf, sys_inp, hp)
+    obj_final = _eval_fast(base_layer, h2_mf, h2_T_out, sys_inp, hp)
     runtime = time.perf_counter() - t0
 
     return LayerResult(
-        n=n_sc, t_min=tp_in.t_min, t_max=tp_in.t_max, p_max=tp_in.p_max,
+        n=n_sc, t_min=tp_in.t_min, t_max=tp_in.t_max,
+        p_min=tp_in.p_min, p_max=tp_in.p_max,
         t_q=tp_in.t_quantiles, p_q=tp_in.p_quantiles,
-        flows=flows, h2_mf=h2_mf, obj=obj_final,
+        flows=flows, h2_mf=h2_mf, h2_T_out=h2_T_out, obj=obj_final,
         n_subcycles=n_sc, n_evals=total_evals, runtime=runtime,
     ), base_layer
 
@@ -285,18 +319,18 @@ def _inner_cma_fast(
 
 def _sample_worker(args: tuple) -> LayerResult:
     """模块级 worker: 评估一个外层 LHS 样本。"""
-    (t_min, t_max, t_q_vals, p_q_vals, p_max, sys_inp, hp, seed) = args
+    (t_min, t_max, t_q_vals, p_q_vals, p_max, p_min, sys_inp, hp, seed) = args
 
     tp_in = ClosedCycleTPInput(
         fluid="He", t_min=t_min, t_max=t_max,
-        p_min=hp["p_min"], p_max=p_max,
+        p_min=p_min, p_max=p_max,
         t_quantiles=t_q_vals, p_quantiles=p_q_vals,
     )
 
     from core import InterpolatingHeliumSolver
     try:
         _he = InterpolatingHeliumSolver(
-            T_min=t_min, T_max=t_max, P_min=hp["p_min"], P_max=p_max)
+            T_min=t_min, T_max=t_max, P_min=p_min, P_max=p_max)
         _he._build()
         probe = ClosedCycleLayer(tp_in, properties=_he)
         if len(probe.subcycles) == 0:
@@ -304,7 +338,8 @@ def _sample_worker(args: tuple) -> LayerResult:
     except Exception:
         probe = ClosedCycleLayer(tp_in)
     if len(probe.subcycles) == 0:
-        return LayerResult(n=0, t_min=t_min, t_max=t_max, p_max=p_max,
+        return LayerResult(n=0, t_min=t_min, t_max=t_max,
+                           p_min=p_min, p_max=p_max,
                            t_q=t_q_vals, p_q=p_q_vals, flows=[], h2_mf=0,
                            obj=1e9, n_subcycles=0, n_evals=0, runtime=0)
 
@@ -317,8 +352,8 @@ def _sample_worker(args: tuple) -> LayerResult:
 # ──────────────────────────────────────────────────────────────────
 
 
-def _de_trial_worker(args: tuple) -> tuple[float, LayerResult]:
-    """模块级 worker: 外层参数 → 内层 CMA → (obj, LayerResult)。"""
+def _de_trial_worker(args: tuple) -> float:
+    """模块级 worker: 外层参数 → 内层 CMA → obj（仅回传标量）。"""
     (x_outer, sys_inp, hp, seed) = args
 
     t_min = round(x_outer[0])
@@ -331,16 +366,17 @@ def _de_trial_worker(args: tuple) -> tuple[float, LayerResult]:
                for j in range(hp["n_p_q"]))
     idx += hp["n_p_q"]
     p_max = round(x_outer[idx])
+    p_min = round(x_outer[idx + 1])
 
     tp_in = ClosedCycleTPInput(
         fluid="He", t_min=t_min, t_max=t_max,
-        p_min=hp["p_min"], p_max=p_max,
+        p_min=p_min, p_max=p_max,
         t_quantiles=tq, p_quantiles=pq,
     )
     from core import InterpolatingHeliumSolver
     try:
         _he = InterpolatingHeliumSolver(
-            T_min=t_min, T_max=t_max, P_min=hp["p_min"], P_max=p_max)
+            T_min=t_min, T_max=t_max, P_min=p_min, P_max=p_max)
         _he._build()
         probe = ClosedCycleLayer(tp_in, properties=_he)
         if len(probe.subcycles) == 0:
@@ -348,12 +384,10 @@ def _de_trial_worker(args: tuple) -> tuple[float, LayerResult]:
     except Exception:
         probe = ClosedCycleLayer(tp_in)
     if len(probe.subcycles) == 0:
-        return 1e9, LayerResult(n=0, t_min=t_min, t_max=t_max, p_max=p_max,
-                                t_q=tq, p_q=pq, flows=[], h2_mf=0,
-                                obj=1e9, n_subcycles=0, n_evals=0, runtime=0)
+        return 1e9
 
     result, _ = _inner_cma_fast(tp_in, sys_inp, hp, seed=seed)
-    return result.obj, result
+    return result.obj
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -362,8 +396,7 @@ def _de_trial_worker(args: tuple) -> tuple[float, LayerResult]:
 
 
 def _rebuild_result(x_outer: list[float], sys_inp: SystemInput,
-                    hp: dict, best_inner: LayerResult,
-                    *, use_coolprop: bool = False) -> tuple:
+                    hp: dict, *, use_coolprop: bool = False) -> tuple:
     """用最优参数重建层、获取 report + HX；可选 CoolProp 模式。"""
     props = PropertyRegistry()
     t_min = round(x_outer[0])
@@ -376,15 +409,16 @@ def _rebuild_result(x_outer: list[float], sys_inp: SystemInput,
                for j in range(hp["n_p_q"]))
     idx += hp["n_p_q"]
     p_max = round(x_outer[idx])
+    p_min = round(x_outer[idx + 1])
 
     tp_in = ClosedCycleTPInput(
         fluid="He", t_min=t_min, t_max=t_max,
-        p_min=hp["p_min"], p_max=p_max,
+        p_min=p_min, p_max=p_max,
         t_quantiles=tq, p_quantiles=pq,
     )
     from core import InterpolatingHeliumSolver
     he_solver = InterpolatingHeliumSolver(
-        T_min=t_min, T_max=t_max, P_min=hp["p_min"], P_max=p_max)
+        T_min=t_min, T_max=t_max, P_min=p_min, P_max=p_max)
     he_solver._build()
     layer = ClosedCycleLayer(tp_in, properties=he_solver)
     if len(layer.subcycles) == 0:
@@ -401,15 +435,21 @@ def _rebuild_result(x_outer: list[float], sys_inp: SystemInput,
         except Exception:
             pass
         ideal_rep_cp = layer_cp.performance_report()
-        ni_cp = layer_cp.ensure_non_ideal()
-        ni_cp.apply_offsets()
-        ni_rep_cp = layer_cp.performance_report()
+        if hp["use_non_ideal"]:
+            ni_cp = layer_cp.ensure_non_ideal()
+            ni_cp.apply_offsets()
+            ni_rep_cp = layer_cp.performance_report()
+        else:
+            ni_rep_cp = ideal_rep_cp
         return result, None, ideal_rep_cp, ni_rep_cp, layer_cp, [], []
 
     ideal_report = layer.performance_report()
-    ni = layer.ensure_non_ideal()
-    ni.apply_offsets()
-    ni_report = layer.performance_report()
+    if hp["use_non_ideal"]:
+        ni = layer.ensure_non_ideal()
+        ni.apply_offsets()
+        ni_report = layer.performance_report()
+    else:
+        ni_report = ideal_report
     hots: list = []
     colds: list = []
     for _, rec in ni_report.by_edge:
@@ -419,8 +459,7 @@ def _rebuild_result(x_outer: list[float], sys_inp: SystemInput,
             else:
                 colds.append(rec)
     from core.system import convert_sources
-    cold_src = ExternalSourceInput(fluid="Hydrogen", mass_flow=result.h2_mf,
-                                   T_in=20.0, P_in=5000.0, T_out=900.0, P_out=4500.0)
+    cold_src = _make_h2_source(hp, result.h2_mf, result.h2_T_out)
     src_hots, _ = convert_sources(sys_inp.heat_sources, (), props)
     _, src_colds = convert_sources((), (cold_src,), props)
     hots[:0] = src_hots
@@ -544,8 +583,8 @@ def _draw_hx_tq(hots: list, colds: list, hx_result: HXMatchResult,
     fig.suptitle(
         f"HX Optimal Matching | {len(hots) + len(colds)} records, "
         f"{hx_result.num_units} units | "
-        f"matched={hx_result.total_matched / 1e3:.1f}kW, "
-        f"unmatched={hx_result.total_unmatched / 1e3:.1f}kW",
+        f"matched={hx_result.total_matched:.0f}kW, "
+        f"unmatched={hx_result.total_unmatched:.0f}kW",
         fontsize=12, fontweight="bold")
 
     gs = fig.add_gridspec(n_rows + 1, 1, height_ratios=[1] + [2] * n_rows,
@@ -565,14 +604,14 @@ def _draw_hx_tq(hots: list, colds: list, hx_result: HXMatchResult,
                 in_unit = ui
                 break
         if in_unit >= 0:
-            ax_ov.annotate(f"{label}\n{r.Q / 1e3:.1f}kW",
+            ax_ov.annotate(f"{label}\n{r.Q:.0f}kW",
                            (cum_q + r.Q / 2, (r.T_high + r.T_low) / 2),
                            fontsize=6, ha="center", color=color,
                            bbox=dict(boxstyle="round,pad=0.1",
                                      facecolor=unit_colors[in_unit % len(unit_colors)],
                                      alpha=0.85))
         else:
-            ax_ov.annotate(f"{label}\n{r.Q / 1e3:.1f}kW",
+            ax_ov.annotate(f"{label}\n{r.Q:.0f}kW",
                            (cum_q + r.Q / 2, (r.T_high + r.T_low) / 2),
                            fontsize=6, ha="center", color="gray",
                            bbox=dict(boxstyle="round,pad=0.1",
@@ -604,7 +643,7 @@ def _draw_hx_tq(hots: list, colds: list, hx_result: HXMatchResult,
             Th_h, Th_l = max(hr.tail_state.T, hr.head_state.T), min(hr.tail_state.T, hr.head_state.T)
             Qh = abs(hr.power_rate) if hr.power_rate else 0.0
             ax.plot([x, x + Qh], [Th_h, Th_l], "o-", color="tab:red", lw=2.2, ms=3.5)
-            ax.annotate(f"{hr.edge_key}\n({Qh / 1e3:.1f}kW)",
+            ax.annotate(f"{hr.edge_key}\n({Qh:.0f}kW)",
                         (x + Qh / 2, (Th_h + Th_l) / 2),
                         fontsize=5, color="darkred", ha="center",
                         xytext=(0, 8), textcoords="offset points")
@@ -615,13 +654,13 @@ def _draw_hx_tq(hots: list, colds: list, hx_result: HXMatchResult,
             Tc_l, Tc_h = min(cr.tail_state.T, cr.head_state.T), max(cr.tail_state.T, cr.head_state.T)
             Qc = abs(cr.power_rate) if cr.power_rate else 0.0
             ax.plot([x, x + Qc], [Tc_h, Tc_l], "s--", color="tab:blue", lw=1.8, ms=3.5)
-            ax.annotate(f"{cr.edge_key}\n({Qc / 1e3:.1f}kW)",
+            ax.annotate(f"{cr.edge_key}\n({Qc:.0f}kW)",
                         (x + Qc / 2, (Tc_h + Tc_l) / 2),
                         fontsize=5, color="darkblue", ha="center",
                         xytext=(0, -12), textcoords="offset points")
             x += Qc
 
-        ax.set_title(f"Unit {ui + 1}  matched={unit.matched_heat / 1e3:.1f}kW  "
+        ax.set_title(f"Unit {ui + 1}  matched={unit.matched_heat:.0f}kW  "
                      f"pinch={unit.internal_pinch:.0f}K", fontsize=8, fontweight="bold")
         ax.set_xlabel("Q [kW]"); ax.set_ylabel("T [K]")
         ax.grid(True, alpha=0.2)
@@ -723,24 +762,49 @@ def test_layered_0p0t() -> None:
     _run_layered(hp, tag="0P0T")
 
 
+def test_layered_0p0t_wide() -> None:
+    """0P+0T 宽边界 + 无非理想：t_min∈[50,500] t_max∈[700,1100] p_min∈[1000,4000] p_max∈[6000,15000] H2∈[2,6]"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 0, "n_p_q": 0, "n_lhs": 50, "hx_dT": 10.0,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 15, "de_maxiter": 40, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001,
+          "t_min_lo": 50.0, "t_min_hi": 500.0,
+          "t_max_lo": 700.0, "t_max_hi": 1100.0,
+          "p_min_lo": 1000.0, "p_min_hi": 4000.0,
+          "p_max_lo": 6000.0, "p_max_hi": 15000.0,
+          "h2_mf_lo": 2.0, "h2_mf_hi": 6.0,
+          "use_non_ideal": False,
+          }
+    _run_layered(hp, tag="0P0T_wide")
+
+
 def _run_layered(hp: dict, tag: str = "") -> None:
     hp = {**_DEFAULT_HP, **hp}
     tq_tag = f"{hp['n_t_q']}T{hp['n_p_q']}P"
     print("=" * 60)
     print(f"分层优化 (LHS+DE并行) [{tag}] {tq_tag}")
     print(f"  LHS={hp['n_lhs']}点 DE={hp['de_popsize']}x{hp['de_maxiter']} "
-          f"p_min={hp['p_min']} hx_dT={hp['hx_dT']} "
-          f"H2∈[{hp['h2_mf_lo']},{hp['h2_mf_hi']}] mf∈[{hp['mf_lo']},{hp['mf_hi']}]")
+          f"t_min∈[{hp['t_min_lo']},{hp['t_min_hi']}] "
+          f"t_max∈[{hp['t_max_lo']},{hp['t_max_hi']}] "
+          f"p_min∈[{hp['p_min_lo']},{hp['p_min_hi']}] "
+          f"p_max∈[{hp['p_max_lo']},{hp['p_max_hi']}] "
+          f"H2∈[{hp['h2_mf_lo']},{hp['h2_mf_hi']}] "
+          f"interp_He=True non_ideal={hp['use_non_ideal']} hx_dT={hp['hx_dT']}")
     print("=" * 60)
 
-    base = _make_system_input()
+    base = _make_system_input(hp)
 
-    outer_bounds = [(40.0, 500.0), (800.0, 1100.0)]
+    outer_bounds = [
+        (hp["t_min_lo"], hp["t_min_hi"]),
+        (hp["t_max_lo"], hp["t_max_hi"]),
+    ]
     for _ in range(hp["n_t_q"]):
         outer_bounds.append((0.01, 0.99))
     for _ in range(hp["n_p_q"]):
         outer_bounds.append((0.01, 0.99))
-    outer_bounds.append((8000.0, 15000.0))
+    outer_bounds.append((hp["p_max_lo"], hp["p_max_hi"]))
+    outer_bounds.append((hp["p_min_lo"], hp["p_min_hi"]))
     dim = len(outer_bounds)
 
     import concurrent.futures, multiprocessing, random as _rnd_
@@ -764,8 +828,8 @@ def _run_layered(hp: dict, tag: str = "") -> None:
             p_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
                              for j in range(hp["n_p_q"]))
             idx += hp["n_p_q"]
-            p_max = round(row[idx])
-            tasks.append((t_min, t_max, t_q_vals, p_q_vals, p_max,
+            p_max = round(row[idx]); p_min = round(row[idx + 1])
+            tasks.append((t_min, t_max, t_q_vals, p_q_vals, p_max, p_min,
                           base, hp, 42 + i))
 
         lhs_results: list[LayerResult] = []
@@ -795,19 +859,18 @@ def _run_layered(hp: dict, tag: str = "") -> None:
             for q in r.p_q:
                 x.append(q)
             x.append(r.p_max)
+            x.append(r.p_min)
             pop.append(x)
         while len(pop) < hp['de_popsize']:
             pop.append([rng.uniform(lo[d], hi[d]) for d in range(dim)])
 
         g0_args = [(p, base, hp, 0) for p in pop]
         g0_futures = [ex.submit(_de_trial_worker, a) for a in g0_args]
-        g0_results = [f.result(timeout=600) for f in g0_futures]
-        scores = [r[0] for r in g0_results]
+        scores = [f.result(timeout=600) for f in g0_futures]
 
         best_idx = min(range(len(scores)), key=lambda i: scores[i])
         best_x = pop[best_idx][:]
         best_val = scores[best_idx]
-        best_inner = g0_results[best_idx][1]
         stall = 0
         n_evals = len(scores)
         conv_history: list[float] = [best_val]
@@ -828,18 +891,17 @@ def _run_layered(hp: dict, tag: str = "") -> None:
 
             trial_args = [(t, base, hp, 0) for _, t in trials]
             t_futures = [ex.submit(_de_trial_worker, a) for a in trial_args]
-            trial_results = [f.result(timeout=600) for f in t_futures]
-            n_evals += len(trial_results)
+            trial_scores = [f.result(timeout=600) for f in t_futures]
+            n_evals += len(trial_scores)
 
             improved = False
-            for (i, u), (us, u_result) in zip(trials, trial_results):
+            for (i, u), us in zip(trials, trial_scores):
                 if us < scores[i]:
                     pop[i] = u
                     scores[i] = us
                     if us < best_val:
                         best_val = us
                         best_x = u[:]
-                        best_inner = u_result
                         improved = True
                         stall = 0
             if not improved:
@@ -849,7 +911,7 @@ def _run_layered(hp: dict, tag: str = "") -> None:
             sys.stdout.write(f"  DE gen {gen+1:2d}: best={best_val:.5f} "
                              f"stall={stall}/{hp['de_popsize']*hp['de_maxiter']} "
                              f"t_max={best_x[1]:.0f} t_min={best_x[0]:.0f} "
-                             f"pmax={best_x[-1]:.0f}\n")
+                             f"pmax={best_x[-2]:.0f} pmin={best_x[-1]:.0f}\n")
             sys.stdout.flush()
 
             if stall >= hp["de_popsize"] * hp["de_maxiter"] * 2:
@@ -865,16 +927,31 @@ def _run_layered(hp: dict, tag: str = "") -> None:
     tq_out = tuple(round(best_x[idx + j], 4) for j in range(hp["n_t_q"]))
     idx += hp["n_t_q"]
     pq_out = tuple(round(best_x[idx + j], 4) for j in range(hp["n_p_q"]))
-    print(f"  t_max={best_x[1]:.0f}K  t_min={best_x[0]:.0f}K  p_max={best_x[-1]:.0f}kPa")
+    print(f"  t_max={best_x[1]:.0f}K  t_min={best_x[0]:.0f}K  "
+          f"p_max={best_x[-2]:.0f}kPa  p_min={best_x[-1]:.0f}kPa")
     print(f"  t_q={[f'{v:.3f}' for v in tq_out]}  p_q={[f'{v:.3f}' for v in pq_out]}")
-    print(f"  obj={best_val:.5f}  flows={[f'{v:.1f}' for v in best_inner.flows]} "
+    print(f"  obj={best_val:.5f}")
+
+    # ── 最终重建 + CoolProp 验证 ──
+    print("\n  [最终重建]")
+    try:
+        # 用最优参数在主进程重建一次，获取完整结果（无需 pickle 传输）
+        opt_result, _, _, _, _, _, _ = \
+            _rebuild_result(best_x, base, hp, use_coolprop=False)
+        best_inner = opt_result
+    except Exception:
+        best_inner = LayerResult(n=0, t_min=0, t_max=0, p_min=0, p_max=0,
+                                 t_q=(), p_q=(), flows=[], h2_mf=0,
+                                 obj=best_val, n_subcycles=0, n_evals=0, runtime=0)
+
+    print(f"    flows={[f'{v:.1f}' for v in best_inner.flows]} "
           f"H2={best_inner.h2_mf:.2f}kg/s  n_sc={best_inner.n_subcycles}")
 
     # ── CoolProp 验证 ──
     print("\n  [CoolProp 验证]")
     try:
         cp_result, _, cp_ir, cp_nr, cp_layer, _, _ = \
-            _rebuild_result(best_x, base, hp, best_inner, use_coolprop=True)
+            _rebuild_result(best_x, base, hp, use_coolprop=True)
         if cp_nr.nodes:
             cp_p_min = min(snap.P for _, snap in cp_nr.nodes)
             cp_p_max = max(snap.P for _, snap in cp_nr.nodes)
@@ -908,24 +985,28 @@ def _run_layered(hp: dict, tag: str = "") -> None:
 
     try:
         _, best_hx, ideal_rep, ni_rep, best_layer, _hots, _colds = \
-            _rebuild_result(best_x, base, hp, best_inner)
+            _rebuild_result(best_x, base, hp)
 
         # 理想 TS/PS
         _draw_cycle_ts_ps(ideal_rep, best_layer,
                           f"{tag} ideal", run_dir / f"ideal_ts_ps_{tag}.png")
-        # 非理想 TS/PS — 传入 ni_nodes 使子循环多边形对齐
-        _draw_cycle_ts_ps(ni_rep, best_layer,
-                          f"{tag} non-ideal", run_dir / f"nonideal_ts_ps_{tag}.png",
-                          ni_nodes=best_layer.non_ideal.nodes)
+        print(f"  理想 TS/PS: {run_dir / f'ideal_ts_ps_{tag}.png'}")
+
+        # 非理想 TS/PS
+        if hp["use_non_ideal"] and best_layer.non_ideal is not None:
+            _draw_cycle_ts_ps(ni_rep, best_layer,
+                              f"{tag} non-ideal", run_dir / f"nonideal_ts_ps_{tag}.png",
+                              ni_nodes=best_layer.non_ideal.nodes)
+            print(f"  非理想 TS/PS: {run_dir / f'nonideal_ts_ps_{tag}.png'}")
+        else:
+            print(f"  非理想 TS/PS: 跳过 (use_non_ideal=False)")
+
         # HX T-Q
         _draw_hx_tq(_hots, _colds, best_hx, run_dir / f"hx_tq_{tag}.png")
-
-        print(f"  理想 TS/PS: {run_dir / f'ideal_ts_ps_{tag}.png'}")
-        print(f"  非理想 TS/PS: {run_dir / f'nonideal_ts_ps_{tag}.png'}")
         print(f"  HX T-Q: {run_dir / f'hx_tq_{tag}.png'}")
         print(f"  HX单元={len(best_hx.units)} "
-              f"未匹配={float(best_hx.total_unmatched)/1e6:.3f}MW "
-              f"总匹配={best_hx.total_matched/1e6:.3f}MW")
+              f"未匹配={best_hx.total_unmatched:.0f}kW "
+              f"总匹配={best_hx.total_matched:.0f}kW")
     except Exception as e:
         import traceback
         print(f"  绘图异常: {e}")
@@ -942,5 +1023,7 @@ if __name__ == "__main__":
         test_layered_2p0t_long()
     elif len(sys.argv) > 1 and sys.argv[1] == "0p0t":
         test_layered_0p0t()
+    elif len(sys.argv) > 1 and sys.argv[1] == "wide":
+        test_layered_0p0t_wide()
     else:
         test_layered_optimization()
