@@ -1,6 +1,10 @@
-# `core/non_ideal_bias.py` 已知问题备忘
+# `core/` 已知问题备忘
 
-## 高严重
+> ✅ = 已修复
+
+## `non_ideal_bias.py`
+
+### 高严重
 
 ### 1. `_mechanical_step_known_to_unknown` — 反向行走效率逆推是近似
 **`line 581-585`**
@@ -161,6 +165,17 @@ edge_key_groups = mech_keys if kind == "mechanical" else heat_keys
 ---
 
 # `core/closed_cycle_layer.py` 低优问题备忘
+
+### ✅ C0a. `_rebuild_simplified` 不调用 `_invalidate_non_ideal()`
+**`line 842`** — 已修复：`b669576` 开头新增 `self._invalidate_non_ideal()`。
+
+### ✅ C0b. 子循环存在但重组后拓扑为空时静默
+**`line 860`** — 已修复：`b669576` `build_simplified_topology` 返回空边时发出 `RuntimeWarning`。
+
+### ✅ C0c. `sync_subcycle_mass_flows_to_subcycles` 无长度校验
+**`line 863`** — 已修复：`b669576` 开头新增长度校验抛出 `ValueError`。
+
+---
 
 ### C1. `_merge_chains_of_kind` 返回的 counter 被调用方丢弃
 **`line 635, 751, 762`**
