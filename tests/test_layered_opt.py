@@ -189,8 +189,8 @@ def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, h2_T_out: float,
                                       max_group_size=hp["hx_max_group_size"])
     unmatched_ratio = hx.total_unmatched / total_q
     num_unmatched = len(hx.unassigned_hots) + len(hx.unassigned_colds)
-    # 分阶段 merit: 最小化未匹配比(主) + 最少 HX 单元数 + 最少未匹配过程数(权重 1e-4)
-    obj = unmatched_ratio + 1e-4 * hx.num_units + 1e-4 * num_unmatched
+    # 分阶段 merit: 最小化未匹配比(主) + 最少未匹配过程数(权重 1e-3)
+    obj = unmatched_ratio + 1e-3 * num_unmatched
     return obj
 
 
@@ -970,9 +970,9 @@ def test_layered_1p1t_ideal() -> None:
 
 
 def test_layered_0p0t_hx1() -> None:
-    """0P0T HXmax=1 h2_T_out=600K p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000] H2∈[3,6]"""
+    """0P0T0S 理想 HXmax=1 H2固定4.3 h2_T_out∈[400,900] p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000]"""
     hp = {**_DEFAULT_HP,
-          "n_t_q": 0, "n_p_q": 0, "n_lhs": 30, "hx_dT": 10.0,
+          "n_t_q": 0, "n_p_q": 0, "n_s_q": 0, "n_lhs": 30, "hx_dT": 10.0,
           "hx_max_group_size": 1,
           "maxiter_inner": 10, "restarts_inner": 2,
           "de_popsize": 10, "de_maxiter": 25, "de_F": 0.8, "de_CR": 0.9,
@@ -981,18 +981,18 @@ def test_layered_0p0t_hx1() -> None:
           "t_max_lo": 800.0, "t_max_hi": 1100.0,
           "p_min_lo": 2000.0, "p_min_hi": 2000.0,
           "p_max_lo": 8000.0, "p_max_hi": 12000.0,
-          "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
-          "h2_T_out_lo": 600.0, "h2_T_out_hi": 600.0,
+          "h2_mf_lo": 4.3, "h2_mf_hi": 4.3,
+          "h2_T_out_lo": 400.0, "h2_T_out_hi": 900.0,
           "use_non_ideal": False,
           }
-    _run_layered(hp, tag="0P0T_HX1")
+    _run_layered(hp, tag="0P0T0S_HX1")
 
 
 def test_layered_0p1t_hx1() -> None:
-    """0T+1P HXmax=1 h2_T_out=600K p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000] H2∈[3,6]"""
+    """0T+1P+1S 理想 HXmax=1 H2固定4.3 h2_T_out∈[400,900] p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000]"""
     hp = {**_DEFAULT_HP,
-          "n_t_q": 0, "n_p_q": 1, "n_lhs": 40, "hx_dT": 10.0,
-          "hx_max_group_size": 1,
+          "n_t_q": 0, "n_p_q": 1, "n_s_q": 1, "n_lhs": 40, "hx_dT": 10.0,
+          "hx_max_group_size": 2,
           "maxiter_inner": 15, "restarts_inner": 3,
           "de_popsize": 12, "de_maxiter": 60, "de_F": 0.8, "de_CR": 0.9,
           "qstep": 0.001,
@@ -1000,11 +1000,11 @@ def test_layered_0p1t_hx1() -> None:
           "t_max_lo": 800.0, "t_max_hi": 1100.0,
           "p_min_lo": 2000.0, "p_min_hi": 2000.0,
           "p_max_lo": 8000.0, "p_max_hi": 12000.0,
-          "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
-          "h2_T_out_lo": 600.0, "h2_T_out_hi": 600.0,
+          "h2_mf_lo": 2.0, "h2_mf_hi": 5.5,
+          "h2_T_out_lo": 400.0, "h2_T_out_hi": 900.0,
           "use_non_ideal": False,
           }
-    _run_layered(hp, tag="0P1T_HX1")
+    _run_layered(hp, tag="0P1T_S1_HX2")
 
 
 def test_layered_0p0t_sq1() -> None:
