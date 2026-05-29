@@ -324,6 +324,27 @@ def build_node_edge_topology(
             grid.append(Node(index=idx, T=Tk, P=Pk, H=st["H"], S=st["S"], parent=None))
             idx += 1
 
+    # —— 熵序警告：(t_max, p_max) 的熵不应低于 (t_min, p_min)，否则 PS 平面子循环矩形可能不连通 ——
+    def _node_matches(n: Node, T: float, P: float) -> bool:
+        return abs(n.T - T) < 1e-9 * max(1.0, abs(T)) and abs(n.P - P) < 1e-9 * max(1.0, abs(P))
+
+    hot_hi: Node | None = None
+    cold_lo: Node | None = None
+    for node in grid:
+        if _node_matches(node, inp.t_max, inp.p_max):
+            hot_hi = node
+        if _node_matches(node, inp.t_min, inp.p_min):
+            cold_lo = node
+        if hot_hi is not None and cold_lo is not None:
+            break
+    if hot_hi is not None and cold_lo is not None and hot_hi.S < cold_lo.S:
+        warnings.warn(
+            f"S(t_max={inp.t_max:.1f}K, p_max={inp.p_max:.1f}kPa)={hot_hi.S:.3f} < "
+            f"S(t_min={inp.t_min:.1f}K, p_min={inp.p_min:.1f}kPa)={cold_lo.S:.3f}: "
+            "熵序反转可能导致子循环无法连通",
+            RuntimeWarning,
+        )
+
     # —— 二级等熵 + 机械边：沿每个一级点的 S 在压力轴上延伸，同 parent 的二级点按 P 排序连成 M* ——
     p_axis = build_axis(inp.p_min, inp.p_max, inp.p_quantiles)
     secondary: list[Node] = []

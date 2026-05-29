@@ -42,6 +42,7 @@ _DEFAULT_HP = {
     "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
     "mf_lo": 0.0, "mf_hi": 50.0,
     "n_workers": 6,
+    "use_interp_he": False,
     # 外层搜索边界
     "t_min_lo": 40.0, "t_min_hi": 500.0,
     "t_max_lo": 800.0, "t_max_hi": 1100.0,
@@ -183,8 +184,12 @@ def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, h2_T_out: float,
     if total_q < 1e-12:
         return 1.0
     hx = match_heat_exchanger_groups(hots, colds, dT_min=hp["hx_dT"],
-                                     max_group_size=hp["hx_max_group_size"])
-    return hx.total_unmatched / total_q
+                                      max_group_size=hp["hx_max_group_size"])
+    unmatched_ratio = hx.total_unmatched / total_q
+    num_unmatched = len(hx.unassigned_hots) + len(hx.unassigned_colds)
+    # 分阶段 merit: 最小化未匹配比(主) + 最少 HX 单元数 + 最少未匹配过程数(权重 1e-4)
+    obj = unmatched_ratio + 1e-4 * hx.num_units + 1e-4 * num_unmatched
+    return obj
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -205,25 +210,80 @@ def _inner_cma_fast(
     from core import InterpolatingHeliumSolver
 
     t0 = time.perf_counter()
-    he_solver = InterpolatingHeliumSolver(
-        T_min=tp_in.t_min, T_max=tp_in.t_max,
-        P_min=tp_in.p_min, P_max=tp_in.p_max,
-    )
-    he_solver._build()
+    use_he = hp.get("use_interp_he", True)
+    if use_he:
+        from core import InterpolatingHeliumSolver
+        he_solver = InterpolatingHeliumSolver(
+            T_min=tp_in.t_min, T_max=tp_in.t_max,
+            P_min=tp_in.p_min, P_max=tp_in.p_max,
+        )
+        he_solver._build()
 
     if layer is not None:
         base_layer = layer
+    elif use_he:
+        try:
+            base_layer = ClosedCycleLayer(tp_in, properties=he_solver)
+            if len(base_layer.subcycles) == 0:
+                base_layer = ClosedCycleLayer(tp_in)
+            else:
+                ref = ClosedCycleLayer(tp_in)
+                if len(ref.subcycles) != len(base_layer.subcycles):
+                    base_layer = ref
+        except Exception:
+            try:
+                base_layer = ClosedCycleLayer(tp_in)
+            except Exception:
+                runtime = time.perf_counter() - t0
+                return LayerResult(
+                    n=0, t_min=tp_in.t_min, t_max=tp_in.t_max,
+                    p_min=tp_in.p_min, p_max=tp_in.p_max,
+                    t_q=tp_in.t_quantiles, p_q=tp_in.p_quantiles,
+                    flows=[], h2_mf=hp["h2_mf_lo"], h2_T_out=hp["h2_T_out_lo"],
+                    obj=1.0, n_subcycles=0, n_evals=0, runtime=runtime,
+                ), None
     else:
-        base_layer = ClosedCycleLayer(tp_in, properties=he_solver)
-    if len(base_layer.subcycles) == 0:
-        # InterpHe 近似 S 值可能导致拓扑断裂，回退 CoolProp
-        base_layer = ClosedCycleLayer(tp_in)
+        try:
+            base_layer = ClosedCycleLayer(tp_in)
+        except Exception:
+            runtime = time.perf_counter() - t0
+            return LayerResult(
+                n=0, t_min=tp_in.t_min, t_max=tp_in.t_max,
+                p_min=tp_in.p_min, p_max=tp_in.p_max,
+                t_q=tp_in.t_quantiles, p_q=tp_in.p_quantiles,
+                flows=[], h2_mf=hp["h2_mf_lo"], h2_T_out=hp["h2_T_out_lo"],
+                obj=1.0, n_subcycles=0, n_evals=0, runtime=runtime,
+            ), None
     n_sc = len(base_layer.subcycles)
-    dim = n_sc + 2  # 子循环流量 + H2 流量 + h2_T_out
+    if n_sc == 0:
+        runtime = time.perf_counter() - t0
+        return LayerResult(
+            n=0, t_min=tp_in.t_min, t_max=tp_in.t_max,
+            p_min=tp_in.p_min, p_max=tp_in.p_max,
+            t_q=tp_in.t_quantiles, p_q=tp_in.p_quantiles,
+            flows=[], h2_mf=hp["h2_mf_lo"], h2_T_out=hp["h2_T_out_lo"],
+            obj=1.0, n_subcycles=0, n_evals=0, runtime=runtime,
+        ), base_layer
+    h2_fixed = hp["h2_mf_lo"] == hp["h2_mf_hi"]
+    h2_T_fixed = hp["h2_T_out_lo"] == hp["h2_T_out_hi"]
 
-    mf_lo = hp["mf_lo"]; mf_hi = hp["mf_hi"]
-    lo = [mf_lo] * n_sc + [hp["h2_mf_lo"], hp["h2_T_out_lo"]]
-    hi = [mf_hi] * n_sc + [hp["h2_mf_hi"], hp["h2_T_out_hi"]]
+    def _extract_extra(sol: list[float], idx: int) -> tuple[float, float]:
+        ei = idx
+        h2_mf = hp["h2_mf_lo"] if h2_fixed else sol[ei]; ei += 0 if h2_fixed else 1
+        h2_T_out = hp["h2_T_out_lo"] if h2_T_fixed else sol[ei]
+        return h2_mf, h2_T_out
+
+    dim = n_sc
+    lo = [hp["mf_lo"]] * n_sc
+    hi = [hp["mf_hi"]] * n_sc
+    if not h2_fixed:
+        dim += 1
+        lo.append(hp["h2_mf_lo"])
+        hi.append(hp["h2_mf_hi"])
+    if not h2_T_fixed:
+        dim += 1
+        lo.append(hp["h2_T_out_lo"])
+        hi.append(hp["h2_T_out_hi"])
     stds = [hp["sigma0"] * (hi[i] - lo[i]) for i in range(dim)]
     x0_init = [(lo[i] + hi[i]) / 2 for i in range(dim)]
 
@@ -255,8 +315,7 @@ def _inner_cma_fast(
             scores = []
             for sol in solutions:
                 flows = list(sol[:n_sc])
-                h2_mf = sol[n_sc]
-                h2_T_out = sol[n_sc + 1]
+                h2_mf, h2_T_out = _extract_extra(sol, n_sc)
                 try:
                     base_layer.subcycle_mass_flows = flows
                     base_layer.commit_subcycle_mass_flows_to_topology()
@@ -280,20 +339,21 @@ def _inner_cma_fast(
             if gen >= hp["maxiter_inner"] or stall >= hp["early_stop"] * len(solutions):
                 break
 
+        h2_val, h2tout_val = _extract_extra(global_best_x, n_sc)
         sys.stdout.write(
             f"    r{restart}: gen={gen} obj={global_best_val:.5f} "
             f"evals={total_evals} dim={dim} n_sc={n_sc} "
             f"best_flow_sum={sum(global_best_x[:n_sc]):.0f} "
-            f"H2={global_best_x[n_sc]:.1f} "
-            f"h2tout={global_best_x[n_sc+1]:.0f}\n"
+            f"H2={h2_val:.1f} h2tout={h2tout_val:.0f}\n"
         )
         sys.stdout.flush()
 
     flows = global_best_x[:n_sc]
     flow_step = hp["flow_step"]
     flows = [round(f / flow_step) * flow_step for f in flows]
-    h2_mf = round(global_best_x[n_sc] / hp["h2_step"]) * hp["h2_step"]
-    h2_T_out = round(global_best_x[n_sc + 1])
+    h2_mf, h2_T_out_unrounded = _extract_extra(global_best_x, n_sc)
+    h2_mf = round(h2_mf / hp["h2_step"]) * hp["h2_step"] if not h2_fixed else h2_mf
+    h2_T_out = round(h2_T_out_unrounded) if not h2_T_fixed else h2_T_out_unrounded
 
     try:
         base_layer.subcycle_mass_flows = flows
@@ -328,15 +388,34 @@ def _sample_worker(args: tuple) -> LayerResult:
     )
 
     from core import InterpolatingHeliumSolver
-    try:
-        _he = InterpolatingHeliumSolver(
-            T_min=t_min, T_max=t_max, P_min=p_min, P_max=p_max)
-        _he._build()
-        probe = ClosedCycleLayer(tp_in, properties=_he)
-        if len(probe.subcycles) == 0:
+    if hp.get("use_interp_he", True):
+        try:
+            _he = InterpolatingHeliumSolver(
+                T_min=t_min, T_max=t_max, P_min=p_min, P_max=p_max)
+            _he._build()
+            probe = ClosedCycleLayer(tp_in, properties=_he)
+            if len(probe.subcycles) == 0:
+                probe = ClosedCycleLayer(tp_in)
+            else:
+                ref = ClosedCycleLayer(tp_in)
+                if len(ref.subcycles) != len(probe.subcycles):
+                    probe = ref
+        except Exception:
+            try:
+                probe = ClosedCycleLayer(tp_in)
+            except Exception:
+                return LayerResult(n=0, t_min=t_min, t_max=t_max,
+                                   p_min=p_min, p_max=p_max,
+                                   t_q=t_q_vals, p_q=p_q_vals, flows=[], h2_mf=0,
+                                   obj=1e9, n_subcycles=0, n_evals=0, runtime=0)
+    else:
+        try:
             probe = ClosedCycleLayer(tp_in)
-    except Exception:
-        probe = ClosedCycleLayer(tp_in)
+        except Exception:
+            return LayerResult(n=0, t_min=t_min, t_max=t_max,
+                               p_min=p_min, p_max=p_max,
+                               t_q=t_q_vals, p_q=p_q_vals, flows=[], h2_mf=0,
+                               obj=1e9, n_subcycles=0, n_evals=0, runtime=0)
     if len(probe.subcycles) == 0:
         return LayerResult(n=0, t_min=t_min, t_max=t_max,
                            p_min=p_min, p_max=p_max,
@@ -375,14 +454,24 @@ def _de_trial_worker(args: tuple) -> float:
     )
     from core import InterpolatingHeliumSolver
     try:
-        _he = InterpolatingHeliumSolver(
-            T_min=t_min, T_max=t_max, P_min=p_min, P_max=p_max)
-        _he._build()
-        probe = ClosedCycleLayer(tp_in, properties=_he)
-        if len(probe.subcycles) == 0:
+        if hp.get("use_interp_he", True):
+            try:
+                _he = InterpolatingHeliumSolver(
+                    T_min=t_min, T_max=t_max, P_min=p_min, P_max=p_max)
+                _he._build()
+                probe = ClosedCycleLayer(tp_in, properties=_he)
+                if len(probe.subcycles) == 0:
+                    probe = ClosedCycleLayer(tp_in)
+                else:
+                    ref = ClosedCycleLayer(tp_in)
+                    if len(ref.subcycles) != len(probe.subcycles):
+                        probe = ref
+            except Exception:
+                probe = ClosedCycleLayer(tp_in)
+        else:
             probe = ClosedCycleLayer(tp_in)
     except Exception:
-        probe = ClosedCycleLayer(tp_in)
+        return 1e9
     if len(probe.subcycles) == 0:
         return 1e9
 
@@ -417,17 +506,30 @@ def _rebuild_result(x_outer: list[float], sys_inp: SystemInput,
         t_quantiles=tq, p_quantiles=pq,
     )
     from core import InterpolatingHeliumSolver
-    he_solver = InterpolatingHeliumSolver(
-        T_min=t_min, T_max=t_max, P_min=p_min, P_max=p_max)
-    he_solver._build()
-    layer = ClosedCycleLayer(tp_in, properties=he_solver)
-    if len(layer.subcycles) == 0:
+    try:
+        if hp.get("use_interp_he", True):
+            he_solver = InterpolatingHeliumSolver(
+                T_min=t_min, T_max=t_max, P_min=p_min, P_max=p_max)
+            he_solver._build()
+            layer = ClosedCycleLayer(tp_in, properties=he_solver)
+            if len(layer.subcycles) == 0:
+                layer = ClosedCycleLayer(tp_in)
+            else:
+                ref = ClosedCycleLayer(tp_in)
+                if len(ref.subcycles) != len(layer.subcycles):
+                    layer = ref
+        else:
+            layer = ClosedCycleLayer(tp_in)
+    except Exception:
         layer = ClosedCycleLayer(tp_in)
 
     result, layer = _inner_cma_fast(tp_in, sys_inp, hp, seed=0, layer=layer)
 
     if use_coolprop:
-        layer_cp = ClosedCycleLayer(tp_in)
+        try:
+            layer_cp = ClosedCycleLayer(tp_in)
+        except Exception:
+            return result, None, None, None, layer, [], []
         try:
             if len(layer_cp.subcycles) == len(result.flows):
                 layer_cp.subcycle_mass_flows = list(result.flows)
@@ -779,6 +881,120 @@ def test_layered_0p0t_wide() -> None:
     _run_layered(hp, tag="0P0T_wide")
 
 
+def test_layered_1p0t_wide() -> None:
+    """1P+0T 宽边界 + 无非理想 + CoolProp + 变量 H2。"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 0, "n_p_q": 1, "n_lhs": 80, "hx_dT": 10.0,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 20, "de_maxiter": 40, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001,
+          "t_min_lo": 50.0, "t_min_hi": 500.0,
+          "t_max_lo": 700.0, "t_max_hi": 1100.0,
+          "p_min_lo": 1000.0, "p_min_hi": 4000.0,
+          "p_max_lo": 6000.0, "p_max_hi": 15000.0,
+          "h2_mf_lo": 2.0, "h2_mf_hi": 6.0,
+          "use_non_ideal": False,
+          "use_interp_he": False,
+          "seed": 123,
+          }
+    _run_layered(hp, tag="1P0T_cp_s123")
+
+
+def test_layered_2p0t_ideal() -> None:
+    """2P+0T 理想 t_max∈[800,1100] t_min∈[50,400] p_min∈[2000,4000] p_max∈[8000,12000] H2∈[3,6] H2_T_out∈[400,900]"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 0, "n_p_q": 2, "n_lhs": 50, "hx_dT": 10.0,
+          "hx_max_group_size": 2,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 15, "de_maxiter": 40, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001,
+          "t_min_lo": 50.0, "t_min_hi": 400.0,
+          "t_max_lo": 800.0, "t_max_hi": 1100.0,
+          "p_min_lo": 2000.0, "p_min_hi": 4000.0,
+          "p_max_lo": 8000.0, "p_max_hi": 12000.0,
+          "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
+          "h2_T_out_lo": 400.0, "h2_T_out_hi": 900.0,
+          "use_non_ideal": False,
+           }
+    _run_layered(hp, tag="2P0T_HX2")
+
+
+def test_layered_2p1t_ideal() -> None:
+    """2P+1T 理想 t_max∈[800,1100] t_min∈[50,400] p_min∈[2000,4000] p_max∈[8000,12000] H2∈[3,6] HXmax=2"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 1, "n_p_q": 2, "n_lhs": 60, "hx_dT": 10.0,
+          "hx_max_group_size": 2,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 20, "de_maxiter": 40, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001,
+          "t_min_lo": 50.0, "t_min_hi": 400.0,
+          "t_max_lo": 800.0, "t_max_hi": 1100.0,
+          "p_min_lo": 2000.0, "p_min_hi": 4000.0,
+          "p_max_lo": 8000.0, "p_max_hi": 12000.0,
+          "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
+          "h2_T_out_lo": 400.0, "h2_T_out_hi": 900.0,
+          "use_non_ideal": False,
+           }
+    _run_layered(hp, tag="2P1T_HX2")
+
+
+def test_layered_1p1t_ideal() -> None:
+    """1P+1T 理想 t_max∈[800,1100] t_min∈[50,400] p_min∈[2000,4000] p_max∈[8000,12000] H2∈[3,6] HXmax=2"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 1, "n_p_q": 1, "n_lhs": 60, "hx_dT": 10.0,
+          "hx_max_group_size": 2,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 20, "de_maxiter": 40, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001,
+          "t_min_lo": 50.0, "t_min_hi": 400.0,
+          "t_max_lo": 800.0, "t_max_hi": 1100.0,
+          "p_min_lo": 2000.0, "p_min_hi": 4000.0,
+          "p_max_lo": 8000.0, "p_max_hi": 12000.0,
+          "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
+          "h2_T_out_lo": 400.0, "h2_T_out_hi": 900.0,
+          "use_non_ideal": False,
+          }
+    _run_layered(hp, tag="1P1T_HX2")
+
+
+def test_layered_0p0t_hx1() -> None:
+    """0P0T HXmax=1 h2_T_out=600K p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000] H2∈[3,6]"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 0, "n_p_q": 0, "n_lhs": 30, "hx_dT": 10.0,
+          "hx_max_group_size": 1,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 10, "de_maxiter": 25, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001,
+          "t_min_lo": 50.0, "t_min_hi": 400.0,
+          "t_max_lo": 800.0, "t_max_hi": 1100.0,
+          "p_min_lo": 2000.0, "p_min_hi": 2000.0,
+          "p_max_lo": 8000.0, "p_max_hi": 12000.0,
+          "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
+          "h2_T_out_lo": 600.0, "h2_T_out_hi": 600.0,
+          "use_non_ideal": False,
+          }
+    _run_layered(hp, tag="0P0T_HX1")
+
+
+def test_layered_0p1t_hx1() -> None:
+    """0T+1P HXmax=1 h2_T_out=600K p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000] H2∈[3,6]"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 0, "n_p_q": 1, "n_lhs": 40, "hx_dT": 10.0,
+          "hx_max_group_size": 1,
+          "maxiter_inner": 15, "restarts_inner": 3,
+          "de_popsize": 12, "de_maxiter": 60, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001,
+          "t_min_lo": 50.0, "t_min_hi": 400.0,
+          "t_max_lo": 800.0, "t_max_hi": 1100.0,
+          "p_min_lo": 2000.0, "p_min_hi": 2000.0,
+          "p_max_lo": 8000.0, "p_max_hi": 12000.0,
+          "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
+          "h2_T_out_lo": 600.0, "h2_T_out_hi": 600.0,
+          "use_non_ideal": False,
+          }
+    _run_layered(hp, tag="0P1T_HX1")
+
+
 def _run_layered(hp: dict, tag: str = "") -> None:
     hp = {**_DEFAULT_HP, **hp}
     tq_tag = f"{hp['n_t_q']}T{hp['n_p_q']}P"
@@ -790,7 +1006,7 @@ def _run_layered(hp: dict, tag: str = "") -> None:
           f"p_min∈[{hp['p_min_lo']},{hp['p_min_hi']}] "
           f"p_max∈[{hp['p_max_lo']},{hp['p_max_hi']}] "
           f"H2∈[{hp['h2_mf_lo']},{hp['h2_mf_hi']}] "
-          f"interp_He=True non_ideal={hp['use_non_ideal']} hx_dT={hp['hx_dT']}")
+          f"interp_He={hp.get('use_interp_he', False)} non_ideal={hp['use_non_ideal']} hx_dT={hp['hx_dT']}")
     print("=" * 60)
 
     base = _make_system_input(hp)
@@ -817,7 +1033,8 @@ def _run_layered(hp: dict, tag: str = "") -> None:
     with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
         # ── 阶段1: LHS 并行采样 ──
         print(f"\n  [阶段1] LHS {hp['n_lhs']} 点并行采样...")
-        lhs_samples = _lhs(hp["n_lhs"], outer_bounds, seed=42)
+        seed = hp.get("seed", 42)
+        lhs_samples = _lhs(hp["n_lhs"], outer_bounds, seed=seed)
         tasks = []
         for i, row in enumerate(lhs_samples):
             t_min = round(row[0]); t_max = round(row[1])
@@ -830,7 +1047,7 @@ def _run_layered(hp: dict, tag: str = "") -> None:
             idx += hp["n_p_q"]
             p_max = round(row[idx]); p_min = round(row[idx + 1])
             tasks.append((t_min, t_max, t_q_vals, p_q_vals, p_max, p_min,
-                          base, hp, 42 + i))
+                          base, hp, seed + i))
 
         lhs_results: list[LayerResult] = []
         futures = [ex.submit(_sample_worker, t) for t in tasks]
@@ -847,7 +1064,7 @@ def _run_layered(hp: dict, tag: str = "") -> None:
 
         # ── 阶段2: DE 并行评估 ──
         print(f"\n  [阶段2] DE 并行 (popsize={hp['de_popsize']}, maxiter={hp['de_maxiter']})...")
-        rng = _rnd_.Random(42)
+        rng = _rnd_.Random(seed)
         lo = [b[0] for b in outer_bounds]
         hi = [b[1] for b in outer_bounds]
 
