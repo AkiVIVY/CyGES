@@ -352,7 +352,40 @@ hot_utility  = max(0, -delta_Q) + max(0, delta_Q + Q_c_max - Q_h_max)
 
 ---
 
-## 12. 待办与约束（备忘）
+## 12. 串联夹点 HX 匹配（系列模式）
+
+`core/heat_exchanger.py` 中 `match_series_pinch()` 提供与星型匹配并行的另一种 HX 匹配方式。
+
+**核心逻辑：**
+1. 所有放热过程按 T_high 降序排列 → 串联为一条热流链
+2. 所有吸热过程按 T_high 降序排列 → 串联为一条冷流链
+3. `matched = min(ΣQ_hot, ΣQ_cold)`
+4. 在每条过程边界，线性插值检查对应 Q 位置的逆流温差
+5. 违规量累计为 `pinch_violation`
+
+**目标函数：** `obj = unmatched_ratio + 1e-2 * pinch_violation`
+
+**HXMatchResult** 新增字段 `pinch_violation: float = 0.0`。
+
+---
+
+## 13. S 分位节点
+
+`closed_cycle_layer.py` 中 `ClosedCycleTPInput.s_quantiles` 支持熵分位数。
+
+**构建流程：**
+1. Primary nodes 建成后计算 S_min/S_max
+2. 对每个 s_q ∈ s_quantiles，在每个 P 值处建 PS 延伸节点
+3. 节点标记 `parent="S"`，按 P 排序形成独立机械链
+4. 参与换热边构建，扩展子循环拓扑
+
+**Node.parent 类型** 扩展为 `int | str | None`。
+
+**优化管线** 中 s_q 与 t_q/p_q 平级，作为外层 DE 变量（区间 (0.01, 0.99)，步长 qstep=0.001）。
+
+---
+
+## 14. 待办与约束（备忘）
 
 - 非理想方程/约束装配、优化器：未实现。
 - HEN 边界：未实现。

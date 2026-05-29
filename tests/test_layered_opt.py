@@ -185,13 +185,22 @@ def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, h2_T_out: float,
     total_q = sum(abs(float(r.power_rate)) for r in hots + colds if r.power_rate)
     if total_q < 1e-12:
         return 1.0
-    hx = match_heat_exchanger_groups(hots, colds, dT_min=hp["hx_dT"],
-                                      max_group_size=hp["hx_max_group_size"])
-    unmatched_ratio = hx.total_unmatched / total_q
-    num_unmatched = len(hx.unassigned_hots) + len(hx.unassigned_colds)
-    # 分阶段 merit: 最小化未匹配比(主) + 最少未匹配过程数(权重 1e-3)
-    obj = unmatched_ratio + 1e-3 * num_unmatched
-    return obj
+
+    if hp.get("hx_series", False):
+        from core.heat_exchanger import match_series_pinch
+        hx = match_series_pinch(hots, colds, dT_min=hp["hx_dT"])
+        unmatched_ratio = hx.total_unmatched / total_q if total_q > 0 else 1.0
+        # 串联夹点: 全局功率差比例(主) + 夹点违规(1e-2)
+        obj = unmatched_ratio + 1e-2 * hx.pinch_violation
+        return obj
+    else:
+        hx = match_heat_exchanger_groups(hots, colds, dT_min=hp["hx_dT"],
+                                          max_group_size=hp["hx_max_group_size"])
+        unmatched_ratio = hx.total_unmatched / total_q
+        num_unmatched = len(hx.unassigned_hots) + len(hx.unassigned_colds)
+        # 分阶段 merit: 最小化未匹配比(主) + 最少未匹配过程数(权重 1e-3)
+        obj = unmatched_ratio + 1e-3 * num_unmatched
+        return obj
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -578,8 +587,12 @@ def _rebuild_result(x_outer: list[float], sys_inp: SystemInput,
     _, src_colds = convert_sources((), (cold_src,), props)
     hots[:0] = src_hots
     colds[:0] = src_colds
-    hx = match_heat_exchanger_groups(hots, colds, dT_min=hp["hx_dT"],
-                                     max_group_size=hp["hx_max_group_size"])
+    if hp.get("hx_series", False):
+        from core.heat_exchanger import match_series_pinch
+        hx = match_series_pinch(hots, colds, dT_min=hp["hx_dT"])
+    else:
+        hx = match_heat_exchanger_groups(hots, colds, dT_min=hp["hx_dT"],
+                                          max_group_size=hp["hx_max_group_size"])
     return result, hx, ideal_report, ni_report, layer, hots, colds
 
 
@@ -989,13 +1002,14 @@ def test_layered_0p0t_hx1() -> None:
 
 
 def test_layered_0p1t_hx1() -> None:
-    """0T+1P+1S 理想 HXmax=1 H2固定4.3 h2_T_out∈[400,900] p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000]"""
+    """1P+0T+1S 理想 串联夹点 H2∈[2,5.5] h2_T_out∈[400,900] p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000]"""
     hp = {**_DEFAULT_HP,
           "n_t_q": 0, "n_p_q": 1, "n_s_q": 1, "n_lhs": 40, "hx_dT": 10.0,
           "hx_max_group_size": 2,
           "maxiter_inner": 15, "restarts_inner": 3,
           "de_popsize": 12, "de_maxiter": 60, "de_F": 0.8, "de_CR": 0.9,
           "qstep": 0.001,
+          "hx_series": True,
           "t_min_lo": 50.0, "t_min_hi": 400.0,
           "t_max_lo": 800.0, "t_max_hi": 1100.0,
           "p_min_lo": 2000.0, "p_min_hi": 2000.0,
@@ -1004,26 +1018,45 @@ def test_layered_0p1t_hx1() -> None:
           "h2_T_out_lo": 400.0, "h2_T_out_hi": 900.0,
           "use_non_ideal": False,
           }
-    _run_layered(hp, tag="0P1T_S1_HX2")
+    _run_layered(hp, tag="1P0T1S_series")
 
 
-def test_layered_0p0t_sq1() -> None:
-    """0P0T + 1S HXmax=2 h2_T_out=600K p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000] H2∈[3,6]"""
+def test_layered_0p0t0s_h2_4() -> None:
+    """0P0T0S 理想 串联夹点 H2=4固定 h2_T_out∈[400,900] p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000]"""
     hp = {**_DEFAULT_HP,
-          "n_t_q": 0, "n_p_q": 0, "n_s_q": 1, "n_lhs": 40, "hx_dT": 10.0,
-          "hx_max_group_size": 2,
-          "maxiter_inner": 10, "restarts_inner": 2,
-          "de_popsize": 12, "de_maxiter": 40, "de_F": 0.8, "de_CR": 0.9,
+          "n_t_q": 0, "n_p_q": 0, "n_s_q": 0, "n_lhs": 30, "hx_dT": 10.0,
+          "hx_series": True,
+          "maxiter_inner": 15, "restarts_inner": 3,
+          "de_popsize": 10, "de_maxiter": 60, "de_F": 0.8, "de_CR": 0.9,
           "qstep": 0.001,
           "t_min_lo": 50.0, "t_min_hi": 400.0,
           "t_max_lo": 800.0, "t_max_hi": 1100.0,
           "p_min_lo": 2000.0, "p_min_hi": 2000.0,
           "p_max_lo": 8000.0, "p_max_hi": 12000.0,
-          "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
-          "h2_T_out_lo": 600.0, "h2_T_out_hi": 600.0,
+          "h2_mf_lo": 4.0, "h2_mf_hi": 4.0,
+          "h2_T_out_lo": 400.0, "h2_T_out_hi": 900.0,
           "use_non_ideal": False,
           }
-    _run_layered(hp, tag="0P0T_S1")
+    _run_layered(hp, tag="0P0T0S_H2-4")
+
+
+def test_layered_0p1t0s_h2_4() -> None:
+    """0T+1P+0S 理想 串联夹点 H2=4固定 h2_T_out∈[400,900] p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000]"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 0, "n_p_q": 1, "n_s_q": 0, "n_lhs": 40, "hx_dT": 10.0,
+          "hx_series": True,
+          "maxiter_inner": 20, "restarts_inner": 4,
+          "de_popsize": 15, "de_maxiter": 100, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001,
+          "t_min_lo": 50.0, "t_min_hi": 400.0,
+          "t_max_lo": 800.0, "t_max_hi": 1100.0,
+          "p_min_lo": 2000.0, "p_min_hi": 2000.0,
+          "p_max_lo": 8000.0, "p_max_hi": 12000.0,
+          "h2_mf_lo": 4.0, "h2_mf_hi": 4.0,
+          "h2_T_out_lo": 400.0, "h2_T_out_hi": 900.0,
+          "use_non_ideal": False,
+          }
+    _run_layered(hp, tag="1P0T0S_H2-4")
 
 
 def _run_layered(hp: dict, tag: str = "") -> None:

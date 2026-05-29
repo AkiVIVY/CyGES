@@ -47,6 +47,8 @@ class HXMatchResult:
     total_matched: float
     total_unmatched: float
     num_units: int
+    pinch_violation: float = 0.0
+    """串联夹点模式下的累计温差违规量 [K]；星型匹配模式下为 0。"""
 
 
 # ============================================================
@@ -680,4 +682,123 @@ def match_heat_exchanger_staged(
         total_matched=total_matched,
         total_unmatched=total_unmatched,
         num_units=len(all_units),
+    )
+
+
+# ============================================================
+# §8. 串联夹点匹配
+# ============================================================
+
+
+def _t_range(r: ProcessRecord) -> tuple[float, float]:
+    """返回 (T_high, T_low)。"""
+    T1 = float(r.tail_state.T)
+    T2 = float(r.head_state.T)
+    return max(T1, T2), min(T1, T2)
+
+
+def match_series_pinch(
+    hot_records: list[ProcessRecord],
+    cold_records: list[ProcessRecord],
+    dT_min: float = 10.0,
+) -> HXMatchResult:
+    """串联夹点匹配 — 全部放热 / 吸热过程按温度降序在 Q 上串联，全局匹配。
+
+    - 放热、吸热均按 T_high 降序排列，串联为一条总链
+    - 唯一换热器：matched = min(ΣQ_hot, ΣQ_cold)
+    - 在每个过程边界检查逆流温差，违规量计入惩罚
+    - 全局功率差比例作为主残差
+
+    :returns: HXMatchResult 含全局串联匹配结果。
+    """
+    hots = list(hot_records)
+    colds = list(cold_records)
+
+    if not hots and not colds:
+        return HXMatchResult(
+            units=(), unassigned_hots=(), unassigned_colds=(),
+            total_matched=0.0, total_unmatched=0.0, num_units=0,
+        )
+
+    # 均按 T_high 降序
+    hots.sort(key=lambda r: _t_range(r)[0], reverse=True)
+    colds.sort(key=lambda r: _t_range(r)[0], reverse=True)
+
+    total_hot_Q = sum(abs(float(r.power_rate)) for r in hots if r.power_rate)
+    total_cold_Q = sum(abs(float(r.power_rate)) for r in colds if r.power_rate)
+    total_matched = min(total_hot_Q, total_cold_Q)
+
+    # ── 构建累积 Q 边界序列 ──
+    # hot_bounds: [(cum_Q, T)] — 每个过程起、终点
+    hot_bounds: list[tuple[float, float]] = []
+    cum = 0.0
+    for r in hots:
+        Q = abs(float(r.power_rate)) if r.power_rate else 0.0
+        h_hi, h_lo = _t_range(r)
+        hot_bounds.append((cum, h_hi))   # 过程起点（高温端）
+        cum += Q
+        hot_bounds.append((cum, h_lo))   # 过程终点（低温端）
+
+    cold_bounds: list[tuple[float, float]] = []
+    cum = 0.0
+    for r in colds:
+        Q = abs(float(r.power_rate)) if r.power_rate else 0.0
+        c_hi, c_lo = _t_range(r)
+        cold_bounds.append((cum, c_hi))  # 过程起点（高温端）
+        cum += Q
+        cold_bounds.append((cum, c_lo))  # 过程终点（低温端）
+
+    # ── 夹点检查：在每个边界 Q 位置对比两侧温度 ──
+    def _t_at(q: float, bounds: list[tuple[float, float]]) -> float:
+        """线性插值返回 bounds 链上累计 Q 位置 q 处的温度。"""
+        for i in range(len(bounds) - 1):
+            q0, t0 = bounds[i]
+            q1, t1 = bounds[i + 1]
+            if abs(q1 - q0) < 1e-12:
+                continue
+            if q0 <= q <= q1 + 1e-9:
+                frac = (q - q0) / (q1 - q0)
+                return t0 + frac * (t1 - t0)
+        return bounds[-1][1]  # 超出范围取末端
+
+    pinch_violation = 0.0
+    # 对每条过程链的每一段区间做采样检查
+    for (q_hot, t_hot) in hot_bounds:
+        if q_hot > total_cold_Q + 1e-9:
+            break
+        # 逆流：冷流在相同累计 Q 位置的温度为在 cold_bounds 中的对应点
+        # 冷流高温端起于 Q=0，沿 Q 增加方向降温
+        t_cold = _t_at(q_hot, cold_bounds)
+        dT = t_hot - t_cold
+        if dT < dT_min:
+            pinch_violation += dT_min - dT
+
+    # 冷流边界也检查对应的热流位置
+    for (q_cold, t_cold) in cold_bounds:
+        if q_cold > total_hot_Q + 1e-9:
+            break
+        t_hot = _t_at(q_cold, hot_bounds)
+        dT = t_hot - t_cold
+        if dT < dT_min:
+            pinch_violation += dT_min - dT
+
+    total_q_sum = total_hot_Q + total_cold_Q
+    total_unmatched = abs(total_hot_Q - total_cold_Q)
+
+    unit = HXUnit(
+        hot_records=tuple(hots) if total_matched > 0 else (),
+        cold_records=tuple(colds) if total_matched > 0 else (),
+        matched_heat=total_matched,
+        residual=total_unmatched,
+        internal_pinch=0.0,
+    )
+
+    return HXMatchResult(
+        units=(unit,) if total_matched > 0 else (),
+        unassigned_hots=() if total_hot_Q <= total_cold_Q else (hots[-1],),
+        unassigned_colds=() if total_cold_Q <= total_hot_Q else (colds[-1],),
+        total_matched=total_matched,
+        total_unmatched=total_unmatched,
+        num_units=1 if total_matched > 0 else 0,
+        pinch_violation=pinch_violation,
     )
