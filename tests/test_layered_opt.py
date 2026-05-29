@@ -11,7 +11,7 @@ import math
 import random
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -43,6 +43,7 @@ _DEFAULT_HP = {
     "mf_lo": 0.0, "mf_hi": 50.0,
     "n_workers": 6,
     "use_interp_he": False,
+    "n_s_q": 0,
     # 外层搜索边界
     "t_min_lo": 40.0, "t_min_hi": 500.0,
     "t_max_lo": 800.0, "t_max_hi": 1100.0,
@@ -134,8 +135,9 @@ class LayerResult:
     p_max: float
     t_q: tuple[float, ...]
     p_q: tuple[float, ...]
-    flows: list[float]
-    h2_mf: float
+    s_q: tuple[float, ...] = ()
+    flows: list[float] = field(default_factory=list)
+    h2_mf: float = 0.0
     h2_T_out: float = 900.0
     obj: float = 1e9
     n_subcycles: int = 0
@@ -367,6 +369,7 @@ def _inner_cma_fast(
         n=n_sc, t_min=tp_in.t_min, t_max=tp_in.t_max,
         p_min=tp_in.p_min, p_max=tp_in.p_max,
         t_q=tp_in.t_quantiles, p_q=tp_in.p_quantiles,
+        s_q=tp_in.s_quantiles,
         flows=flows, h2_mf=h2_mf, h2_T_out=h2_T_out, obj=obj_final,
         n_subcycles=n_sc, n_evals=total_evals, runtime=runtime,
     ), base_layer
@@ -379,12 +382,13 @@ def _inner_cma_fast(
 
 def _sample_worker(args: tuple) -> LayerResult:
     """模块级 worker: 评估一个外层 LHS 样本。"""
-    (t_min, t_max, t_q_vals, p_q_vals, p_max, p_min, sys_inp, hp, seed) = args
+    (t_min, t_max, t_q_vals, p_q_vals, s_q_vals, p_max, p_min, sys_inp, hp, seed) = args
 
     tp_in = ClosedCycleTPInput(
         fluid="He", t_min=t_min, t_max=t_max,
         p_min=p_min, p_max=p_max,
         t_quantiles=t_q_vals, p_quantiles=p_q_vals,
+        s_quantiles=s_q_vals,
     )
 
     from core import InterpolatingHeliumSolver
@@ -444,6 +448,9 @@ def _de_trial_worker(args: tuple) -> float:
     pq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
                for j in range(hp["n_p_q"]))
     idx += hp["n_p_q"]
+    sq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
+               for j in range(hp["n_s_q"]))
+    idx += hp["n_s_q"]
     p_max = round(x_outer[idx])
     p_min = round(x_outer[idx + 1])
 
@@ -451,6 +458,7 @@ def _de_trial_worker(args: tuple) -> float:
         fluid="He", t_min=t_min, t_max=t_max,
         p_min=p_min, p_max=p_max,
         t_quantiles=tq, p_quantiles=pq,
+        s_quantiles=sq,
     )
     from core import InterpolatingHeliumSolver
     try:
@@ -497,6 +505,9 @@ def _rebuild_result(x_outer: list[float], sys_inp: SystemInput,
     pq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
                for j in range(hp["n_p_q"]))
     idx += hp["n_p_q"]
+    sq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
+               for j in range(hp["n_s_q"]))
+    idx += hp["n_s_q"]
     p_max = round(x_outer[idx])
     p_min = round(x_outer[idx + 1])
 
@@ -504,6 +515,7 @@ def _rebuild_result(x_outer: list[float], sys_inp: SystemInput,
         fluid="He", t_min=t_min, t_max=t_max,
         p_min=p_min, p_max=p_max,
         t_quantiles=tq, p_quantiles=pq,
+        s_quantiles=sq,
     )
     from core import InterpolatingHeliumSolver
     try:
@@ -995,9 +1007,30 @@ def test_layered_0p1t_hx1() -> None:
     _run_layered(hp, tag="0P1T_HX1")
 
 
+def test_layered_0p0t_sq1() -> None:
+    """0P0T + 1S HXmax=2 h2_T_out=600K p_min=2000kPa t_max∈[800,1100] t_min∈[50,400] p_max∈[8000,12000] H2∈[3,6]"""
+    hp = {**_DEFAULT_HP,
+          "n_t_q": 0, "n_p_q": 0, "n_s_q": 1, "n_lhs": 40, "hx_dT": 10.0,
+          "hx_max_group_size": 2,
+          "maxiter_inner": 10, "restarts_inner": 2,
+          "de_popsize": 12, "de_maxiter": 40, "de_F": 0.8, "de_CR": 0.9,
+          "qstep": 0.001,
+          "t_min_lo": 50.0, "t_min_hi": 400.0,
+          "t_max_lo": 800.0, "t_max_hi": 1100.0,
+          "p_min_lo": 2000.0, "p_min_hi": 2000.0,
+          "p_max_lo": 8000.0, "p_max_hi": 12000.0,
+          "h2_mf_lo": 3.0, "h2_mf_hi": 6.0,
+          "h2_T_out_lo": 600.0, "h2_T_out_hi": 600.0,
+          "use_non_ideal": False,
+          }
+    _run_layered(hp, tag="0P0T_S1")
+
+
 def _run_layered(hp: dict, tag: str = "") -> None:
     hp = {**_DEFAULT_HP, **hp}
     tq_tag = f"{hp['n_t_q']}T{hp['n_p_q']}P"
+    if hp.get("n_s_q", 0) > 0:
+        tq_tag += f"{hp['n_s_q']}S"
     print("=" * 60)
     print(f"分层优化 (LHS+DE并行) [{tag}] {tq_tag}")
     print(f"  LHS={hp['n_lhs']}点 DE={hp['de_popsize']}x{hp['de_maxiter']} "
@@ -1018,6 +1051,8 @@ def _run_layered(hp: dict, tag: str = "") -> None:
     for _ in range(hp["n_t_q"]):
         outer_bounds.append((0.01, 0.99))
     for _ in range(hp["n_p_q"]):
+        outer_bounds.append((0.01, 0.99))
+    for _ in range(hp["n_s_q"]):
         outer_bounds.append((0.01, 0.99))
     outer_bounds.append((hp["p_max_lo"], hp["p_max_hi"]))
     outer_bounds.append((hp["p_min_lo"], hp["p_min_hi"]))
@@ -1045,8 +1080,11 @@ def _run_layered(hp: dict, tag: str = "") -> None:
             p_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
                              for j in range(hp["n_p_q"]))
             idx += hp["n_p_q"]
+            s_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
+                             for j in range(hp["n_s_q"]))
+            idx += hp["n_s_q"]
             p_max = round(row[idx]); p_min = round(row[idx + 1])
-            tasks.append((t_min, t_max, t_q_vals, p_q_vals, p_max, p_min,
+            tasks.append((t_min, t_max, t_q_vals, p_q_vals, s_q_vals, p_max, p_min,
                           base, hp, seed + i))
 
         lhs_results: list[LayerResult] = []
@@ -1074,6 +1112,8 @@ def _run_layered(hp: dict, tag: str = "") -> None:
             for q in r.t_q:
                 x.append(q)
             for q in r.p_q:
+                x.append(q)
+            for q in getattr(r, 's_q', ()):
                 x.append(q)
             x.append(r.p_max)
             x.append(r.p_min)
@@ -1144,9 +1184,13 @@ def _run_layered(hp: dict, tag: str = "") -> None:
     tq_out = tuple(round(best_x[idx + j], 4) for j in range(hp["n_t_q"]))
     idx += hp["n_t_q"]
     pq_out = tuple(round(best_x[idx + j], 4) for j in range(hp["n_p_q"]))
+    idx += hp["n_p_q"]
+    sq_out = tuple(round(best_x[idx + j], 4) for j in range(hp["n_s_q"]))
     print(f"  t_max={best_x[1]:.0f}K  t_min={best_x[0]:.0f}K  "
           f"p_max={best_x[-2]:.0f}kPa  p_min={best_x[-1]:.0f}kPa")
     print(f"  t_q={[f'{v:.3f}' for v in tq_out]}  p_q={[f'{v:.3f}' for v in pq_out]}")
+    if hp["n_s_q"] > 0:
+        print(f"  s_q={[f'{v:.3f}' for v in sq_out]}")
     print(f"  obj={best_val:.5f}")
 
     # ── 最终重建 + CoolProp 验证 ──

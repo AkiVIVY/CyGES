@@ -60,6 +60,8 @@ class ClosedCycleTPInput:
     """[0,1] 分位，在 [t_min, t_max] 内线性插值；须互不重复（与端点亦不重复）。"""
     p_quantiles: Sequence[float] = field(default_factory=tuple)
     """[0,1] 分位，在 [p_min, p_max] 内线性插值；须互不重复（与端点亦不重复）。"""
+    s_quantiles: Sequence[float] = field(default_factory=tuple)
+    """[0,1] 分位，在 [S_min, S_max] 之间构建熵分位节点；S_min / S_max 取自主节点网格。"""
     subcycle_mass_flow_initial: float | None = None
     """子循环初始质量流量 [kg/s]；``None`` 时取 ``config.SUBCYCLE_INITIAL_MASS_FLOW_DEFAULT``。"""
 
@@ -80,7 +82,7 @@ class Node:
     P: float
     H: float
     S: float
-    parent: int | None = None
+    parent: int | str | None = None
     edge_up: str | None = None
     edge_down: str | None = None
     edge_left: str | None = None
@@ -345,12 +347,41 @@ def build_node_edge_topology(
             RuntimeWarning,
         )
 
-    # —— 二级等熵 + 机械边：沿每个一级点的 S 在压力轴上延伸，同 parent 的二级点按 P 排序连成 M* ——
+    # —— 熵 S 分位节点：沿每个分位熵值向所有压力延伸，同 parent="S" 的节点按 P 排序连成 M* ——
     p_axis = build_axis(inp.p_min, inp.p_max, inp.p_quantiles)
     secondary: list[Node] = []
+    s_secondary: list[Node] = []
     mechanical: dict[str, Edge] = {}
     m = 0
     idx = len(grid)
+
+    if inp.s_quantiles:
+        s_min = min(n.S for n in grid)
+        s_max = max(n.S for n in grid)
+        s_vals = [s_min + q * (s_max - s_min) for q in inp.s_quantiles]
+        for s_q in s_vals:
+            batch: list[Node] = []
+            for Pk in p_axis:
+                try:
+                    st = solver.state("PS", Pk, s_q)
+                    Tk = st["T"]
+                except Exception as exc:
+                    skipped_points.append(
+                        SkippedPoint(stage="secondary_PS", T=None, P=Pk, S=s_q, reason=repr(exc))
+                    )
+                    continue
+                if not (inp.t_min <= Tk <= inp.t_max):
+                    continue
+                node = Node(index=idx, T=Tk, P=Pk, H=st["H"], S=s_q, parent="S")
+                s_secondary.append(node)
+                batch.append(node)
+                idx += 1
+            batch.sort(key=lambda n: (n.P, n.index))
+            for a, b in zip(batch, batch[1:]):
+                mechanical[f"M{m}"] = oriented_edge("mechanical", a, b)
+                m += 1
+
+    # —— 二级等熵 + 机械边：沿每个一级点的 S 在压力轴上延伸，同 parent 的二级点按 P 排序连成 M* ——
 
     for prim in grid:
         batch: list[Node] = []
@@ -390,6 +421,8 @@ def build_node_edge_topology(
     for n in grid:
         nodes[n.index] = n
     for n in secondary:
+        nodes[n.index] = n
+    for n in s_secondary:
         nodes[n.index] = n
 
     # —— 换热边：等压线上按 S 排序，相邻节点连成 H*（沿熵增方向） ——
