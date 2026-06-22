@@ -64,9 +64,9 @@ _DEFAULT_HP = {
 
 
 def _make_h2_source(hp: dict, h2_mf: float, h2_T_out: float | None = None) -> ExternalSourceInput:
-    """用 hp 中的 H₂ 参数 + 可变流量/出口温构造冷源。"""
+    """用 hp 中的冷源参数 + 可变流量/出口温构造冷源。"""
     return ExternalSourceInput(
-        fluid="Hydrogen", mass_flow=h2_mf,
+        fluid=hp.get("cold_fluid", "Hydrogen"), mass_flow=h2_mf,
         T_in=hp["h2_T_in"], P_in=hp["h2_P_in"],
         T_out=h2_T_out if h2_T_out is not None else hp["h2_T_out"],
         P_out=hp["h2_P_out"],
@@ -87,7 +87,7 @@ def _make_system_input(
                               mass_flow=hp["air_mf"],
                               T_in=hp["air_T_in"], P_in=hp["air_P_in"],
                               T_out=hp["air_T_out"], P_out=hp["air_P_out"])
-    cold = ExternalSourceInput(fluid="Hydrogen", mass_flow=h2_mass_flow,
+    cold = ExternalSourceInput(fluid=hp.get("cold_fluid", "Hydrogen"), mass_flow=h2_mass_flow,
                                T_in=hp["h2_T_in"], P_in=hp["h2_P_in"],
                                T_out=hp["h2_T_out"], P_out=hp["h2_P_out"])
     cycle_input = ClosedCycleTPInput(
@@ -195,6 +195,16 @@ def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, h2_T_out: float,
         from core.postprocess import analyze_pinch
         pinch = analyze_pinch(colds, hots, hp["hx_dT"], props)
         obj = (pinch.hot_utility_demand + pinch.cold_utility_demand) / q_source
+        return obj
+    elif obj_mode == "eff_pinch":
+        from core.postprocess import analyze_pinch
+        pinch = analyze_pinch(colds, hots, hp["hx_dT"], props)
+        util = pinch.hot_utility_demand + pinch.cold_utility_demand
+        q_cold = sum(abs(float(r.power_rate)) for r in src_colds if r.power_rate)
+        eta = (q_source - q_cold) / q_source if q_source > 1e-12 else 0.0
+        penalty_w = hp.get("penalty_w", 100.0)
+        util_tol = hp.get("util_tol", 1.0)
+        obj = -eta + penalty_w * max(0, util - util_tol) / q_source
         return obj
     elif obj_mode == "series":
         from core.heat_exchanger import match_series_pinch
@@ -987,7 +997,7 @@ def _rebuild_result(x_outer: list[float], sys_inp: SystemInput,
     hots[:0] = src_hots
     colds[:0] = src_colds
     obj_mode = hp.get("obj_mode", "series" if hp.get("hx_series") else "group")
-    if obj_mode == "pinch":
+    if obj_mode in ("pinch", "eff_pinch"):
         from core.postprocess import analyze_pinch
         pinch_result = analyze_pinch(colds, hots, hp["hx_dT"], props)
         hx = pinch_result
@@ -2711,30 +2721,47 @@ def _run_layered(hp: dict, tag: str = "") -> None:
         # ── 阶段1: LHS 并行采样 ──
         print(f"\n  [阶段1] LHS {hp['n_lhs']} 点并行采样...")
         seed = hp.get("seed", 42)
-        lhs_samples = _lhs(hp["n_lhs"], outer_bounds, seed=seed)
+        # ── 熵预检：跳过 S(t_max,p_max) < S(t_min,p_min) 的无效样本 ──
+        from core import PropertyRegistry
+        _pre_props = PropertyRegistry()
+        _pre_fluid = "He"
         tasks = []
-        for i, row in enumerate(lhs_samples):
-            t_min = round(row[0]); t_max = round(row[1])
-            idx = 2
-            t_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
-                             for j in range(hp["n_t_q"]))
-            idx += hp["n_t_q"]
-            p_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
-                             for j in range(hp["n_p_q"]))
-            idx += hp["n_p_q"]
-            s_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
-                             for j in range(hp["n_s_q"]))
-            idx += hp["n_s_q"]
-            p_max = round(row[idx]); p_min = round(row[idx + 1])
-            tasks.append((t_min, t_max, t_q_vals, p_q_vals, s_q_vals, p_max, p_min,
-                          base, hp, seed + i))
+        _lhs_seed = seed
+        _target_tasks = max(hp['n_lhs'], hp.get('de_popsize', 15))
+        while len(tasks) < _target_tasks:
+            lhs_samples = _lhs(hp["n_lhs"], outer_bounds, seed=_lhs_seed)
+            _lhs_seed += 1
+            for i, row in enumerate(lhs_samples):
+                if len(tasks) >= _target_tasks:
+                    break
+                t_min = round(row[0]); t_max = round(row[1])
+                idx = 2
+                t_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
+                                 for j in range(hp["n_t_q"]))
+                idx += hp["n_t_q"]
+                p_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
+                                 for j in range(hp["n_p_q"]))
+                idx += hp["n_p_q"]
+                s_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
+                                 for j in range(hp["n_s_q"]))
+                idx += hp["n_s_q"]
+                p_max = round(row[idx]); p_min = round(row[idx + 1])
+                try:
+                    s_top = _pre_props(_pre_fluid, "TP", float(t_max), float(p_max))["S"]
+                    s_bot = _pre_props(_pre_fluid, "TP", float(t_min), float(p_min))["S"]
+                    if s_top < s_bot:
+                        continue
+                except Exception:
+                    continue
+                tasks.append((t_min, t_max, t_q_vals, p_q_vals, s_q_vals, p_max, p_min,
+                              base, hp, seed + len(tasks)))
 
-        lhs_results: list[LayerResult] = []
-        futures = [ex.submit(_sample_worker, t) for t in tasks]
-        for fut in futures:
-            r = fut.result(timeout=600)
-            if r.obj < 1e8 and r.n_subcycles > 0:
-                lhs_results.append(r)
+            lhs_results: list[LayerResult] = []
+            futures = [ex.submit(_sample_worker, t) for t in tasks]
+            for fut in futures:
+                r = fut.result(timeout=600)
+                if r.n_subcycles > 0:
+                    lhs_results.append(r)
 
         lhs_objs = sorted(lhs_results, key=lambda r: r.obj)
         if not lhs_objs:
@@ -2824,7 +2851,7 @@ def _run_layered(hp: dict, tag: str = "") -> None:
             print(f"    CoolProp 验证失败: {e}")
 
     # ── 绘图 ──
-    run_dir = TESTS_DIR / "run_layered_fast"
+    run_dir = Path(hp.get("out_dir", TESTS_DIR / "run_layered_fast"))
     run_dir.mkdir(parents=True, exist_ok=True)
 
     matplotlib = pytest.importorskip("matplotlib")
@@ -2834,7 +2861,12 @@ def _run_layered(hp: dict, tag: str = "") -> None:
     fig1, ax1 = plt.subplots(figsize=(8, 4))
     ax1.plot(range(len(conv_history)), conv_history, "o-", ms=4, color="tab:blue")
     ax1.axhline(y=best_val, color="tab:red", lw=1, ls="--", label=f"best={best_val:.5f}")
-    ylabel = "obj (utility_demand/q_source)" if obj_mode_label == "pinch" else "obj (unmatched/total_Q)"
+    if obj_mode_label == "eff_pinch":
+        ylabel = "obj = -η"
+    elif obj_mode_label == "pinch":
+        ylabel = "obj (utility_demand/q_source)"
+    else:
+        ylabel = "obj (unmatched/total_Q)"
     ax1.set_xlabel("DE generation"); ax1.set_ylabel(ylabel)
     ax1.set_title(f"{'TPE' if outer_method == 'tpe' else 'DE'} convergence [{tag}] {tq_tag}")
     ax1.legend(); ax1.grid(True, alpha=0.2)
@@ -2867,6 +2899,13 @@ def _run_layered(hp: dict, tag: str = "") -> None:
             print(f"  夹点 T-Q: {run_dir / f'pinch_tq_{tag}.png'}")
             print(f"  热公用={best_hx.hot_utility_demand:.0f}kW  "
                   f"冷公用={best_hx.cold_utility_demand:.0f}kW")
+        elif obj_mode == "eff_pinch":
+            _draw_pinch_tq(_hots, _colds, best_hx, hp["hx_dT"],
+                           run_dir / f"pinch_tq_{tag}.png")
+            print(f"  夹点 T-Q: {run_dir / f'pinch_tq_{tag}.png'}")
+            print(f"  热公用={best_hx.hot_utility_demand:.0f}kW  "
+                  f"冷公用={best_hx.cold_utility_demand:.0f}kW  "
+                  f"η={-best_val:.4f}")
         else:
             _draw_hx_tq(_hots, _colds, best_hx, run_dir / f"hx_tq_{tag}.png")
             print(f"  HX T-Q: {run_dir / f'hx_tq_{tag}.png'}")
@@ -2878,7 +2917,155 @@ def _run_layered(hp: dict, tag: str = "") -> None:
         print(f"  绘图异常: {e}")
         traceback.print_exc()
 
+    # ── 持久化结果 ──
+    if hp.get("save_csv", True):
+        _save_optimization_result(
+            run_dir=run_dir,
+            tag=tag,
+            obj_mode=obj_mode_label,
+            best_val=best_val,
+            best_x=best_x,
+            tq_out=tq_out,
+            pq_out=pq_out,
+            sq_out=sq_out,
+            best_inner=best_inner,
+            best_hx=best_hx,
+            t_total=t_total,
+            ni_rep=ni_rep,
+            hots=_hots,
+            colds=_colds,
+        )
+
     assert best_val < 1e3
+
+
+def _save_optimization_result(
+    run_dir: Path,
+    tag: str,
+    obj_mode: str,
+    best_val: float,
+    best_x: list[float],
+    tq_out: tuple,
+    pq_out: tuple,
+    sq_out: tuple,
+    best_inner: LayerResult,
+    best_hx,
+    t_total: float,
+    ni_rep,
+    hots: list,
+    colds: list,
+) -> None:
+    """将优化结果追加写入 CSV 和 JSON，同时保存全部换热/机械过程。"""
+    import csv, json
+
+    hot_util = getattr(best_hx, "hot_utility_demand", None)
+    cold_util = getattr(best_hx, "cold_utility_demand", None)
+    if hot_util is not None:
+        hot_util = round(hot_util, 1)
+    if cold_util is not None:
+        cold_util = round(cold_util, 1)
+
+    row = {
+        "tag": tag,
+        "obj_mode": obj_mode,
+        "H2_kg_s": round(best_inner.h2_mf, 2),
+        "h2_T_out_K": round(best_inner.h2_T_out, 1),
+        "t_min_K": round(best_x[0], 1),
+        "t_max_K": round(best_x[1], 1),
+        "p_max_kPa": round(best_x[-2], 1),
+        "p_min_kPa": round(best_x[-1], 1),
+        "p_q": ",".join(f"{v:.3f}" for v in pq_out) if pq_out else "",
+        "s_q": ",".join(f"{v:.3f}" for v in sq_out) if sq_out else "",
+        "t_q": ",".join(f"{v:.3f}" for v in tq_out) if tq_out else "",
+        "n_sc": best_inner.n_subcycles,
+        "sum_flow_kg_s": round(sum(best_inner.flows), 1),
+        "flows": ",".join(f"{v:.1f}" for v in best_inner.flows),
+        "hot_util_kW": hot_util,
+        "cold_util_kW": cold_util,
+        "obj": round(best_val, 6),
+        "time_s": round(t_total, 1),
+        "n_evals": best_inner.n_evals,
+    }
+
+    # ── 收集所有过程（换热 + 机械）──
+    processes: list[dict] = []
+    process_rows: list[dict] = []
+
+    def _rec_from(rec, is_source: bool = False):
+        tail = rec.tail_state; head = rec.head_state
+        t_lo = min(tail.T, head.T); t_hi = max(tail.T, head.T)
+        mf = abs(float(rec.mass_flow)) if rec.mass_flow else None
+        pr = float(rec.power_rate) if rec.power_rate else None
+        pr_abs = abs(pr) if pr else None
+        return {
+            "edge_key": rec.edge_key,
+            "kind": rec.kind,
+            "category": rec.category.name if rec.category else "",
+            "fluid": getattr(rec, "fluid", ""),
+            "T_lo_K": round(t_lo, 1), "T_hi_K": round(t_hi, 1),
+            "P_tail_kPa": round(tail.P, 1),
+            "P_head_kPa": round(head.P, 1),
+            "S_tail_kJkgK": round(tail.S, 4),
+            "S_head_kJkgK": round(head.S, 4),
+            "H_tail_kJkg": round(tail.H, 4),
+            "H_head_kJkg": round(head.H, 4),
+            "power_kW": round(pr_abs, 1) if pr_abs else None,
+            "power_signed_kW": round(pr, 1) if pr else None,
+            "mass_flow_kg_s": round(mf, 3) if mf else None,
+            "is_source": is_source,
+        }
+
+    # 循环内部过程
+    for _, rec in ni_rep.by_edge:
+        d = _rec_from(rec)
+        processes.append(d)
+        process_rows.append(d)
+
+    # 外部源
+    if hots and hots[0] != ni_rep.by_edge[0][1] if ni_rep.by_edge else True:
+        d = _rec_from(hots[0], is_source=True)
+        processes.append(d)
+        process_rows.append(d)
+    if colds and hots and len(colds) > 0:
+        cold_src = colds[0]
+        if not any(cold_src.edge_key == p.get("edge_key") for p in processes):
+            d = _rec_from(cold_src, is_source=True)
+            processes.append(d)
+            process_rows.append(d)
+
+    # ── 写 processes.csv ──
+    proc_csv_path = run_dir / "processes.csv"
+    write_proc_header = not proc_csv_path.exists()
+    with open(proc_csv_path, "a", newline="") as f:
+        if process_rows:
+            fieldnames = ["tag"] + list(process_rows[0].keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_proc_header:
+                writer.writeheader()
+            for prw in process_rows:
+                writer.writerow({"tag": tag, **prw})
+
+    # ── 写 results.csv ──
+    csv_path = run_dir / "results.csv"
+    write_header = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+    # ── 写 results.json ──
+    json_path = run_dir / "results.json"
+    existing = []
+    if json_path.exists():
+        with open(json_path, "r") as f:
+            existing = json.load(f)
+    row["processes"] = processes
+    existing.append(row)
+    with open(json_path, "w") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False, default=str)
+
+    print(f"  结果已保存: {csv_path}, {proc_csv_path}")
 
 
 def test_h2_scan() -> None:
