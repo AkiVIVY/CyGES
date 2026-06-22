@@ -358,6 +358,9 @@ def _inner_cma_fast(
             total_evals += len(solutions)
             gen += 1
 
+            if es.sigma < 0.5:
+                break
+
             improved = False
             for s, sc in zip(solutions, scores):
                 if sc < global_best_val:
@@ -367,7 +370,7 @@ def _inner_cma_fast(
                     stall = 0
             if not improved:
                 stall += 1
-            if gen >= hp["maxiter_inner"] or stall >= hp["early_stop"] * len(solutions):
+            if gen >= hp["maxiter_inner"] or stall >= 3 * len(solutions):
                 break
 
         h2_val, h2tout_val = _extract_extra(global_best_x, n_sc)

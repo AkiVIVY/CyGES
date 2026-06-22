@@ -339,16 +339,23 @@ class PropertyRegistry:
         h = props.enthalpy("He", 300, 101.325)         # → float
     """
 
-    __slots__ = ("_solvers",)
+    __slots__ = ("_solvers", "_cache")
 
     def __init__(self) -> None:
         self._solvers: dict[str, CoolPropFluidPropertySolver] = {}
+        self._cache: dict[tuple[Any, ...], ThermoStateTPHS] = {}
 
     def __call__(self, fluid: str, pair: PropertyPair, x: float, y: float) -> ThermoStateTPHS:
         """``(fluid, pair, x, y) → ThermoStateTPHS``，匹配原 ``ThermoLookup`` 签名。"""
+        key = (fluid, pair, round(x, 4), round(y, 4))
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
         if fluid not in self._solvers:
             self._solvers[fluid] = CoolPropFluidPropertySolver(fluid)
-        return self._solvers[fluid].state(pair, x, y)  # type: ignore[arg-type]
+        val = self._solvers[fluid].state(pair, x, y)  # type: ignore[arg-type]
+        self._cache[key] = val
+        return val
 
     def enthalpy(self, fluid: str, T: float, P: float) -> float:
         """``(fluid, T, P) → H``，匹配原 ``EnthalpyLookup`` 签名。"""
