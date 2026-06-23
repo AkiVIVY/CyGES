@@ -27,7 +27,7 @@ CyGES/
 │   ├── postprocess.py           # T-Q 构建 + 夹点分析 (build_tq / analyze_pinch)
 │   ├── heat_exchanger.py        # HX 匹配：星型拓扑 + 串联夹点(match_series_pinch)
 │   ├── system.py                # 系统层：Pipeline + analyze_system_heat (解耦)
-│   └── fluid_property_solver.py # 物性：PropertyRegistry + InterpolatingHeliumSolver
+│   └── fluid_property_solver.py # 物性：PropertyRegistry(含memo缓存) + InterpolatingHeliumSolver
 ├── optimize/
 │   ├── solver.py                # Optimizer: CMA-ES(BIPOP)+DE, 高斯基编码, 并行
 │   ├── objective.py             # @register 目标函数注册表（含 hx_unmatched）
@@ -38,7 +38,10 @@ CyGES/
 │   ├── test_optimize.py        # 优化测试 + Excel 日志 + run_XXX 输出
 │   ├── test_optimize_hx.py     # HX 匹配优化: 4 图 + dT_min 参数化
 │   ├── test_hx_match.py        # HX 匹配单元测试
-│   └── test_layered_opt.py     # 分层优化: LHS+DE外层 + CMA内层, TS/PS/HX图
+│   ├── test_layered_opt.py     # 分层优化: LHS+DE外层 + CMA/L-BFGS-B内层, TS/PS/HX图
+│   ├── test_inner_compare.py   # 内层方法对比: CMA-ES vs L-BFGS-B (多起点LHS)
+│   ├── test_outer_quantile_opt.py # 外层分位点优化: 网格扫描 + L-BFGS-B中心验证
+│   └── optimization_example.py # 效率优化示例: CH4冷源, η最大化
 ├── docs/architecture.md
 │   └── core_bugs.md            # 已知问题备忘
 └── AGENTS.md                   # 本文件
@@ -56,14 +59,32 @@ CyGES/
 - 性能统计：`ProcessRecord`/`CyclePerformanceReport`（纯计算，零外部依赖）。
 - T-Q 构建 + 夹点分析：`build_heat_tq_curves`、`compute_pinch`（底层）、`analyze_pinch`（高层）。
 - 系统集成：`SystemPipeline.run(props, layers=...)` 产纯数据，支持预建 layer 复用拓扑；`analyze_system_heat(raw, inp, props)` 独立做夹点。
-- 多工质：`PropertyRegistry`（自动缓存 CoolProp 求解器）。
+- 多工质：`PropertyRegistry` 含 memo 缓存 `(fluid, pair, x, y)` 去重；冷源支持任意 CoolProp 流体（`cold_fluid` 参数）。
 - 物性加速：`InterpolatingHeliumSolver`（通过 `use_interp_he` 开关启用，默认关闭）。
-- **HX 串联夹点匹配**：`match_series_pinch()` — 所有放热/吸热过程按温度降序在 Q 上串联为单一逆流单元，在每条过程边界检查 dT_min 违规。与星型匹配并行共存，通过 `hx_series=True` 开关切换。
-  - 目标函数：`obj = unmatched_ratio + 1e-2 * pinch_violation`（串联模式）
-  - 目标函数：`obj = unmatched_ratio + 1e-3 * num_unmatched`（星型模式）
+- **HX 串联夹点匹配**：`match_series_pinch()` — 所有放热/吸热过程按温度降序在 Q 上串联为单一逆流单元，在每条过程边界检查 dT_min 违规。
 - 星型 HX 匹配：`match_heat_exchanger_groups()` / `match_constructive()` / `match_heat_exchanger_staged()`。
-- 分层优化 `test_layered_opt.py`：外层 LHS+DE 搜索拓扑参数（含 s_q），内层 CMA 复用固定拓扑优化流量 + H2 + h2_T_out。支持 `h2_T_out` 固定、`h2_mf` 固定等模式。`_DEFAULT_HP` 集中所有可调参数。
-- 可视化：理想/非理想 TS/PS（子循环多边形叠加）、HX T-Q（概览 + 每单元逆流）、DE 收敛曲线。
+- **分层优化** `test_layered_opt.py`：外层 LHS+DE 搜索拓扑参数（含 s_q），内层支持三种方法（CMA-ES / L-BFGS-B / hybrid 两阶段），`_DEFAULT_HP` 集中所有可调参数。
+- **内层 L-BFGS-B 多起点优化**：LHS 采样初始点 + best-track 记录最小值 + scipy L-BFGS-B（`ftol=1e-8`）+ 多进程并行（`w=8` 确定性验证通过）。
+- **Smooth softplus 惩罚**：`log(1+exp(k*(util-tol)))/k` 替代不可微 ReLU，使 L-BFGS-B 梯度法可用；`penalty_k=10`。
+- **目标函数模式**：`_eval_fast` 支持 4 种 `obj_mode`。
+- 可视化：理想/非理想 TS/PS（子循环多边形叠加）、HX T-Q（概览 + 每单元逆流）、DE 收敛曲线、夹点复合曲线。
+
+**目标函数模式**
+
+| obj_mode | 公式 | 用途 |
+|------|------|------|
+| `group` | `unmatched_ratio + 1e-3 * num_unmatched` | 星型 HX 匹配（默认） |
+| `series` | `unmatched_ratio + 1e-2 * pinch_violation` | 串联夹点 HX 匹配 |
+| `pinch` | `(hot_util + cold_util) / q_source` | 直接最小化公用工程量 |
+| `eff_pinch` | `-η + penalty_w * softplus(util,tol,k) / q_source` | 最大效率 + 公用工程容差 |
+
+**内层优化方法**
+
+| inner_method | 说明 |
+|------|------|
+| `cma` | CMA-ES (BIPOP) + sigma 早停（σ<0.5, stall=3×popsize） |
+| `lbfgsb` | L-BFGS-B + LHS 多起点 + best-track + 并行（推荐） |
+| `hybrid` | CMA 粗搜 + L-BFGS-B 精搜索（两阶段） |
 
 **HX 匹配模式**
 
@@ -84,21 +105,27 @@ CyGES/
 
 **夹点分析与管线解耦**：`SystemPipeline.run()` 产纯数据，`analyze_system_heat()` 独立做夹点。
 
-**高斯基编码**：子循环流量由 PS 空间上的高斯核加权和生成，维度固定，与子循环数无关。
+**高斯基编码**：子循环流量由 PS 空间上的高斯核加权和生成，维度固定，与子循环数无关。**优化器层已去除量化步长**（flow_step/h2_step/qstep），直接使用连续值。
 
 **离散化在优化器层**：流量/分位/T 边界步长全在 `Optimizer` 中控制。
 
-**S 分位节点**：`ClosedCycleTPInput.s_quantiles` 与 t_quantiles/p_quantiles 平级。S 分位节点由 primary nodes 的 S_min/S_max 线性插值得到，对每个 P 轴 做 PS 延伸（`solver.state("PS", P, S_q)`），`parent="S"`。新节点通过同 parent 的 P 排序链形成机械边，并参与换热边构建。S 分位点的离散化步长与 T/P 分位共用 `qstep`。
+**S 分位节点**：`ClosedCycleTPInput.s_quantiles` 与 t_quantiles/p_quantiles 平级。S 分位节点由 primary nodes 的 S_min/S_max 线性插值得到，对每个 P 轴做 PS 延伸（`solver.state("PS", P, S_q)`），`parent="S"`。新节点通过同 parent 的 P 排序链形成机械边，并参与换热边构建。
 
 **串联夹点匹配**：所有过程按 T_high 降序排列，在累计 Q 上构成两条链（hots + colds 均降序）。单一单元检查每个过程边界的逆流温差。目标函数 = `unmatched_ratio + 1e-2*pinch_violation`，直接暴露系统级的功率不平衡与温差违规。
 
-**分层优化**：外层 LHS/DE 搜索拓扑参数（t_min/t_max/p_min/p_max/t_q/p_q/s_q），内层 CMA 在固定拓扑下优化流量 + H2 + h2_T_out。支持 `h2_T_fixed`（`h2_T_out_lo==h2_T_out_hi`）和 `h2_fixed`（`h2_mf_lo==h2_mf_hi`）模式，自动调整 CMA 维度。`LayerResult` 数据类含 `s_q` 字段。
+**分层优化**：外层 LHS/DE 搜索拓扑参数（t_min/t_max/p_min/p_max/t_q/p_q/s_q），内层在固定拓扑下优化流量 + H2 + h2_T_out。支持 `h2_T_fixed` 和 `h2_fixed` 模式。`_DEFAULT_HP` 中 `inner_method` 选内层方法，`lbfgsb_starts`/`lbfgsb_maxiter`/`lbfgsb_workers` 控制 L-BFGS-B。
 
-**物性加速**：`InterpolatingHeliumSolver` 默认关闭（`_DEFAULT_HP.use_interp_he=False`），所有测试用纯 CoolProp。
+**多工质冷源**：`_make_system_input()`/`_make_h2_source()` 支持 `cold_fluid` 参数切换冷源工质（H₂/CH₄ 等任意 CoolProp 流体）。
 
-**n_sc==0 短路**：`_inner_cma_fast` 中 n_sc==0 时直接返回 obj=1.0，跳过 CMA 迭代。
+**Smooth softplus 惩罚**：`_eval_fast` 在 `obj_mode='eff_pinch'` 时使用 `softplus(k*(util-tol))/k` 的光滑惩罚，数值安全分段处理（excess>50→线性, excess<-10→0）。梯度连续可微，L-BFGS-B 可用。
+
+**PropertyRegistry memo 缓存**：`(fluid, pair, x, y)` 键 → round-4 精度值，避免重复 CoolProp 查询，累计提速 11.5%。
+
+**n_sc==0 短路**：`_inner_cma_fast`/`_inner_lbfgsb_fast`/`_inner_hybrid_fast` 中 n_sc==0 时直接返回 obj=1.0，跳过迭代。
 
 **熵序警告**：`build_node_edge_topology` 中 S(t_max,p_max) < S(t_min,p_min) 时发出 RuntimeWarning。
+
+**best-track 必需**：记录优化过程中的 obj 最小值，非最终迭代值。
 
 ---
 
@@ -108,6 +135,8 @@ CyGES/
 |------|------|------|
 | `test_layered_opt.py` | 分层优化，多个预设配置 | `pytest -s tests/test_layered_opt.py::<test_name>` |
 | `test_optimize.py` | CMA-ES + DE 优化测试 | `pytest -s tests/test_optimize.py` |
+| `test_inner_compare.py` | CMA-ES vs L-BFGS-B 内层对比 | `pytest -s tests/test_inner_compare.py::test_compare_inner` |
+| `optimization_example.py` | CH₄ 效率优化示例 | `pytest -s tests/optimization_example.py::test_h2_scan_efficiency` |
 
 可选测试函数（`test_layered_opt.py`）：
 
@@ -119,8 +148,14 @@ CyGES/
 | `test_layered_0p1t0s_h2_4` | 0T+1P+0S | series | 4固定 | +P分位 |
 | `test_layered_0p0t_sq1` | 0P0T+1S | group HX2 | [3,6] | S分位测试 |
 | `test_layered_1p1t_ideal` | 1T+1P | group HX2 | [3,6] | 1P1T 基准 |
+| `test_layered_0p1s_h2_4_lbfgsb` | 0P1S | eff_pinch | 4固定 | L-BFGS-B 内层 |
+| `test_layered_1p1s_h2_4_lbfgsb` | 1P1S | eff_pinch | 4固定 | L-BFGS-B 内层 |
+| `test_inner_method_compare` | 1P1S | eff_pinch | 3.5固定 | CMA/L-BFGS-B/hybrid 三法对比 |
+| `test_inner_global_search_0p1s` | 0P1S | eff_pinch | 3.5固定 | 多seed全局搜索 |
+| `test_h2_scan_1p1s` | 1P1S | eff_pinch | 扫描 | H₂流量扫描 |
+| `test_h2_scan_1p1s_pinch` | 1P1S | pinch | 扫描 | pinch模式扫描 |
 
-输出：`tests/run_layered_fast/` 下图表。
+输出：`tests/run_layered_fast/`、`tests/inner_compare/`、`tests/optimization_example/` 下图表。
 
 ---
 
@@ -133,7 +168,7 @@ CyGES/
 | `ClosedCycleLayer._rebuild_simplified()` | 清空 `non_ideal` + 重建 `simplified`（子循环为空或全零流量时 warn） |
 | `ClosedCycleLayer.ensure_non_ideal()` | 创建 `NonIdealClosedCycleLayer` 快照；要求 `simplified` 存在 |
 | 父层变动后 | 已存在 `NonIdealClosedCycleLayer` 仍指向 ensure 时刻快照，与父层**解耦** |
-| `_inner_cma_fast` n_sc==0 | 直接返回 obj=1.0, n_evals=0，跳过所有 CMA 迭代 |
+| 内层 n_sc==0 | 直接返回 obj=1.0, n_evals=0，跳过所有迭代 |
 
 ---
 
@@ -143,17 +178,19 @@ CyGES/
 - **非理想偏置顺序**：先 `ensure_non_ideal()`，再 `ni.apply_offsets()`。
 - **Node.parent 类型**：`int | str | None` — 支持 `"S"` 标记 S 分位节点。
 - **无自动化 `git commit/push`**。
+- **内层方法选择**：`_DEFAULT_HP.inner_method` ∈ `{"cma","lbfgsb","hybrid"}`；`lbfgsb` 为推荐默认。
+- **并行确定性**：`lbfgsb_workers=8` 不引入非确定性（w=1 vs w=8 结果完全一致）。
+- **冷源工质**：`_DEFAULT_HP.cold_fluid` 支持任意 CoolProp 流体名。
 
 ---
 
 ## 8. 当前最优参数 & 测试结果
 
-### 来源
+### 来源 1: 最简串联夹点 (0P0T0S, series)
 
 `pytest -s tests/test_layered_opt.py::test_layered_0p0t0s_series`
 
 **配置**: 0P0T0S, 理想, 串联夹点, H2∈[2,5.5], h2_T_out∈[400,900], p_min=2000kPa 固定
-
 **优化器**: LHS=30, DE popsize=10 × maxiter=60, CMA restarts=3 × maxiter=15
 
 | 参数 | 值 |
@@ -161,7 +198,6 @@ CyGES/
 | t_max | 938K |
 | t_min | 349K |
 | p_max | 8609kPa |
-| p_min | 2000kPa |
 | n_sc | 1 |
 | flow | 29.7 kg/s |
 | H2 | 5.50 kg/s |
@@ -169,42 +205,71 @@ CyGES/
 | obj | **0.00000** |
 | 匹配 | 103.6MW |
 | 未匹配 | **4kW** |
-| HX 单元 | 1 (串联) |
 | 耗时 | 14.9s, 610 evals |
 
-### H2=4 固定测试 (0P0T0S)
+### 来源 2: L-BFGS-B 内层对比 (1P1S, eff_pinch)
+
+`pytest -s tests/test_inner_compare.py::test_compare_inner`
+
+**配置**: 1P1S, p_q=s_q=0.5, H2=3.5kg/s 固定, obj_mode=eff_pinch, 理想
+
+| 方法 | η | evals | 时间 |
+|------|:--|:--|:--|
+| CMA-b100 | -0.069 | 584 | 0.94s |
+| CMA-b250 | 0.334 | 1,387 | 0.85s |
+| CMA-b500 | 0.483 | 2,750 | 1.69s |
+| CMA-b1000 | 0.547 | 5,129 | 3.11s |
+| **L-BFGS-B×16** | **0.679** | 16,432 | 2.45s |
+
+> L-BFGS-B 远超 CMA-b1000（2.45s vs 3.11s, η 0.679 vs 0.547）。
+
+### 来源 3: CH₄ 冷源效率优化 (1P1S, eff_pinch)
+
+`pytest -s tests/optimization_example.py::test_h2_scan_efficiency`
+
+**配置**: 1P1S, CH₄ 120K→900K, Air 1000K→500K, p_min=2000kPa 固定
 
 | 参数 | 值 |
 |------|:--|
-| t_max | 1100K |
-| t_min | 176K |
+| CH₄ | 11.0 kg/s |
+| t_max | 932.6K |
+| t_min | 150K |
 | p_max | 12000kPa |
-| n_sc | 1 |
-| H2 | 4.00 kg/s |
-| h2_T_out | 404K |
-| obj | 0.04095 |
-| 匹配 | 120.7MW |
-| 未匹配 | 11.1MW |
+| n_sc | 4 |
+| flows | 37.7 kg/s 总和 |
+| **η** | **0.431** |
+| hot_util | 0.9 kW |
+| cold_util | 0 kW |
 
-### H2=4 固定 + 1P 分位 (1P0T0S, 100gen)
+### 来源 4: 0P1S 分拆惩罚确定性收敛
+
+`pytest -s tests/test_layered_opt.py::test_inner_global_search_0p1s`
+
+**配置**: 0P1S, H2=3.5kg/s 固定, split penalty (hot/cold 分开), L-BFGS-B S32
 
 | 参数 | 值 |
 |------|:--|
-| t_max | 978K |
-| t_min | 50K |
-| p_max | 8831kPa |
-| p_q | 0.213 |
-| n_sc | 4 |
-| flows | [31.1, 40.2, 1.7, 18.2] kg/s |
-| H2 | 4.00 kg/s |
-| h2_T_out | 832K |
-| obj | 0.02168 |
-| 匹配 | 180.4MW |
-| 未匹配 | 8.0MW |
-| 耗时 | 126.9s, 1515 evals |
+| **η** | **0.627** |
+| spread | 0.0002 (所有 seed 一致) |
+| flows | [13.8, 26.3] kg/s |
+| h2_T_out | 641K |
+
+### 来源 5: 1P0S 天花板
+
+**配置**: 1P0S, H2=3.5kg/s 固定, L-BFGS-B S96
+
+| 参数 | 值 |
+|------|:--|
+| **η** | **0.521** |
+| spread | 0.024 |
+| mean_η | 0.501~0.513 |
+
+> P 分位在此工况下非活跃变量（η 0.627→0.521）。
 
 ### 关键结论
 
-- **H2 流量是核心瓶颈**：H2=5.5 串联夹点可实现近乎精确解（4kW 未匹配），H2=4 固定时未匹配跳至 11MW。
-- **串联夹点模式有效**：直接暴露系统级功率不平衡和温差违规，单一逆流单元检查所有过程边界。
-- **P 分位增加拓扑自由度**（n_sc 1→4），在 H2 受约束时可提升总匹配功率（120→180MW），但多加的换热过程会放大功率差。
+- **H2 流量是核心瓶颈**：H2=5.5 串联夹点可实现近乎精确解（4kW 未匹配）。
+- **L-BFGS-B 远超 CMA-ES**：固定拓扑下梯度法 + smooth softplus 收敛远优于演化算法。
+- **分拆惩罚仅低维有效**：0P1S (d=3) 确定性收敛，1P0S (d=5) 反效果。
+- **局部极值随维度增长**：spread d=3(0.000)→d=5(0.024)→d=7(0.12)，每增 2 维扩大 5-6×。
+- **量化步长阻塞梯度**：flow_step/h2_step/qstep 已全部移除，L-BFGS-B 直接连续优化。

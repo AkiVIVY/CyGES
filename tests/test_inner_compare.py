@@ -45,7 +45,8 @@ _HP = {
 }
 
 _CMA_BUDGETS = [100, 250, 500, 1000]
-_LBFGSB_STARTS = [5, 10, 15, 20, 40]
+_LBFGSB_STARTS = [16]
+_LBFGSB_WORKERS = 16
 
 
 def _build_fixed_layer(hp: dict) -> ClosedCycleLayer:
@@ -116,6 +117,7 @@ def test_compare_inner() -> None:
         hp_lb = dict(hp)
         hp_lb["lbfgsb_starts"] = n_starts
         hp_lb["lbfgsb_maxiter"] = 50
+        hp_lb["lbfgsb_workers"] = _LBFGSB_WORKERS
         hp_lb["inner_method"] = "lbfgsb"
         label = f"LBFGSB-s{n_starts}"
         t0 = time.perf_counter()

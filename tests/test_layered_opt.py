@@ -394,12 +394,8 @@ def _inner_cma_fast(
         )
         sys.stdout.flush()
 
-    flows = global_best_x[:n_sc]
-    flow_step = hp["flow_step"]
-    flows = [round(f / flow_step) * flow_step for f in flows]
-    h2_mf, h2_T_out_unrounded = _extract_extra(global_best_x, n_sc)
-    h2_mf = round(h2_mf / hp["h2_step"]) * hp["h2_step"] if not h2_fixed else h2_mf
-    h2_T_out = round(h2_T_out_unrounded) if not h2_T_fixed else h2_T_out_unrounded
+    flows = list(global_best_x[:n_sc])
+    h2_mf, h2_T_out = _extract_extra(global_best_x, n_sc)
 
     try:
         base_layer.subcycle_mass_flows = flows
@@ -455,6 +451,52 @@ def _build_base_layer(tp_in, hp) -> ClosedCycleLayer | None:
     return base_layer
 
 
+def _lbfgsb_single_worker(args: tuple) -> tuple[float, list[float], int]:
+    """单起点 L-BFGS-B worker（模块级，供多进程调用）。"""
+    (tp_in, sys_inp, hp, x0, lo, hi, n_sc, dim, h2_fixed, h2_T_fixed, maxiter_per) = args
+    import scipy.optimize as _sopt
+
+    layer = _build_base_layer(tp_in, hp)
+    if layer is None or len(layer.subcycles) == 0:
+        return (1e9, [], 0)
+
+    _best_obj = [float("inf")]
+    _best_x: list[float] = []
+
+    def _obj(x: list[float]) -> float:
+        flows = list(x[:n_sc])
+        ei = n_sc
+        _h2_mf = hp["h2_mf_lo"] if h2_fixed else x[ei]; ei += 0 if h2_fixed else 1
+        _h2_T_out = hp["h2_T_out_lo"] if h2_T_fixed else x[ei]
+        try:
+            layer.subcycle_mass_flows = flows
+            layer.commit_subcycle_mass_flows_to_topology()
+        except Exception:
+            return 1e9
+        val = _eval_fast(layer, _h2_mf, _h2_T_out, sys_inp, hp)
+        if val < _best_obj[0]:
+            _best_obj[0] = val
+            _best_x[:] = list(x)
+        return val
+
+    opts: dict = {"maxiter": maxiter_per, "ftol": 1e-8}
+    _eps = hp.get("lbfgsb_eps", None)
+    if _eps is not None:
+        opts["eps"] = float(_eps)
+    try:
+        res = _sopt.minimize(
+            _obj, x0, method="L-BFGS-B",
+            bounds=[(lo[i], hi[i]) for i in range(dim)],
+            options=opts,
+        )
+        n_evals = getattr(res, "nfev", maxiter_per * dim * 2) if hasattr(res, "nfev") else maxiter_per * dim * 2
+        best_val = min(res.fun, _best_obj[0])
+        best_x_out = list(_best_x) if _best_x and _best_obj[0] < res.fun else list(res.x)
+        return (best_val, best_x_out, n_evals)
+    except Exception:
+        return (1e9, [], 0)
+
+
 def _inner_lbfgsb_fast(
     tp_in: ClosedCycleTPInput,
     sys_inp: SystemInput,
@@ -465,7 +507,6 @@ def _inner_lbfgsb_fast(
 ) -> tuple[LayerResult, ClosedCycleLayer]:
     """内层 L-BFGS-B + 多起点优化子循环流量 + H2 出口温度。"""
     import random as _rnd
-    import scipy.optimize as _sopt
 
     t0 = time.perf_counter()
 
@@ -509,53 +550,55 @@ def _inner_lbfgsb_fast(
         lo.append(hp["h2_T_out_lo"])
         hi.append(hp["h2_T_out_hi"])
 
-    def _objective(x: list[float]) -> float:
-        flows = list(x[:n_sc])
-        ei = n_sc
-        h2_mf = hp["h2_mf_lo"] if h2_fixed else x[ei]; ei += 0 if h2_fixed else 1
-        h2_T_out = hp["h2_T_out_lo"] if h2_T_fixed else x[ei]
-        try:
-            base_layer.subcycle_mass_flows = flows
-            base_layer.commit_subcycle_mass_flows_to_topology()
-        except Exception:
-            return 1e9
-        return _eval_fast(base_layer, h2_mf, h2_T_out, sys_inp, hp)
-
     n_starts = hp.get("lbfgsb_starts", 20)
-    maxiter_per = hp.get("lbfgsb_maxiter", 50)
+    maxiter_per = hp.get("lbfgsb_maxiter", 80)
+    n_workers = hp.get("lbfgsb_workers", 1)
     rng = _rnd.Random(seed)
 
     lhs_samples: list[list[float]] = []
     if n_starts > 1:
         lhs_samples = _lhs(n_starts, [(lo[i], hi[i]) for i in range(dim)], seed=seed + 1)
 
-    best_x: list[float] = []
+    start_points: list[list[float]] = []
+    for i in range(n_starts):
+        if i == 0:
+            x0 = [(lo[j] + hi[j]) / 2 for j in range(dim)]
+        elif lhs_samples:
+            x0 = lhs_samples[i - 1]
+        else:
+            x0 = [rng.uniform(lo[j], hi[j]) for j in range(dim)]
+        start_points.append(x0)
+
+    worker_args = [
+        (tp_in, sys_inp, hp, x0, lo, hi, n_sc, dim, h2_fixed, h2_T_fixed, maxiter_per)
+        for x0 in start_points
+    ]
+
     best_val = float("inf")
+    best_x: list[float] = []
     total_evals = 0
 
-    for start_i in range(n_starts):
-        if start_i == 0:
-            x0 = [(lo[i] + hi[i]) / 2 for i in range(dim)]
-        elif lhs_samples:
-            x0 = lhs_samples[start_i - 1]
-        else:
-            x0 = [rng.uniform(lo[i], hi[i]) for i in range(dim)]
-
-        try:
-            res = _sopt.minimize(
-                _objective, x0, method="L-BFGS-B",
-                bounds=[(lo[i], hi[i]) for i in range(dim)],
-                options={"maxiter": maxiter_per, "ftol": 1e-8},
-            )
-        except Exception:
-            continue
-
-        n_evals = getattr(res, "nfev", maxiter_per * dim * 2) if hasattr(res, "nfev") else maxiter_per * dim * 2
-        total_evals += n_evals
-
-        if res.fun < best_val:
-            best_val = res.fun
-            best_x = list(res.x)
+    if n_workers > 1:
+        import concurrent.futures, multiprocessing
+        ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as ex:
+            futures = [ex.submit(_lbfgsb_single_worker, a) for a in worker_args]
+            for fut in futures:
+                try:
+                    val, x, n_ev = fut.result(timeout=600)
+                    total_evals += n_ev
+                    if val < best_val:
+                        best_val = val
+                        best_x = x
+                except Exception:
+                    pass
+    else:
+        for args_i in worker_args:
+            val, x, n_ev = _lbfgsb_single_worker(args_i)
+            total_evals += n_ev
+            if val < best_val:
+                best_val = val
+                best_x = x
 
     if not best_x:
         runtime = time.perf_counter() - t0
@@ -567,20 +610,16 @@ def _inner_lbfgsb_fast(
             obj=1.0, n_subcycles=n_sc, n_evals=0, runtime=runtime,
         ), base_layer
 
-    flows = best_x[:n_sc]
-    flow_step = hp["flow_step"]
-    flows = [round(f / flow_step) * flow_step for f in flows]
-    h2_mf, h2_T_out_unrounded = (hp["h2_mf_lo"], hp["h2_T_out_lo"]) if h2_fixed else (best_x[n_sc], best_x[n_sc + 1])
-    if not h2_fixed:
-        ei = n_sc
-        h2_mf = hp["h2_mf_lo"] if h2_fixed else best_x[ei]; ei += 0 if h2_fixed else 1
-        h2_T_out_unrounded = hp["h2_T_out_lo"] if h2_T_fixed else best_x[ei]
-    else:
-        h2_mf = hp["h2_mf_lo"]
-        ei = n_sc
-        h2_T_out_unrounded = hp["h2_T_out_lo"] if h2_T_fixed else best_x[ei] if not h2_T_fixed else hp["h2_T_out_lo"]
-    h2_T_out = round(h2_T_out_unrounded) if not h2_T_fixed else h2_T_out_unrounded
-    h2_mf = round(h2_mf / hp["h2_step"]) * hp["h2_step"] if not h2_fixed else h2_mf
+    flows = list(best_x[:n_sc])
+    h2_mf = hp["h2_mf_lo"]
+    h2_T_out = hp["h2_T_out_lo"]
+    if not h2_fixed and not h2_T_fixed:
+        h2_mf = best_x[n_sc]
+        h2_T_out = best_x[n_sc + 1]
+    elif not h2_fixed:
+        h2_mf = best_x[n_sc]
+    elif not h2_T_fixed:
+        h2_T_out = best_x[n_sc]
 
     try:
         base_layer.subcycle_mass_flows = flows
@@ -762,20 +801,16 @@ def _inner_hybrid_fast(
                 obj=1.0, n_subcycles=n_sc, n_evals=total_evals, runtime=runtime,
             ), base_layer
 
-    flows = best_x[:n_sc]
-    flow_step = hp["flow_step"]
-    flows = [round(f / flow_step) * flow_step for f in flows]
-    h2_mf = hp["h2_mf_lo"] if h2_fixed else best_x[n_sc]
-    h2_T_out = hp["h2_T_out_lo"] if h2_T_fixed else best_x[-1] if not h2_fixed and not h2_T_fixed else hp["h2_T_out_lo"]
-    if not h2_fixed:
-        ei = n_sc
-        h2_mf = hp["h2_mf_lo"] if h2_fixed else best_x[ei]; ei += 0 if h2_fixed else 1
-        h2_T_out = hp["h2_T_out_lo"] if h2_T_fixed else best_x[ei]
-    else:
-        h2_mf = hp["h2_mf_lo"]
-        h2_T_out = hp["h2_T_out_lo"] if h2_T_fixed else best_x[-1]
-    h2_T_out = round(h2_T_out) if not h2_T_fixed else h2_T_out
-    h2_mf = round(h2_mf / hp["h2_step"]) * hp["h2_step"] if not h2_fixed else h2_mf
+    flows = list(best_x[:n_sc])
+    h2_mf = hp["h2_mf_lo"]
+    h2_T_out = hp["h2_T_out_lo"]
+    if not h2_fixed and not h2_T_fixed:
+        h2_mf = best_x[n_sc]
+        h2_T_out = best_x[n_sc + 1]
+    elif not h2_fixed:
+        h2_mf = best_x[n_sc]
+    elif not h2_T_fixed:
+        h2_T_out = best_x[n_sc]
 
     try:
         base_layer.subcycle_mass_flows = flows
@@ -870,14 +905,11 @@ def _de_trial_worker(args: tuple) -> float:
     t_min = round(x_outer[0])
     t_max = round(x_outer[1])
     idx = 2
-    tq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
-               for j in range(hp["n_t_q"]))
+    tq = tuple(float(x_outer[idx + j]) for j in range(hp["n_t_q"]))
     idx += hp["n_t_q"]
-    pq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
-               for j in range(hp["n_p_q"]))
+    pq = tuple(float(x_outer[idx + j]) for j in range(hp["n_p_q"]))
     idx += hp["n_p_q"]
-    sq = tuple(round(round(x_outer[idx + j] / hp["qstep"]) * hp["qstep"], 3)
-               for j in range(hp["n_s_q"]))
+    sq = tuple(float(x_outer[idx + j]) for j in range(hp["n_s_q"]))
     idx += hp["n_s_q"]
     p_max = round(x_outer[idx])
     p_min = round(x_outer[idx + 1])
@@ -2757,14 +2789,11 @@ def _run_layered(hp: dict, tag: str = "") -> None:
                     break
                 t_min = round(row[0]); t_max = round(row[1])
                 idx = 2
-                t_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
-                                 for j in range(hp["n_t_q"]))
+                t_q_vals = tuple(float(row[idx + j]) for j in range(hp["n_t_q"]))
                 idx += hp["n_t_q"]
-                p_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
-                                 for j in range(hp["n_p_q"]))
+                p_q_vals = tuple(float(row[idx + j]) for j in range(hp["n_p_q"]))
                 idx += hp["n_p_q"]
-                s_q_vals = tuple(round(round(row[idx + j] / hp['qstep']) * hp['qstep'], 3)
-                                 for j in range(hp["n_s_q"]))
+                s_q_vals = tuple(float(row[idx + j]) for j in range(hp["n_s_q"]))
                 idx += hp["n_s_q"]
                 p_max = round(row[idx]); p_min = round(row[idx + 1])
                 try:
