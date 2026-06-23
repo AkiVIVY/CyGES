@@ -198,13 +198,25 @@ def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, h2_T_out: float,
         return obj
     elif obj_mode == "eff_pinch":
         from core.postprocess import analyze_pinch
+        import math
         pinch = analyze_pinch(colds, hots, hp["hx_dT"], props)
         util = pinch.hot_utility_demand + pinch.cold_utility_demand
         q_cold = sum(abs(float(r.power_rate)) for r in src_colds if r.power_rate)
         eta = (q_source - q_cold) / q_source if q_source > 1e-12 else 0.0
         penalty_w = hp.get("penalty_w", 100.0)
         util_tol = hp.get("util_tol", 1.0)
-        obj = -eta + penalty_w * max(0, util - util_tol) / q_source
+        k = hp.get("penalty_k", None)
+        if k is not None:
+            excess = k * (util - util_tol)
+            if excess > 50:
+                penalty = util - util_tol
+            elif excess < -10:
+                penalty = 0.0
+            else:
+                penalty = math.log(1 + math.exp(excess)) / k
+        else:
+            penalty = max(0, util - util_tol)
+        obj = -eta + penalty_w * penalty / q_source
         return obj
     elif obj_mode == "series":
         from core.heat_exchanger import match_series_pinch
@@ -513,6 +525,10 @@ def _inner_lbfgsb_fast(
     maxiter_per = hp.get("lbfgsb_maxiter", 50)
     rng = _rnd.Random(seed)
 
+    lhs_samples: list[list[float]] = []
+    if n_starts > 1:
+        lhs_samples = _lhs(n_starts, [(lo[i], hi[i]) for i in range(dim)], seed=seed + 1)
+
     best_x: list[float] = []
     best_val = float("inf")
     total_evals = 0
@@ -520,6 +536,8 @@ def _inner_lbfgsb_fast(
     for start_i in range(n_starts):
         if start_i == 0:
             x0 = [(lo[i] + hi[i]) / 2 for i in range(dim)]
+        elif lhs_samples:
+            x0 = lhs_samples[start_i - 1]
         else:
             x0 = [rng.uniform(lo[i], hi[i]) for i in range(dim)]
 
@@ -527,7 +545,7 @@ def _inner_lbfgsb_fast(
             res = _sopt.minimize(
                 _objective, x0, method="L-BFGS-B",
                 bounds=[(lo[i], hi[i]) for i in range(dim)],
-                options={"maxiter": maxiter_per, "ftol": 1e-12},
+                options={"maxiter": maxiter_per, "ftol": 1e-8},
             )
         except Exception:
             continue
