@@ -1,7 +1,8 @@
-"""
-换热最优匹配测试：4热+5冷复杂算例 → 枚举+DP → T-Q 可视化。
+"""换热最优匹配单元测试: 4热+5冷构造算例 → 星型分组(枚举+构造法) → T-Q 可视化。
 
-输出 ``tests/hx_match_demo.png``。
+  验证 HX 匹配算法正确性: 给定人工热/冷过程记录, 调用 match_heat_exchanger_groups/
+  match_constructive/match_staged 分组, 检查未匹配功率比 + 每组 dT_min 合规性。
+  输出 ``tests/hx_match_demo.png``(各组T-Q逆流配对图)。
 """
 
 from __future__ import annotations

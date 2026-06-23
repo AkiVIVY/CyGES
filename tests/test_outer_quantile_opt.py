@@ -1,6 +1,7 @@
-"""对比: 内层 workers=1 vs workers=8, 外层从 (0.2,0.2) L-BFGS-B 优化 (p_q,s_q).
+"""外层分位点优化: 固定拓扑下的 (p_q,s_q) 网格扫描 + L-BFGS-B 中心精修验证。
 
-运行: pytest -s tests/test_outer_quantile_opt.py::test_compare_workers
+  用 LHS 多起点 L-BFGS-B 遍历 5×5 分位网格, 对比各 (p_q,s_q) 点的 η 和 evals,
+  确认最优分位组合并验证内层并行确定性 (w=1 vs w=8 结果完全一致)。
 """
 
 import time, sys

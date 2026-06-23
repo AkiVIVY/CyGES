@@ -1,6 +1,8 @@
-"""差分进化优化测试：Air/H₂/He 系统，非理想，min_max_utility 闭环目标。
+"""DE差分进化 + CMA-ES优化测试: 直接优化全参数空间 (拓扑+流量+H₂), 非理想。
 
-每代打印最优值；绘制残差下降曲线。
+  外部热源 Air 100kg/s→H₂冷源→He工质闭环循环, 优化器直接搜索
+  t_min/t_max/t_q/p_q/H₂_mf/高斯基权重, 目标最小化 hx_unmatched(星型HX匹配)。
+  每代打印最优值；输出 DE 收敛曲线 + TS/PS 图 + Excel 过程日志。
 """
 
 from __future__ import annotations

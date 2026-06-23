@@ -1,6 +1,8 @@
-r"""CMA-ES 全参数优化: t_min/t_max/t_q/p_q/H2_mf + 基函数权重, 2P+1T, CoolProp.
+r"""CMA-ES HX匹配全参数优化: 2P+1T拓扑下联合优化参数+基函数权重, CoolProp物性。
 
-  目标: hx_unmatched (无 N+1 惩罚), CMA-ES 30代×3重启, 4×4 basis.
+  搜索空间: t_min/t_max/t_q/p_q + H2流量 + 4×4 高斯基权重,
+  目标 hx_unmatched(未匹配功率比), CMA-ES 30代×3重启(σ早停),
+  输出 4 张图: TS/PS 状态空间 + HX T-Q概览 + 每配对单元T-Q。
 """
 
 from __future__ import annotations

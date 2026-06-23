@@ -1,8 +1,13 @@
-r"""分层优化 (加速版): 外层 LHS → 内层 CMA 复用拓扑 (maxiter=10, restarts=1), 外层多进程并行。
+r"""分层循环拓扑+流量联合优化。
 
-   A. 内层: 固定拓扑后只更新流量+非理想+性能+HX, ~50μs/eval
-   B. 外层: ProcessPoolExecutor 并行 6 进程
-   C. 减代数: maxiter=10, restarts=1
+  外层: LHS/DE 搜索拓扑参数 (t_min/t_max/p_min/p_max/t_q/p_q/s_q),
+       多进程并行评估各候选拓扑。
+  内层: 三种方法可选 — CMA-ES / L-BFGS-B(LHS多起点+best-track+并行) / hybrid两阶段,
+       在固定拓扑下优化子循环质量流量 + H₂冷源流量 + H₂出口温度。
+  目标: 4 种 obj_mode — group(星型HX) / series(串联夹点HX) /
+        pinch(直接最小化公用工程) / eff_pinch(最大化热效率η + 软惩罚)。
+
+  输出 TS/PS 拓扑图、HX T-Q 复合曲线、DE 收敛曲线、最优参数 CSV/JSON。
 """
 
 from __future__ import annotations
