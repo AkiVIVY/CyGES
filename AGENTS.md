@@ -42,6 +42,7 @@ CyGES/
 │   ├── test_inner_compare.py   # 内层方法对比: CMA-ES vs L-BFGS-B (多起点LHS)
 │   ├── test_outer_quantile_opt.py # 外层分位点优化: 网格扫描 + L-BFGS-B中心验证
 │   └── optimization_example.py # 效率优化示例: CH4冷源, η最大化
+│   └── test_feasibility_de.py # 新框架: h2_T_out 外层纳入 + 内层 flows-only
 ├── docs/architecture.md
 │   └── core_bugs.md            # 已知问题备忘
 └── AGENTS.md                   # 本文件
@@ -67,6 +68,7 @@ CyGES/
 - **内层 L-BFGS-B 多起点优化**：LHS 采样初始点 + best-track 记录最小值 + scipy L-BFGS-B（`ftol=1e-8`）+ 多进程并行（`w=8` 确定性验证通过）。
 - **Smooth softplus 惩罚**：`log(1+exp(k*(util-tol)))/k` 替代不可微 ReLU，使 L-BFGS-B 梯度法可用；`penalty_k=10`。
 - **目标函数模式**：`_eval_fast` 支持 4 种 `obj_mode`。
+- **h2_T_out 外层新框架** `test_feasibility_de.py`：将 h2_T_out 从内层 L-BFGS-B 变量提升为外层 DE 变量，内层仅优化子循环流量（dim=n_sc）。```outer(DE 7D: [拓扑 + h2_T_out]) → inner(L-BFGS-B S48 w=8, dim=n_sc flows only)```。h2_T_out 搜索边界 [500,1000]K。
 - 可视化：理想/非理想 TS/PS（子循环多边形叠加）、HX T-Q（概览 + 每单元逆流）、DE 收敛曲线、夹点复合曲线。
 
 **目标函数模式**
@@ -75,8 +77,9 @@ CyGES/
 |------|------|------|
 | `group` | `unmatched_ratio + 1e-3 * num_unmatched` | 星型 HX 匹配（默认） |
 | `series` | `unmatched_ratio + 1e-2 * pinch_violation` | 串联夹点 HX 匹配 |
-| `pinch` | `(hot_util + cold_util) / q_source` | 直接最小化公用工程量 |
+| `pinch` | `(hot_util + cold_util) / q_source` | 直接最小化公用工程量（**内层推荐**） |
 | `eff_pinch` | `-η + penalty_w * softplus(util,tol,k) / q_source` | 最大效率 + 公用工程容差 |
+| `eff_pinch_split` | `-η + penalty_w × (softplus(hot) + softplus(cold)) / q_source` | 分拆冷热惩罚（实验性） |
 
 **内层优化方法**
 
@@ -123,6 +126,8 @@ CyGES/
 
 **n_sc==0 短路**：`_inner_cma_fast`/`_inner_lbfgsb_fast`/`_inner_hybrid_fast` 中 n_sc==0 时直接返回 obj=1.0，跳过迭代。
 
+**内层 obj_mode 选择**：当 h2_T_out 固定（外层搜索或新框架），η 为常数 → `eff_pinch` 的 `-η + penalty_w × softplus / q_source` 等价于 `const + C × util`，其中 penalty_w 和 k 造成无效比例尺混乱。改用 `obj_mode='pinch'`（纯 `util/q_source`），spread 从 0.29 → 0.0014（200× 改善），evals 减少 30%。新框架 `test_feasibility_de.py` 内层应用 `obj_mode='pinch'`。
+
 **熵序警告**：`build_node_edge_topology` 中 S(t_max,p_max) < S(t_min,p_min) 时发出 RuntimeWarning。
 
 **best-track 必需**：记录优化过程中的 obj 最小值，非最终迭代值。
@@ -137,6 +142,7 @@ CyGES/
 | `test_optimize.py` | CMA-ES + DE 优化测试 | `pytest -s tests/test_optimize.py` |
 | `test_inner_compare.py` | CMA-ES vs L-BFGS-B 内层对比 | `pytest -s tests/test_inner_compare.py::test_compare_inner` |
 | `optimization_example.py` | CH₄ 效率优化示例 | `pytest -s tests/optimization_example.py::test_h2_scan_efficiency` |
+| `test_feasibility_de.py` | h2_T_out 外层纳入新框架 | `pytest -s tests/test_feasibility_de.py::test_1p0s_baseline` |
 
 可选测试函数（`test_layered_opt.py`）：
 
@@ -266,6 +272,68 @@ CyGES/
 
 > P 分位在此工况下非活跃变量（η 0.627→0.521）。
 
+### 来源 6: 1P0S S256 多 seed 更大规模对比
+
+**配置**: 1P0S, H2=3.5kg/s 固定, L-BFGS-B S256 w=8 maxiter=80, 9 seeds
+
+| 参数 | 值 |
+|------|:--|
+| **best η** | **0.523** |
+| spread (9 seeds) | 0.050 |
+| spread (除 seed=800 outlier) | **0.020** |
+| mean evals/seed | ~180k |
+| 总耗时 | 110.8s |
+| outlier (seed=800) | η=0.473, h2_T_out=891K (脱靶) |
+
+> S256 将内聚度提升到 8/9 seeds η∈[0.503,0.523]，但仍有 1 个 outlier 因 h2_T_out 脱出 40K 峰区。
+
+### 来源 7: h2_T_out 扫描（固定拓扑）
+
+**配置**: 1P0S, t_max=1000, p_max=10000, p_q=0.5, H2=3.5
+
+| h2_T_out [K] | η | 备注 |
+|:--|:--|:--|
+| 500~775 | 负 (obj>0) | 不可行区 |
+| 800 | ≈0 | 临界点 |
+| **825** | **0.514** | 峰顶 |
+| 850~1000 | 0.50→0.40 | 衰减区 |
+
+> h2_T_out 是单峰光滑变量，峰宽~40K，500K 范围中有效区仅占~8%。验证了 h2_T_out 应从内层 LHS 随机搜索中移除。
+
+### 来源 8: LHS vs Sobol (1P0S S96)
+
+| 采样 | best η | mean η | spread | evals |
+|:--|:--|:--|:--|:--|
+| LHS | 0.5194 | 0.5056 | **0.030** | 632k |
+| Sobol | 0.5216 | 0.5029 | 0.064 | 605k |
+
+> Sobol 在 n=96(非2^k) 时退化，且 seed=500 出现 η=0.458 的严重离群值。
+
+### 来源 9: 变量分块测试 (h2_T_out=812 固定, dim=4, 9 seeds)
+
+| 指标 | dim=5 (含 h2_T_out) | dim=4 (固定 h2_T_out=812K) |
+|:--|:--|:--|
+| best η | 0.519 | 0.522 |
+| spread | **0.030** | **0.068** |
+
+> 固定 h2_T_out 后 6/9 seeds 收敛到同一最优值（η=0.522），但 3 个 seed 陷入更差盆地。变量分块无效 — h2_T_out 与 flows 交互不可忽略。
+
+### 来源 10: 惩罚参数扫描 (1P0S, h2_T_out=750K 固定, dim=4)
+
+**配置**: S48 w=8 maxiter=80, 9 seeds, 对比三种目标
+
+| obj_mode | best | mean | spread | evals/seed |
+|:--|:--|:--|:--|:--|
+| eff_pinch w=1000 k=10 | 2.810 | 2.899 | **0.290** | ~26k |
+| **pinch (direct)** | **0.0034** | **0.0038** | **0.0014** | **~18k** |
+| eff_pinch w=2000 k=5 | 6.253 | 7.221 | 3.540 | ~27k |
+
+> `pinch` 模式的 spread 比 `eff_pinch` 低 200×，evals 少 30%。h2_T_out 固定后 η 为常数，`eff_pinch` 的 penalty_w×softplus 等价于 `const + C × util`，引入了无效比例尺。`pinch` 直接 `util/q_source` 给出干净梯度信号。
+
+### 来源 11: flows 精度验证
+
+3 seed 打印 6 位小数：flows 收敛到不同连续值（差异 0.07~0.38 kg/s），非截断所致。1 位小数的显示（原 `{v:.1f}` 格式）是之前"看起来一致"的原因。
+
 ### 关键结论
 
 - **H2 流量是核心瓶颈**：H2=5.5 串联夹点可实现近乎精确解（4kW 未匹配）。
@@ -273,3 +341,13 @@ CyGES/
 - **分拆惩罚仅低维有效**：0P1S (d=3) 确定性收敛，1P0S (d=5) 反效果。
 - **局部极值随维度增长**：spread d=3(0.000)→d=5(0.024)→d=7(0.12)，每增 2 维扩大 5-6×。
 - **量化步长阻塞梯度**：flow_step/h2_step/qstep 已全部移除，L-BFGS-B 直接连续优化。
+
+**h2_T_out 变量归属**：h2_T_out 经扫描和 LHS 多 seed 验证为~40K 宽单峰变量（峰区 800~840K，边界外 η 崩盘）。不应放入内层随机 LHS 多起点搜索（dim=5 时峰区覆盖率仅 ~11%），应作为外层系统级变量或以确定性 Brent 线搜索处理。`test_feasibility_de.py` 将 h2_T_out 纳入外层 DE 7D 向量。
+
+**LHS vs Sobol 采样**：Sobol 在 n≠2^k 时平衡性退化，d=5 时对多盆地地貌反效果（spread 0.030→0.064）。LHS 仍是当前推荐起点生成方法。
+
+**变量分块不适用**：尝试固定 h2_T_out 将 dim 从 5 降为 4，spread 反而从 0.030 恶化到 0.068 — 因为 flows 盆地无法通过调节 h2_T_out 补偿。h2_T_out 地貌分层：`h2_T_out`（主导，窄峰）>> `flows`（次级，多盆地）。
+
+**内层起点数与收敛**：S96→S128→S256 spread 不归零（0.030→0.033→0.050，除 outlier 外 0.020）。ftol=1e-8 已超越 maxiter=80，提高代数无改善。瓶颈在地貌而非收敛精度。
+
+**内层 obj_mode**：h2_T_out 固定后 η 为常数，`pinch`（`util/q_source`）优于 `eff_pinch`（spread 0.0014 vs 0.29，200× 改善）。新框架 `test_feasibility_de.py` 内层应用 `obj_mode='pinch'`。

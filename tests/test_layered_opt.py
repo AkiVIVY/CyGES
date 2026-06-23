@@ -223,6 +223,23 @@ def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, h2_T_out: float,
             penalty = max(0, util - util_tol)
         obj = -eta + penalty_w * penalty / q_source
         return obj
+    elif obj_mode == "eff_pinch_split":
+        from core.postprocess import analyze_pinch
+        import math
+        pinch = analyze_pinch(colds, hots, hp["hx_dT"], props)
+        q_cold = sum(abs(float(r.power_rate)) for r in src_colds if r.power_rate)
+        eta = (q_source - q_cold) / q_source if q_source > 1e-12 else 0.0
+        penalty_w = hp.get("penalty_w", 100.0)
+        util_tol = hp.get("util_tol", 1.0)
+        k = hp.get("penalty_k", 10)
+        def _sp(excess: float) -> float:
+            if excess > 50: return excess / k
+            if excess < -10: return 0.0
+            return math.log(1 + math.exp(excess)) / k
+        p_hot = _sp(k * (pinch.hot_utility_demand - util_tol))
+        p_cold = _sp(k * (pinch.cold_utility_demand - util_tol))
+        obj = -eta + penalty_w * (p_hot + p_cold) / q_source
+        return obj
     elif obj_mode == "series":
         from core.heat_exchanger import match_series_pinch
         hx = match_series_pinch(hots, colds, dT_min=hp["hx_dT"])
@@ -560,14 +577,29 @@ def _inner_lbfgsb_fast(
     n_workers = hp.get("lbfgsb_workers", 1)
     rng = _rnd.Random(seed)
 
+    sampler = hp.get("lbfgsb_sampler", "lhs")
+    sobol_samples: list[list[float]] = []
     lhs_samples: list[list[float]] = []
-    if n_starts > 1:
+    if n_starts > 1 and sampler == "sobol":
+        try:
+            from scipy.stats.qmc import Sobol
+            sbl = Sobol(d=dim, scramble=True, seed=seed + 1)
+            raw = sbl.random(n=n_starts)
+            sobol_samples = []
+            for i in range(n_starts):
+                sobol_samples.append([lo[j] + (hi[j] - lo[j]) * float(raw[i, j])
+                                      for j in range(dim)])
+        except Exception:
+            pass
+    if not sobol_samples and n_starts > 1:
         lhs_samples = _lhs(n_starts, [(lo[i], hi[i]) for i in range(dim)], seed=seed + 1)
 
     start_points: list[list[float]] = []
     for i in range(n_starts):
         if i == 0:
             x0 = [(lo[j] + hi[j]) / 2 for j in range(dim)]
+        elif sobol_samples:
+            x0 = sobol_samples[i - 1]
         elif lhs_samples:
             x0 = lhs_samples[i - 1]
         else:
