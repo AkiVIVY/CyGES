@@ -830,10 +830,83 @@ def test_2d_cma_penalty_sweep() -> None:
 
 
 def test_1p0s_pinch_aligned() -> None:
-    """0P1S 内层对比: pinch vs pinch_aligned, h2tout=800K固定, S32 w=16, 9 seeds."""
+    """1P0S pinch_aligned 参数扫描: starts, pinch_reward, 优化夹点."""
     hp = dict(_HP)
-    hp["n_t_q"] = 0; hp["n_p_q"] = 0; hp["n_s_q"] = 1
-    hp["s_q_vals"] = (0.5,); hp["p_q_vals"] = (); hp["t_q_vals"] = ()
+    hp["n_t_q"] = 0; hp["n_p_q"] = 1; hp["n_s_q"] = 0
+    hp["p_q_vals"] = (0.5,); hp["s_q_vals"] = (); hp["t_q_vals"] = ()
+    hp["t_min_lo"] = 50.0; hp["t_min_hi"] = 50.0
+    hp["t_max_lo"] = 1000.0; hp["t_max_hi"] = 1000.0
+    hp["p_min_lo"] = 2000.0; hp["p_min_hi"] = 2000.0
+    hp["p_max_lo"] = 10000.0; hp["p_max_hi"] = 10000.0
+    hp["lbfgsb_maxiter"] = 20; hp["lbfgsb_workers"] = 16
+    hp["lbfgsb_sampler"] = "lhs"; hp["inner_method"] = "lbfgsb"
+    hp["penalty_w"] = 1000.0; hp["penalty_k"] = 10; hp["util_tol"] = 1.0
+    hp["hx_dT"] = 10.0; hp["use_non_ideal"] = False
+    hp["mf_lo"] = 0.0; hp["mf_hi"] = 50.0
+    hp["h2_T_out_lo"] = 800.0; hp["h2_T_out_hi"] = 800.0
+    hp["obj_mode"] = "pinch_aligned"
+
+    from core.system import SystemInput, CycleConfig
+    from core import ExternalSourceInput
+    layer = _build_fixed_layer(hp)
+    n_sc = len(layer.subcycles)
+    hot = ExternalSourceInput(fluid="Air", mass_flow=hp["air_mf"],
+                              T_in=hp["air_T_in"], P_in=hp["air_P_in"],
+                              T_out=hp["air_T_out"], P_out=hp["air_P_out"])
+    cold = ExternalSourceInput(fluid=hp.get("cold_fluid", "Hydrogen"),
+                               mass_flow=hp["h2_mf_lo"],
+                               T_in=hp["h2_T_in"], P_in=hp["h2_P_in"],
+                               T_out=800.0, P_out=hp["h2_P_out"])
+    cycle_in = ClosedCycleTPInput(
+        fluid="He", t_min=hp["t_min_lo"], t_max=hp["t_max_hi"],
+        p_min=hp["p_min_lo"], p_max=hp["p_max_hi"],
+        t_quantiles=hp["t_q_vals"], p_quantiles=hp["p_q_vals"],
+        s_quantiles=hp["s_q_vals"], subcycle_mass_flow_initial=20.0,
+    )
+    sys_inp = SystemInput(
+        heat_sources=(hot,), cold_sources=(cold,),
+        cycles=(CycleConfig(input=cycle_in, use_non_ideal=False,
+                             delta_T_min=20.0, heat_method=None),),
+        delta_T_min=20.0, heat_method="system_pinch",
+    )
+    seeds = [0, 100, 200, 300, 400, 500, 600, 700, 800]
+
+    configs = [
+        (32, 0.5, "S32_pen0.5"),
+        (32, 1.0, "S32_pen1.0"),
+        (32, 2.0, "S32_pen2.0"),
+        (64, 1.0, "S64_pen1.0"),
+        (96, 1.0, "S96_pen1.0"),
+    ]
+
+    for n_starts, pen_dt, tag in configs:
+        hp_run = dict(hp)
+        hp_run["lbfgsb_starts"] = n_starts
+        hp_run["pinch_reward"] = pen_dt
+        all_r: list[dict] = []
+        print(f"\n{'='*80}")
+        print(f"  1P0S pinch_aligned | {tag} | n_sc={n_sc} | 9 seeds")
+        print(f"{'='*80}")
+        print(f"{'seed':>5} {'obj':>12} {'evals':>8}  {'flows':>28}")
+        print("-" * 68)
+        for seed in seeds:
+            t0 = time.perf_counter()
+            result, _ = _inner_lbfgsb_fast(cycle_in, sys_inp, dict(hp_run), seed=seed)
+            elapsed = time.perf_counter() - t0
+            flows_str = "[" + ",".join(f"{v:.1f}" for v in result.flows) + "]"
+            all_r.append({"seed": seed, "obj": result.obj, "n_evals": result.n_evals,
+                          "time_s": elapsed, "flows": list(result.flows)})
+            print(f"{seed:>5} {result.obj:>12.5f} {result.n_evals:>8}  {flows_str}")
+        objs = [r["obj"] for r in all_r]
+        best = min(objs); mean = sum(objs) / len(objs); spread = max(objs) - min(objs)
+        print("-" * 68)
+        print(f"  best={best:.5f}  mean={mean:.5f}  spread={spread:.5f}  evals={sum(r['n_evals'] for r in all_r)}")
+        print(f"{'='*80}")
+
+    print(f"\n  done — check spread across configs above")
+    hp = dict(_HP)
+    hp["n_t_q"] = 0; hp["n_p_q"] = 1; hp["n_s_q"] = 0
+    hp["p_q_vals"] = (0.5,); hp["s_q_vals"] = (); hp["t_q_vals"] = ()
     hp["t_min_lo"] = 50.0; hp["t_min_hi"] = 50.0
     hp["t_max_lo"] = 1000.0; hp["t_max_hi"] = 1000.0
     hp["p_min_lo"] = 2000.0; hp["p_min_hi"] = 2000.0
@@ -876,7 +949,7 @@ def test_1p0s_pinch_aligned() -> None:
         hp_run["obj_mode"] = obj_mode
         all_r: list[dict] = []
         print(f"\n{'='*85}")
-        print(f"  0P1S | {label} | h2tout=800K | n_sc={n_sc} | S32 w=16 | 9 seeds")
+        print(f"  1P0S | {label} | h2tout=800K | n_sc={n_sc} | S32 w=16 | 9 seeds")
         print(f"{'='*85}")
         print(f"{'seed':>5} {'obj':>12} {'evals':>8} {'time_s':>7}  {'flows':>20}")
         print("-" * 72)
@@ -894,4 +967,4 @@ def test_1p0s_pinch_aligned() -> None:
         print(f"  best={best:.5f}  mean={mean:.5f}  spread={spread:.5f}  evals-tot={sum(r['n_evals'] for r in all_r)}")
         print(f"{'='*85}")
 
-    print(f"\n  ← pinch_aligned 应该具有更低的 spread——min_dT 提供连续梯度")
+    print(f"\n  ← pinch_aligned should have lower spread — min_dT provides continuous gradient")

@@ -69,6 +69,7 @@ CyGES/
 - **Smooth softplus 惩罚**：`log(1+exp(k*(util-tol)))/k` 替代不可微 ReLU，使 L-BFGS-B 梯度法可用；`penalty_k=10`。
 - **目标函数模式**：`_eval_fast` 支持 4 种 `obj_mode`。
 - **h2_T_out 外层新框架** `test_feasibility_de.py`：将 h2_T_out 从内层 L-BFGS-B 变量提升为外层 DE 变量，内层仅优化子循环流量（dim=n_sc）。```outer(DE 7D: [拓扑 + h2_T_out]) → inner(L-BFGS-B S48 w=8, dim=n_sc flows only)```。h2_T_out 搜索边界 [500,1000]K。
+- **0P1S / 1P0S 拓扑对比**：0P1S (S分位, n_sc=2) 远优于 1P0S — η 从 0.530 → 0.621。S 分位在 PS空间创造更高效换热匹配。0P1S 内层 spread=0（确定性收敛），1P0S spread=0.006（S64 最佳）。
 - 可视化：理想/非理想 TS/PS（子循环多边形叠加）、HX T-Q（概览 + 每单元逆流）、DE 收敛曲线、夹点复合曲线。
 
 **目标函数模式**
@@ -104,13 +105,24 @@ CyGES/
 
 | 参数 | 值 | 说明 |
 |------|:--|------|
-| starts | 32 | S32 balance spread vs cost |
+| starts | 32 | S32 balance spread vs cost; S64 for 1P0S(spread 0.006) |
 | maxiter | 20 | ftol 先于 maxiter 收敛 |
 | workers | 16 | 内层并行 |
 | ftol | 1e-8 | 不可降 — best 退化 3~5× |
 | eps | default | 不可改 — 差分精度最优 |
-| obj_mode | pinch | gradient cleanest for flows-only |
+| obj_mode | pinch_aligned | util penalty + pinch reward (pen_dt=0.5) |
 | sampler | LHS | Sobol 反效果 |
+
+**内层优化方法对比 (1P0S pinch_aligned pen0.5)**
+
+| 方法 | best | spread | 评价 |
+|:--|:--|:--|:--|
+| **L-BFGS-B S64** | **-0.044** | **0.006** | 首选 |
+| L-BFGS-B S256 | -0.047 | 0.004 | 成本 8× |
+| DE pop30×35 | -0.043 | 0.042 | spread 差 |
+| Adam | +57→0.78 | 583 | 不可用 |
+
+**L-BFGS-B starts 收敛:** S32(0.014) → S64(0.006) → S128(0.005) → S256(0.004) — 递减改善。
 
 **HX 匹配模式**
 
@@ -381,6 +393,14 @@ CyGES/
 **h2_T_out 变量归属**：h2_T_out 经扫描和 LHS 多 seed 验证为~40K 宽单峰变量（峰区 800~840K，边界外 η 崩盘）。不应放入内层随机 LHS 多起点搜索（dim=5 时峰区覆盖率仅 ~11%），应作为外层系统级变量或以确定性 Brent 线搜索处理。`test_feasibility_de.py` 将 h2_T_out 纳入外层 DE 7D 向量。
 
 **LHS vs Sobol 采样**：Sobol 在 n≠2^k 时平衡性退化，d=5 时对多盆地地貌反效果（spread 0.030→0.064）。LHS 仍是当前推荐起点生成方法。
+
+**变量分块不适用**：尝试固定 h2_T_out 将 dim 从 5 降为 4，spread 反而从 0.030 恶化到 0.068 — 因为 flows 盆地无法通过调节 h2_T_out 补偿。h2_T_out 地貌分层：`h2_T_out`（主导，窄峰）>> `flows`（次级，多盆地）。
+
+**内层起点数与收敛**：S96→S128→S256 spread 不归零（0.030→0.033→0.050，除 outlier 外 0.020）。ftol=1e-8 已超越 maxiter=80，提高代数无改善。瓶颈在地貌而非收敛精度。
+
+**内层 obj_mode**：h2_T_out 固定后 η 为常数，`pinch`（`util/q_source`）优于 `eff_pinch`（spread 0.0014 vs 0.29，200× 改善）。`pinch_aligned`（`pen_w × softplus(util) / q_source − pen_dt × min_dT / 100`）更优——min_dT 项在 util=0 时仍提供非零梯度 → 9 seeds 全部收敛到同一 flows。新框架 `test_feasibility_de.py` 内层应用 `obj_mode='pinch'`。
+
+**核心架构问题（2024-06-24 确认）**：所有问题的核心出在内层计算的不确定性上。当内层为优化结果时，如果内层存在局部解，外层的边界可能导致内层计算结果不连续，最终使得整个计算失效。0P1S (n_sc=2) 内层完全确定 (spread=0)，1P0S (n_sc=4) 仍有 0.006~0.014 的不确定性——这在嵌套优化架构下会传播到外层目标函数的噪声中。下一版本考虑用核函数方法等替代当前纯 LHS 多起点+L-BFGS-B 的内层搜索策略，以消除剩余的地貌不确定性。
 
 **变量分块不适用**：尝试固定 h2_T_out 将 dim 从 5 降为 4，spread 反而从 0.030 恶化到 0.068 — 因为 flows 盆地无法通过调节 h2_T_out 补偿。h2_T_out 地貌分层：`h2_T_out`（主导，窄峰）>> `flows`（次级，多盆地）。
 
