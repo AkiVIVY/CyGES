@@ -632,3 +632,61 @@ def analyze_pinch(
         hot_utility_ratio=hot_utility / min(abs(Q_c_max), abs(Q_h_max)) if min(abs(Q_c_max), abs(Q_h_max)) > 1e-12 else 0.0,
         cold_utility_ratio=cold_utility / min(abs(Q_c_max), abs(Q_h_max)) if min(abs(Q_c_max), abs(Q_h_max)) > 1e-12 else 0.0,
     )
+
+
+@dataclass(frozen=True)
+class PinchFixedResult:
+    """固定对齐（Q=0 左对齐）下的夹点分析结果。"""
+    min_dT: float
+    """重叠区最小温差 [K]（T_hot - T_cold）。"""
+    pinch_Q: float
+    """min_dT 处的 Q 坐标 [kW]。"""
+    utility: float
+    """未匹配功率 = |Q_h_max - Q_c_max| [kW] — 即公用工程需求。"""
+
+
+def compute_pinch_fixed_alignment(
+    hot_curve: HeatTQCurve,
+    cold_curve: HeatTQCurve,
+) -> PinchFixedResult:
+    """Q=0 左对齐的夹点分析：扫重叠区找最小温差，未对齐尾部 = 公用工程。
+
+    hot_curve 是放热曲线（HEAT_REJECTION），冷流体（吸热或冷源）。
+    cold_curve 是吸热曲线（HEAT_ABSORPTION），需加热的流体。
+    T_hot - T_cold 在重叠区取极小值 = 夹点下限。(越大越好)
+
+    utility = |Q_h_max - Q_c_max| — 两条曲线长度不等时，未匹配部分需要外部公用工程。
+    """
+    q_h = hot_curve.q_points
+    q_c = cold_curve.q_points
+    Q_overlap_max = min(q_h[-1], q_c[-1])
+
+    # 收集重叠区内所有顶点 Q 值（来自两条曲线）
+    all_Q: list[float] = []
+    for q in q_h:
+        if 0 <= q <= Q_overlap_max + 1e-9:
+            all_Q.append(max(0.0, q))
+    for q in q_c:
+        if 0 <= q <= Q_overlap_max + 1e-9:
+            # 去重
+            if not any(abs(q - x) < 1e-9 for x in all_Q):
+                all_Q.append(max(0.0, q))
+    all_Q.sort()
+
+    min_dT = float("inf")
+    pinch_Q = 0.0
+    for Q in all_Q:
+        th = _interp_T_at_Q(hot_curve, Q)
+        tc = _interp_T_at_Q(cold_curve, Q)
+        dT = th - tc
+        if dT < min_dT:
+            min_dT = dT
+            pinch_Q = Q
+
+    utility = abs(q_h[-1] - q_c[-1])
+
+    return PinchFixedResult(
+        min_dT=min_dT,
+        pinch_Q=pinch_Q,
+        utility=utility,
+    )

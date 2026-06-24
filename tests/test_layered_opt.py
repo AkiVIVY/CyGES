@@ -62,9 +62,10 @@ _DEFAULT_HP = {
     "h2_T_out_lo": 400.0, "h2_T_out_hi": 900.0,
     "use_non_ideal": True,
     # L-BFGS-B 内层参数
-    "inner_method": "cma",
-    "lbfgsb_starts": 20,
-    "lbfgsb_maxiter": 50,
+    "inner_method": "lbfgsb",
+    "lbfgsb_starts": 32,
+    "lbfgsb_maxiter": 20,
+    "lbfgsb_workers": 16,
 }
 
 
@@ -164,6 +165,7 @@ def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, h2_T_out: float,
     """固定拓扑下：更新流量 → 非理想 → 性能 → HX。不重建 ClosedCycleLayer。"""
     from core.system import SystemPipeline
     from core import InterpolatingHeliumSolver
+    from core.cycle_performance import ProcessCategory
 
     props = PropertyRegistry()
     if hp["use_non_ideal"]:
@@ -239,6 +241,32 @@ def _eval_fast(layer: ClosedCycleLayer, h2_mf: float, h2_T_out: float,
         p_hot = _sp(k * (pinch.hot_utility_demand - util_tol))
         p_cold = _sp(k * (pinch.cold_utility_demand - util_tol))
         obj = -eta + penalty_w * (p_hot + p_cold) / q_source
+        return obj
+    elif obj_mode == "pinch_aligned":
+        from core.postprocess import compute_pinch_fixed_alignment, _build_heat_tq_curve
+        import math
+        # 构建冷热复合曲线
+        from core.cycle_performance import ProcessCategory
+        hots_all = list(src_hots) + [r for _, r in report.by_edge if r.kind == "heat" and r.power_rate is not None and r.category == ProcessCategory.HEAT_REJECTION]
+        colds_all = list(src_colds) + [r for _, r in report.by_edge if r.kind == "heat" and r.power_rate is not None and r.category == ProcessCategory.HEAT_ABSORPTION]
+        hot_curve = _build_heat_tq_curve(hots_all, ProcessCategory.HEAT_REJECTION, props)
+        cold_curve = _build_heat_tq_curve(colds_all, ProcessCategory.HEAT_ABSORPTION, props)
+        if len(hot_curve.q_points) < 2 or len(cold_curve.q_points) < 2:
+            return 1.0
+        result = compute_pinch_fixed_alignment(hot_curve, cold_curve)
+        util = result.utility
+        penalty_w = hp.get("penalty_w", 1000.0)
+        util_tol = hp.get("util_tol", 1.0)
+        k = hp.get("penalty_k", 10)
+        pen_dt = hp.get("pinch_reward", 1.0)
+        if k is not None:
+            excess = k * (util - util_tol)
+            if excess > 50: penalty_u = util - util_tol
+            elif excess < -10: penalty_u = 0.0
+            else: penalty_u = math.log(1 + math.exp(excess)) / k
+        else:
+            penalty_u = max(0, util - util_tol)
+        obj = penalty_w * penalty_u / q_source - pen_dt * result.min_dT / 100.0
         return obj
     elif obj_mode == "series":
         from core.heat_exchanger import match_series_pinch
@@ -395,9 +423,9 @@ def _inner_lbfgsb_fast(
         lo.append(hp["h2_T_out_lo"])
         hi.append(hp["h2_T_out_hi"])
 
-    n_starts = hp.get("lbfgsb_starts", 20)
-    maxiter_per = hp.get("lbfgsb_maxiter", 80)
-    n_workers = hp.get("lbfgsb_workers", 1)
+    n_starts = hp.get("lbfgsb_starts", 32)
+    maxiter_per = hp.get("lbfgsb_maxiter", 20)
+    n_workers = hp.get("lbfgsb_workers", 16)
     rng = _rnd.Random(seed)
 
     sampler = hp.get("lbfgsb_sampler", "lhs")

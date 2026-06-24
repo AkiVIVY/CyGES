@@ -69,9 +69,9 @@ _HP = {
     "use_non_ideal": False, "use_interp_he": False,
     # ── 内层 L-BFGS-B ──
     "inner_method": "lbfgsb",
-    "lbfgsb_starts": 48,
-    "lbfgsb_maxiter": 80,
-    "lbfgsb_workers": 8,
+    "lbfgsb_starts": 32,
+    "lbfgsb_maxiter": 20,
+    "lbfgsb_workers": 16,
     "lbfgsb_sampler": "lhs",
     "mf_lo": 0.0, "mf_hi": 50.0,
 }

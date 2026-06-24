@@ -55,10 +55,12 @@ from core.cycle_performance import (
 from core.postprocess import (
     HeatTQCurve,
     PinchResult,
+    PinchFixedResult,
     TQSegment,
     analyze_pinch,
     build_heat_tq_curves,
     compute_pinch,
+    compute_pinch_fixed_alignment,
     split_tq_curve_to_records,
 )
 from core.heat_exchanger import (

@@ -80,14 +80,37 @@ CyGES/
 | `pinch` | `(hot_util + cold_util) / q_source` | 直接最小化公用工程量（**内层推荐**） |
 | `eff_pinch` | `-η + penalty_w * softplus(util,tol,k) / q_source` | 最大效率 + 公用工程容差 |
 | `eff_pinch_split` | `-η + penalty_w × (softplus(hot) + softplus(cold)) / q_source` | 分拆冷热惩罚（实验性） |
+| `pinch_aligned` | `pen_w × softplus(util−tol,k)/q_source − pen_dt × min_dT / 100` | 夹点最大化 + 公用工程惩罚（**内层新推荐**） |
+
+**`pinch_aligned` 模式详解**
+
+| 特性 | 说明 |
+|:--|:--|
+| 夹点分析 | `compute_pinch_fixed_alignment(hot_curve, cold_curve)` — Q=0 左对齐，扫重叠区取 min ΔT |
+| 目标 | 公用工程越小越好 + 夹点温差越大越好 |
+| 关键优势 | min_dT 项在 util=0 时**仍提供非零梯度** → 消除 util=0 面上 obj 全等的平坦问题 |
+| 引入位置 | `core/postprocess.py` 新增 `PinchFixedResult` + `compute_pinch_fixed_alignment` |
+| 验证结果 | 0P1S S32 w=16: 9 seeds **全部收敛到同一 flows** [10.9, 22.4], spread=0.000, pinch dT=24.2K |
+
+> 原 `pinch` 模式在 util=0 时 obj 全等、不同 seed 收敛到不同 flows 组合；`pinch_aligned` 模式通过 min_dT 奖励创建唯一最优解，消除多盆地。
 
 **内层优化方法**
 
 | inner_method | 说明 |
 |------|------|
-| `cma` | CMA-ES (BIPOP) + sigma 早停（σ<0.5, stall=3×popsize） |
-| `lbfgsb` | L-BFGS-B + LHS 多起点 + best-track + 并行（推荐） |
-| `hybrid` | CMA 粗搜 + L-BFGS-B 精搜索（两阶段） |
+| `lbfgsb` | L-BFGS-B + LHS 多起点 + best-track + 并行（唯一方案） |
+
+**内层默认配置（2024-06-30 最终）**
+
+| 参数 | 值 | 说明 |
+|------|:--|------|
+| starts | 32 | S32 balance spread vs cost |
+| maxiter | 20 | ftol 先于 maxiter 收敛 |
+| workers | 16 | 内层并行 |
+| ftol | 1e-8 | 不可降 — best 退化 3~5× |
+| eps | default | 不可改 — 差分精度最优 |
+| obj_mode | pinch | gradient cleanest for flows-only |
+| sampler | LHS | Sobol 反效果 |
 
 **HX 匹配模式**
 
@@ -127,6 +150,8 @@ CyGES/
 **n_sc==0 短路**：`_inner_cma_fast`/`_inner_lbfgsb_fast`/`_inner_hybrid_fast` 中 n_sc==0 时直接返回 obj=1.0，跳过迭代。
 
 **内层 obj_mode 选择**：当 h2_T_out 固定（外层搜索或新框架），η 为常数 → `eff_pinch` 的 `-η + penalty_w × softplus / q_source` 等价于 `const + C × util`，其中 penalty_w 和 k 造成无效比例尺混乱。改用 `obj_mode='pinch'`（纯 `util/q_source`），spread 从 0.29 → 0.0014（200× 改善），evals 减少 30%。新框架 `test_feasibility_de.py` 内层应用 `obj_mode='pinch'`。
+
+**`pinch_aligned` 模式**：`pen_w × softplus(util−tol) / q_source − pen_dt × min_dT / 100`。`compute_pinch_fixed_alignment`（Q=0 左对齐，扫重叠区 min ΔT）替代原 δQ 优化对齐。min_dT 项在 util=0 时仍提供非零梯度 → 消除 util=0 面上 obj 全等的平坦问题。0P1S S32 验证 9 seeds 全部收敛到同一 flows [10.9, 22.4], spread=0, pinch dT=24.2K。
 
 **熵序警告**：`build_node_edge_topology` 中 S(t_max,p_max) < S(t_min,p_min) 时发出 RuntimeWarning。
 
@@ -334,6 +359,17 @@ CyGES/
 
 3 seed 打印 6 位小数：flows 收敛到不同连续值（差异 0.07~0.38 kg/s），非截断所致。1 位小数的显示（原 `{v:.1f}` 格式）是之前"看起来一致"的原因。
 
+### 来源 12: pinch_aligned 验证 (0P1S, h2tout=800K)
+
+**配置**: 0P1S, h2tout=800K 固定, S32 w=16, 9 seeds, pinch vs pinch_aligned
+
+| obj_mode | best | spread | flows |
+|:--|:--|:--|:--|
+| pinch | 0.00000 | 0.000 | [13.6,21.6], [8.7,23.1]... 多个不同 |
+| **pinch_aligned** | **-0.24193** | **0.000** | **[10.9,22.4] 全部相同** |
+
+> pinch_aligned 通过 min_dT 奖励 (24.2K) 创建唯一最优解。9 seeds 全部收敛到同一 flows，彻底消除 pinch 模式在 util=0 面上的多盆地问题。
+
 ### 关键结论
 
 - **H2 流量是核心瓶颈**：H2=5.5 串联夹点可实现近乎精确解（4kW 未匹配）。
@@ -350,4 +386,4 @@ CyGES/
 
 **内层起点数与收敛**：S96→S128→S256 spread 不归零（0.030→0.033→0.050，除 outlier 外 0.020）。ftol=1e-8 已超越 maxiter=80，提高代数无改善。瓶颈在地貌而非收敛精度。
 
-**内层 obj_mode**：h2_T_out 固定后 η 为常数，`pinch`（`util/q_source`）优于 `eff_pinch`（spread 0.0014 vs 0.29，200× 改善）。新框架 `test_feasibility_de.py` 内层应用 `obj_mode='pinch'`。
+**内层 obj_mode**：h2_T_out 固定后 η 为常数，`pinch`（`util/q_source`）优于 `eff_pinch`（spread 0.0014 vs 0.29，200× 改善）。`pinch_aligned`（`pen_w × softplus(util) / q_source − pen_dt × min_dT / 100`）更优——min_dT 项在 util=0 时仍提供非零梯度 → 9 seeds 全部收敛到同一 flows。新框架 `test_feasibility_de.py` 内层应用 `obj_mode='pinch'`。
