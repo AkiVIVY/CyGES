@@ -1,12 +1,15 @@
-"""内层优化方法对比: CMA-ES vs L-BFGS-B (多起点LHS + 光滑软惩罚).
+"""内层优化方法对比与诊断: L-BFGS-B 多seed, 一致性诊断, 2D 外层优化方法对比.
 
-固定外层拓扑 (1P1S, p_q=0.5, s_q=0.5), 在同一拓扑上跑两种内层方法,
-对比 obj, eta, n_evals, wall_time. 含可视化图表.
+测试:
+    test_1p0s_lbfgsb_multiseed    — 1P0S L-BFGS-B S16 w=16 dim=n_sc 9 seeds
+    test_1p0s_consistency_h2_750  — h2_T_out=750K 固定, LHS starts × seeds sweep
+    test_1p0s_2d_opt_compare      — 2D (h2_T_out, p_q) Grid/CMA/DE 方法对比
 
 运行:
-    pytest -s tests/test_inner_compare.py::test_compare_inner
+    pytest -s tests/test_inner_compare.py::<test_name>
 """
 
+import sys
 import time
 from pathlib import Path
 
@@ -14,9 +17,7 @@ from core import ClosedCycleLayer, ClosedCycleTPInput, PropertyRegistry
 
 from tests.test_layered_opt import (
     _eval_fast,
-    _inner_cma_fast,
     _inner_lbfgsb_fast,
-    _make_h2_source,
 )
 
 _TESTS_DIR = Path(__file__).resolve().parent
@@ -44,10 +45,6 @@ _HP = {
     "qstep": 0.001, "flow_step": 0.05, "h2_step": 0.01,
 }
 
-_CMA_BUDGETS = [100, 250, 500, 1000]
-_LBFGSB_STARTS = [16]
-_LBFGSB_WORKERS = 16
-
 
 def _build_fixed_layer(hp: dict) -> ClosedCycleLayer:
     tp_in = ClosedCycleTPInput(
@@ -59,255 +56,22 @@ def _build_fixed_layer(hp: dict) -> ClosedCycleLayer:
     return ClosedCycleLayer(tp_in)
 
 
-def test_compare_inner() -> None:
-    """对比 CMA-ES 与 L-BFGS-B (多起点 LHS + softplus)。"""
-    hp = dict(_HP)
-    layer = _build_fixed_layer(hp)
-    n_sc = len(layer.subcycles)
-    dim = n_sc + (1 if hp["h2_T_out_lo"] != hp["h2_T_out_hi"] else 0)
-
-    from core.system import SystemInput, CycleConfig
-    from core import ExternalSourceInput
-    hot = ExternalSourceInput(fluid="Air", mass_flow=hp["air_mf"],
-                              T_in=hp["air_T_in"], P_in=hp["air_P_in"],
-                              T_out=hp["air_T_out"], P_out=hp["air_P_out"])
-    cold = ExternalSourceInput(fluid=hp["cold_fluid"], mass_flow=hp["h2_mf_lo"],
-                               T_in=hp["h2_T_in"], P_in=hp["h2_P_in"],
-                               T_out=hp["h2_T_out_lo"], P_out=hp["h2_P_out"])
-    cycle_in = ClosedCycleTPInput(
-        fluid="He", t_min=hp["t_min_lo"], t_max=hp["t_max_hi"],
-        p_min=hp["p_min_lo"], p_max=hp["p_max_hi"],
-        t_quantiles=hp["t_q_vals"], p_quantiles=hp["p_q_vals"],
-        s_quantiles=hp["s_q_vals"], subcycle_mass_flow_initial=20.0,
-    )
-    sys_inp = SystemInput(
-        heat_sources=(hot,), cold_sources=(cold,),
-        cycles=(CycleConfig(input=cycle_in, use_non_ideal=hp["use_non_ideal"],
-                             delta_T_min=20.0, heat_method=None),),
-        delta_T_min=20.0, heat_method="system_pinch",
-    )
-
-    results: list[dict] = []
-
-    # ── CMA-ES ──
-    for budget in _CMA_BUDGETS:
-        hp_cma = dict(hp)
-        hp_cma["restarts_inner"] = 3
-        hp_cma["early_stop"] = 10
-        hp_cma["sigma0"] = 20.0
-        hp_cma["inner_method"] = "cma"
-        avg_pop = (max(4, int(4 + 3 * __import__("math").log2(max(dim, 2)))) +
-                   max(10, min(dim * dim, 50))) / 2
-        hp_cma["maxiter_inner"] = max(2, round(budget * dim / (avg_pop * 3)))
-        label = f"CMA-b{budget}"
-        t0 = time.perf_counter()
-        result, _ = _inner_cma_fast(cycle_in, sys_inp, hp_cma, seed=42)
-        elapsed = time.perf_counter() - t0
-        results.append({
-            "method": label, "kind": "CMA",
-            "obj": result.obj, "eta": -result.obj,
-            "n_evals": result.n_evals, "time_s": elapsed,
-            "h2_T_out": result.h2_T_out, "flows": result.flows,
-        })
-
-    # ── L-BFGS-B ──
-    best_lb_layer = None
-    best_lb_result = None
-    for n_starts in _LBFGSB_STARTS:
-        hp_lb = dict(hp)
-        hp_lb["lbfgsb_starts"] = n_starts
-        hp_lb["lbfgsb_maxiter"] = 50
-        hp_lb["lbfgsb_workers"] = _LBFGSB_WORKERS
-        hp_lb["inner_method"] = "lbfgsb"
-        label = f"LBFGSB-s{n_starts}"
-        t0 = time.perf_counter()
-        result, layer_out = _inner_lbfgsb_fast(cycle_in, sys_inp, hp_lb, seed=42)
-        elapsed = time.perf_counter() - t0
-        results.append({
-            "method": label, "kind": "LBFGSB",
-            "obj": result.obj, "eta": -result.obj,
-            "n_evals": result.n_evals, "time_s": elapsed,
-            "h2_T_out": result.h2_T_out, "flows": result.flows,
-        })
-        if n_starts == 15:
-            best_lb_layer = layer_out
-            best_lb_result = result
-
-    # ── 控制台输出 ──
-    print(f"\n{'='*70}")
-    print(f"{'Method':<16} {'obj':>10} {'eta':>8} {'evals':>8} {'time_s':>8} {'h2_T_out':>10}")
-    print("-" * 64)
-    for r in results:
-        print(f"{r['method']:<16} {r['obj']:>10.5f} {r['eta']:>8.4f} "
-              f"{r['n_evals']:>8} {r['time_s']:>8.1f} {r['h2_T_out']:>8.0f}")
-    print(f"{'='*70}\n")
-
-    # ── 可视化 ──
-    _draw_comparison(results, n_sc, dim, hp)
-
-    # ── 最佳解 PS 图 + 夹点 T-Q ──
-    if best_lb_layer is not None and best_lb_result is not None:
-        _draw_best_solution(best_lb_layer, best_lb_result, sys_inp, hp)
-
-    # ── 保存汇总 CSV ──
-    _save_csv(results, n_sc, dim, hp)
-
-
-def _draw_comparison(results: list[dict], n_sc: int, dim: int, hp: dict) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    cmap_cma = "tab:blue"
-    cmap_lb = "tab:orange"
-    cma = [r for r in results if r["kind"] == "CMA"]
-    lb = [r for r in results if r["kind"] == "LBFGSB"]
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f"Inner Optimizer Comparison | 1P1S H2=3.5kg/s "
-                 f"n_sc={n_sc} dim={dim} | softplus k={hp['penalty_k']}",
-                 fontsize=12, fontweight="bold")
-
-    # ── 左上: eta vs evals ──
-    ax1 = axes[0, 0]
-    for r in cma:
-        ax1.scatter(r["n_evals"], r["eta"], color=cmap_cma, s=80, zorder=3)
-        ax1.annotate(r["method"].replace("CMA-", ""),
-                     (r["n_evals"], r["eta"]),
-                     textcoords="offset points", xytext=(6, 6), fontsize=8,
-                     color=cmap_cma)
-    for r in lb:
-        ax1.scatter(r["n_evals"], r["eta"], color=cmap_lb, s=80, zorder=3)
-        ax1.annotate(r["method"].replace("LBFGSB-", ""),
-                     (r["n_evals"], r["eta"]),
-                     textcoords="offset points", xytext=(6, 6), fontsize=8,
-                     color=cmap_lb)
-    ax1.set_xlabel("Total evaluations"); ax1.set_ylabel("eta")
-    ax1.set_title("Efficiency vs evaluation budget"); ax1.grid(True, alpha=0.25)
-    ax1.legend(["CMA-ES", "L-BFGS-B"], loc="lower right")
-
-    # ── 右上: eta vs time ──
-    ax2 = axes[0, 1]
-    for r in cma:
-        ax2.scatter(r["time_s"], r["eta"], color=cmap_cma, s=80, zorder=3)
-        ax2.annotate(r["method"].replace("CMA-", ""),
-                     (r["time_s"], r["eta"]),
-                     textcoords="offset points", xytext=(6, 6), fontsize=8,
-                     color=cmap_cma)
-    for r in lb:
-        ax2.scatter(r["time_s"], r["eta"], color=cmap_lb, s=80, zorder=3)
-        ax2.annotate(r["method"].replace("LBFGSB-", ""),
-                     (r["time_s"], r["eta"]),
-                     textcoords="offset points", xytext=(6, 6), fontsize=8,
-                     color=cmap_lb)
-    ax2.set_xlabel("Wall time [s]"); ax2.set_ylabel("eta")
-    ax2.set_title("Efficiency vs wall time"); ax2.grid(True, alpha=0.25)
-
-    # ── 左下: bar chart - evals ──
-    ax3 = axes[1, 0]
-    labels = [r["method"] for r in results]
-    etas = [r["eta"] for r in results]
-    colors = [cmap_cma if r["kind"] == "CMA" else cmap_lb for r in results]
-    bars = ax3.bar(range(len(results)), etas, color=colors)
-    ax3.set_xticks(range(len(results)))
-    ax3.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-    ax3.set_ylabel("eta"); ax3.set_title("Efficiency per method")
-    for bar, eta in zip(bars, etas):
-        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
-                 f"{eta:.3f}", ha="center", fontsize=8)
-    ax3.grid(True, axis="y", alpha=0.25)
-
-    # ── 右下: h2_T_out vs eta ──
-    ax4 = axes[1, 1]
-    for r in cma:
-        ax4.scatter(r["h2_T_out"], r["eta"], color=cmap_cma, s=80, zorder=3)
-        ax4.annotate(r["method"].replace("CMA-", ""),
-                     (r["h2_T_out"], r["eta"]),
-                     textcoords="offset points", xytext=(6, 6), fontsize=8,
-                     color=cmap_cma)
-    for r in lb:
-        ax4.scatter(r["h2_T_out"], r["eta"], color=cmap_lb, s=80, zorder=3)
-        ax4.annotate(r["method"].replace("LBFGSB-", ""),
-                     (r["h2_T_out"], r["eta"]),
-                     textcoords="offset points", xytext=(6, 6), fontsize=8,
-                     color=cmap_lb)
-    ax4.set_xlabel("h2_T_out [K]"); ax4.set_ylabel("eta")
-    ax4.set_title("Efficiency vs H2 outlet temperature"); ax4.grid(True, alpha=0.25)
-
-    plt.tight_layout()
-    out_path = _OUT_DIR / "inner_compare.png"
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  图表: {out_path}")
-
-
-def _save_csv(results: list[dict], n_sc: int, dim: int, hp: dict) -> None:
-    import csv
-    out_path = _OUT_DIR / "inner_compare.csv"
-    with open(out_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["method", "kind", "obj", "eta", "n_evals", "time_s",
-                     "h2_T_out", "n_sc", "dim", "penalty_k", "flows"])
-        for r in results:
-            w.writerow([r["method"], r["kind"], r["obj"], r["eta"],
-                         r["n_evals"], r["time_s"], r["h2_T_out"],
-                         n_sc, dim, hp["penalty_k"],
-                         ",".join(f"{v:.1f}" for v in r["flows"])])
-    print(f"  CSV: {out_path}")
-
-
-def _draw_best_solution(layer, result, sys_inp, hp: dict) -> None:
-    """对最佳 LBFGSB-s20 解绘制 TS/PS 子循环图 + 夹点 T-Q 图。"""
-    from core import PropertyRegistry
-    from core.cycle_performance import ProcessCategory
-    from core.system import convert_sources
-    from core.postprocess import analyze_pinch
-    from tests.test_layered_opt import (
-        _draw_cycle_ts_ps, _draw_pinch_tq, _make_h2_source,
-    )
-
-    props = PropertyRegistry()
-    try:
-        layer.subcycle_mass_flows = list(result.flows)
-        layer.commit_subcycle_mass_flows_to_topology()
-    except Exception:
-        pass
-    report = layer.performance_report()
-    cold_src = _make_h2_source(hp, result.h2_mf, result.h2_T_out)
-
-    hots: list = []
-    colds: list = []
-    for _, rec in report.by_edge:
-        if rec.kind == "heat" and rec.power_rate is not None:
-            if rec.category == ProcessCategory.HEAT_REJECTION:
-                hots.append(rec)
-            else:
-                colds.append(rec)
-    src_hots, _ = convert_sources(sys_inp.heat_sources, (), props)
-    _, src_colds = convert_sources((), (cold_src,), props)
-    hots[:0] = src_hots
-    colds[:0] = src_colds
-
-    pinch = analyze_pinch(colds, hots, hp["hx_dT"], props)
-
-    _draw_cycle_ts_ps(report, layer, "LBFGSB-s20 best",
-                       _OUT_DIR / "best_ts_ps.png")
-    _draw_pinch_tq(hots, colds, pinch, hp["hx_dT"],
-                    _OUT_DIR / "best_pinch_tq.png")
-    print(f"  TS/PS: {_OUT_DIR / 'best_ts_ps.png'}")
-    print(f"  Pinch: {_OUT_DIR / 'best_pinch_tq.png'}")
-
-
 def test_1p0s_lbfgsb_multiseed() -> None:
-    """1P0S L-BFGS-B 多seed确定性对比: S96, w=8, maxiter=80, ftol=1e-8, 9 seeds."""
+    """1P0S L-BFGS-B 多seed: S16 w=16 dim=n_sc (h2_T_out=800K 固定), 9 seeds."""
     hp = dict(_HP)
     hp["n_p_q"] = 1
     hp["n_s_q"] = 0
     hp["p_q_vals"] = (0.5,)
     hp["s_q_vals"] = ()
-    hp["lbfgsb_starts"] = 256
+    hp["lbfgsb_starts"] = 16
     hp["lbfgsb_maxiter"] = 80
-    hp["lbfgsb_workers"] = 8
+    hp["lbfgsb_workers"] = 16
+    hp["lbfgsb_sampler"] = "lhs"
+    hp["inner_method"] = "lbfgsb"
+    hp["penalty_w"] = 1000.0
+    hp["h2_T_out_lo"] = 800.0
+    hp["h2_T_out_hi"] = 800.0   # ← h2_T_fixed → dim=n_sc
+    hp["obj_mode"] = "pinch"       # ← pinch mode for clean gradient
     hp["lbfgsb_sampler"] = "lhs"
     hp["inner_method"] = "lbfgsb"
     hp["penalty_w"] = 1000.0
@@ -341,7 +105,7 @@ def test_1p0s_lbfgsb_multiseed() -> None:
     all_results: list[dict] = []
 
     print(f"\n{'='*90}")
-    print(f"1P0S L-BFGS-B S256 w=8 maxiter=80 | penalty_w={hp['penalty_w']} k={hp['penalty_k']} ftol=1e-8")
+    print(f"1P0S L-BFGS-B S16 w=16 maxiter=80 | penalty_w={hp['penalty_w']} k={hp['penalty_k']} ftol=1e-8")
     print(f"n_sc={n_sc} dim={dim}  seeds={len(seeds)}")
     print(f"{'='*90}")
     print(f"{'seed':>5} {'obj':>10} {'eta':>8} {'evals':>8} {'time_s':>7} "
@@ -377,7 +141,7 @@ def test_1p0s_lbfgsb_multiseed() -> None:
     print(f"{'='*90}\n")
 
     import csv
-    csv_path = _OUT_DIR / "1p0s_s256_multiseed.csv"
+    csv_path = _OUT_DIR / "1p0s_s16_workers16_multiseed.csv"
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["seed", "obj", "eta", "n_evals", "time_s", "h2_T_out", "flows"])
@@ -389,7 +153,7 @@ def test_1p0s_lbfgsb_multiseed() -> None:
 
 
 def test_1p0s_consistency_h2_750() -> None:
-    """1P0S 内层一致性诊断: h2_T_out=750K 固定, 扫描 LHS starts × seeds。
+    """1P0S 内层一致性诊断: h2_T_out=750K 固定, 扫描 LHS starts × seeds.
 
     目的: 退出 h2_T_out 窄峰后, 观察 flows 盆地结构是否仍是 spread 主因。
     若 750K 下内层纯 flows 的 spread 仍然较大 → flows 自身多盆地。
@@ -613,234 +377,286 @@ def _draw_consistency_sweep(
     print(f"  可视化: {out_path}")
 
 
-def test_1p0s_flow_precision() -> None:
-    """验证内层 flows 的实际精度: h2_T_out=750K 固定, S48, 3 seeds, 打印6位小数。"""
-    from core.system import SystemInput, CycleConfig
-    from core import ExternalSourceInput
+def test_1p0s_2d_opt_compare() -> None:
+    """2D 优化方法对比: Grid / DE / L-BFGS-B / CMA-ES 搜索 (h2_T_out, p_q)。
+    内层: pinch(收flows) / 外层 obj: eff_pinch(区分η)。"""
+    import scipy.optimize as _sopt
+    import cma
 
     hp = dict(_HP)
-    hp["n_p_q"] = 1
-    hp["n_s_q"] = 0
-    hp["p_q_vals"] = (0.5,)
-    hp["s_q_vals"] = ()
-    hp["lbfgsb_starts"] = 48
-    hp["lbfgsb_maxiter"] = 80
-    hp["lbfgsb_workers"] = 8
-    hp["lbfgsb_sampler"] = "lhs"
-    hp["inner_method"] = "lbfgsb"
-    hp["penalty_w"] = 1000.0
-    hp["h2_T_out_lo"] = 750.0
-    hp["h2_T_out_hi"] = 750.0
+    hp["n_t_q"] = 0; hp["n_p_q"] = 1; hp["n_s_q"] = 0
+    hp["t_min_lo"] = 50.0; hp["t_min_hi"] = 50.0
+    hp["t_max_lo"] = 1000.0; hp["t_max_hi"] = 1000.0
+    hp["p_min_lo"] = 2000.0; hp["p_min_hi"] = 2000.0
+    hp["p_max_lo"] = 10000.0; hp["p_max_hi"] = 10000.0
+    hp["lbfgsb_starts"] = 24; hp["lbfgsb_maxiter"] = 80; hp["lbfgsb_workers"] = 12
+    hp["lbfgsb_sampler"] = "lhs"; hp["inner_method"] = "lbfgsb"
+    hp["penalty_w"] = 1000.0; hp["penalty_k"] = 10; hp["util_tol"] = 1.0
+    hp["hx_dT"] = 10.0; hp["use_non_ideal"] = False
+    hp["mf_lo"] = 0.0; hp["mf_hi"] = 50.0
 
-    layer = _build_fixed_layer(hp)
-    n_sc = len(layer.subcycles)
-    hot = ExternalSourceInput(fluid="Air", mass_flow=hp["air_mf"],
-                              T_in=hp["air_T_in"], P_in=hp["air_P_in"],
-                              T_out=hp["air_T_out"], P_out=hp["air_P_out"])
-    cold = ExternalSourceInput(fluid=hp["cold_fluid"], mass_flow=hp["h2_mf_lo"],
-                               T_in=hp["h2_T_in"], P_in=hp["h2_P_in"],
-                               T_out=750.0, P_out=hp["h2_P_out"])
-    cycle_in = ClosedCycleTPInput(
-        fluid="He", t_min=hp["t_min_lo"], t_max=hp["t_max_hi"],
-        p_min=hp["p_min_lo"], p_max=hp["p_max_hi"],
-        t_quantiles=hp["t_q_vals"], p_quantiles=hp["p_q_vals"],
-        s_quantiles=hp["s_q_vals"], subcycle_mass_flow_initial=20.0,
-    )
-    sys_inp = SystemInput(
-        heat_sources=(hot,), cold_sources=(cold,),
-        cycles=(CycleConfig(input=cycle_in, use_non_ideal=hp["use_non_ideal"],
-                             delta_T_min=20.0, heat_method=None),),
-        delta_T_min=20.0, heat_method="system_pinch",
-    )
+    from core import ExternalSourceInput, PropertyRegistry, ProcessCategory
+    from core.system import SystemInput, CycleConfig, convert_sources
 
-    print(f"\n  flows 精度验证: h2_T_out=750K, n_sc={n_sc}, S48 w=8")
-    print(f"  {'seed':>5} {'obj':>12}  {'flows (6 decimal places)':>55}")
-    print(f"  {'-'*75}")
+    out_dir = _OUT_DIR / "2d_opt_v2"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    for seed in [0, 100, 500]:
-        result, _ = _inner_lbfgsb_fast(cycle_in, sys_inp, dict(hp), seed=seed)
-        flows_hi = ", ".join(f"{v:.6f}" for v in result.flows)
-        print(f"  {seed:>5} {result.obj:>12.10f}  [{flows_hi}]")
-        print(f"         sum={sum(result.flows):.6f}")
+    # ──── 评估函数: 内层 pinch 收 flows → 外层 eff_pinch 重算 obj ────
+    def _eval_outer(h2t: float, pq: float, seed: int = 42) -> dict:
+        """返回 {obj, eta, flows, evals, time_s}。obj 是 eff_pinch 的值。"""
+        t0 = time.perf_counter()
+        tp_in = ClosedCycleTPInput(
+            fluid="He", t_min=50.0, t_max=1000.0,
+            p_min=2000.0, p_max=10000.0,
+            t_quantiles=(), p_quantiles=(pq,), s_quantiles=(),
+        )
+        layer = ClosedCycleLayer(tp_in)
+        if len(layer.subcycles) == 0:
+            return {"obj": 1e9, "eta": 0, "flows": [], "evals": 0,
+                    "time_s": time.perf_counter() - t0}
 
+        # 内层 pinch: 收 flows
+        hp_inner = dict(hp)
+        hp_inner["h2_T_out_lo"] = h2t; hp_inner["h2_T_out_hi"] = h2t
+        hp_inner["p_q_vals"] = (pq,); hp_inner["obj_mode"] = "pinch"
+        hp_inner["inner_method"] = "lbfgsb"
 
-def test_1p0s_penalty_sweep() -> None:
-    """1P0S 惩罚参数扫描: eff_pinch(w=1000,k=10) vs pinch vs eff_pinch(w=2000,k=5), h2_T_out=750K 固定。"""
-    from core.system import SystemInput, CycleConfig
-    from core import ExternalSourceInput
-
-    configs = [
-        ("eff_pinch w=1000 k=10", {"obj_mode": "eff_pinch", "penalty_w": 1000, "penalty_k": 10}),
-        ("pinch direct",          {"obj_mode": "pinch"}),
-        ("eff_pinch w=2000 k=5",  {"obj_mode": "eff_pinch", "penalty_w": 2000, "penalty_k": 5}),
-    ]
-
-    hp = dict(_HP)
-    hp["n_p_q"] = 1
-    hp["n_s_q"] = 0
-    hp["p_q_vals"] = (0.5,)
-    hp["s_q_vals"] = ()
-    hp["lbfgsb_starts"] = 48
-    hp["lbfgsb_maxiter"] = 80
-    hp["lbfgsb_workers"] = 8
-    hp["lbfgsb_sampler"] = "lhs"
-    hp["inner_method"] = "lbfgsb"
-    hp["h2_T_out_lo"] = 750.0
-    hp["h2_T_out_hi"] = 750.0
-
-    layer = _build_fixed_layer(hp)
-    n_sc = len(layer.subcycles)
-
-    hot = ExternalSourceInput(fluid="Air", mass_flow=hp["air_mf"],
-                              T_in=hp["air_T_in"], P_in=hp["air_P_in"],
-                              T_out=hp["air_T_out"], P_out=hp["air_P_out"])
-    cycle_in = ClosedCycleTPInput(
-        fluid="He", t_min=hp["t_min_lo"], t_max=hp["t_max_hi"],
-        p_min=hp["p_min_lo"], p_max=hp["p_max_hi"],
-        t_quantiles=hp["t_q_vals"], p_quantiles=hp["p_q_vals"],
-        s_quantiles=hp["s_q_vals"], subcycle_mass_flow_initial=20.0,
-    )
-    seeds = [0, 100, 200, 300, 400, 500, 600, 700, 800]
-
-    all_summaries: list[dict] = []
-
-    for label, c_extra in configs:
-        hp_c = dict(hp)
-        hp_c.update(c_extra)
-        cold = ExternalSourceInput(fluid=hp["cold_fluid"], mass_flow=hp["h2_mf_lo"],
+        hot = ExternalSourceInput(fluid="Air", mass_flow=hp["air_mf"],
+                                  T_in=hp["air_T_in"], P_in=hp["air_P_in"],
+                                  T_out=hp["air_T_out"], P_out=hp["air_P_out"])
+        cold = ExternalSourceInput(fluid=hp.get("cold_fluid", "Hydrogen"),
+                                   mass_flow=hp["h2_mf_lo"],
                                    T_in=hp["h2_T_in"], P_in=hp["h2_P_in"],
-                                   T_out=750.0, P_out=hp["h2_P_out"])
+                                   T_out=h2t, P_out=hp["h2_P_out"])
+        cycle_in = ClosedCycleTPInput(
+            fluid="He", t_min=50.0, t_max=1000.0, p_min=2000.0, p_max=10000.0,
+            t_quantiles=(), p_quantiles=(pq,), s_quantiles=(),
+            subcycle_mass_flow_initial=20.0,
+        )
         sys_inp = SystemInput(
             heat_sources=(hot,), cold_sources=(cold,),
-            cycles=(CycleConfig(input=cycle_in, use_non_ideal=hp["use_non_ideal"],
+            cycles=(CycleConfig(input=cycle_in, use_non_ideal=False,
                                  delta_T_min=20.0, heat_method=None),),
             delta_T_min=20.0, heat_method="system_pinch",
         )
+        result, _ = _inner_lbfgsb_fast(tp_in, sys_inp, hp_inner, seed=seed)
 
-        print(f"\n{'='*80}")
-        print(f"  {label}")
-        print(f"{'='*80}")
-        print(f"{'seed':>5} {'obj':>12} {'evals':>8}  {'flows':>25}")
-        print("-" * 65)
+        # 外层 eff_pinch: 对收敛后 flows 重算 obj (区分 η)
+        hp_outer = dict(hp)
+        hp_outer["obj_mode"] = "eff_pinch"
+        hp_outer["h2_T_out_lo"] = h2t; hp_outer["h2_T_out_hi"] = h2t
+        hp_outer["p_q_vals"] = (pq,)
+        outer_obj = _eval_fast(
+            ClosedCycleLayer(tp_in), hp["h2_mf_lo"], h2t, sys_inp, hp_outer)
+        # 也注入 flows 确保正确
+        try:
+            layer2 = ClosedCycleLayer(tp_in)
+            layer2.subcycle_mass_flows = list(result.flows)
+            layer2.commit_subcycle_mass_flows_to_topology()
+            outer_obj = _eval_fast(layer2, hp["h2_mf_lo"], h2t, sys_inp, hp_outer)
+        except Exception:
+            pass
 
-        all_objs: list[float] = []
-        for seed in seeds:
-            result, _ = _inner_lbfgsb_fast(cycle_in, sys_inp, dict(hp_c), seed=seed)
-            flows_str = ",".join(f"{v:.1f}" for v in result.flows)
-            all_objs.append(result.obj)
-            print(f"{seed:>5} {result.obj:>12.6f} {result.n_evals:>8}  [{flows_str}]")
+        # 直接从 sys_inp 算 η
+        props = PropertyRegistry()
+        _, lst_colds = convert_sources((), sys_inp.cold_sources, props)
+        lst_hots, _ = convert_sources(sys_inp.heat_sources, (), props)
+        q_source = sum(abs(float(r.power_rate)) for r in lst_hots if r.power_rate)
+        q_cold = sum(abs(float(r.power_rate)) for r in lst_colds if r.power_rate)
+        eta = (q_source - q_cold) / q_source if q_source > 1e-12 else 0.0
 
-        best = min(all_objs)
-        mean = sum(all_objs) / len(all_objs)
-        spread = max(all_objs) - min(all_objs)
-        all_summaries.append({"label": label, "best": best, "mean": mean, "spread": spread})
-        print("-" * 65)
-        print(f"  best={best:.4f}  mean={mean:.4f}  spread={spread:.4f}")
-        print(f"{'='*80}")
+        return {"obj": outer_obj, "eta": eta, "flows": list(result.flows),
+                "evals": result.n_evals, "time_s": time.perf_counter() - t0}
 
+    # ═══════════════════════════════════════════════════════
+    # 1. Grid
+    # ═══════════════════════════════════════════════════════
+    h2t_grid = list(range(600, 1025, 25))             # 17 pt
+    pq_grid = [round(0.05 + i * 0.1, 2) for i in range(10)]  # 10 pt
+    print(f"\n{'='*70}")
+    print(f"  Grid: h2_T_out∈[600,1000]step=25K × p_q∈[0.05,0.95]step=0.1 = {len(h2t_grid)*len(pq_grid)}pts")
+    print(f"{'='*70}")
+    grid_best = {"obj": float("inf"), "eta": 0.0}
+    grid_data: list[dict] = []
+    t_grid_start = time.perf_counter()
+    for h2t in h2t_grid:
+        for pq in pq_grid:
+            r = _eval_outer(float(h2t), pq)
+            grid_data.append({"h2t": h2t, "pq": pq, **r})
+            # eff_pinch obj 越小越好；同 obj 时选 eta 更高的
+            if r["obj"] < grid_best["obj"] or (r["obj"] == grid_best["obj"] and r["eta"] > grid_best["eta"]):
+                grid_best = {"obj": r["obj"], "eta": r["eta"], "h2t": h2t, "pq": pq}
+            sys.stdout.write(f"\r    ({h2t}K,{pq:.2f}) obj={r['obj']:.5f} eta={r['eta']:.4f}")
+    sys.stdout.write("\n")
+    t_grid = time.perf_counter() - t_grid_start
+    print(f"  Grid best: h2tout={grid_best['h2t']}K p_q={grid_best['pq']} obj={grid_best['obj']:.5f} eta={grid_best['eta']:.4f}  time={t_grid:.1f}s")
+
+    # ═══════════════════════════════════════════════════════
+    # 2. CMA-ES (先跑, 结果供 DE 播种)
+    # ═══════════════════════════════════════════════════════
+    print(f"\n  CMA-ES (sigma=0.15, maxfevals=120)")
+    cma_history: list[dict] = []
+    cma_best = [float("inf"), 0.0, 800.0, 0.5]
+    t_cma = time.perf_counter()
+
+    def _cma_obj_cb(xx):
+        r = _eval_outer(xx[0], xx[1])
+        cma_history.append({"h2t": xx[0], "pq": xx[1], "obj": r["obj"], "eta": r["eta"],
+                            "evals_add": r["evals"]})
+        if r["obj"] < cma_best[0] or (r["obj"] == cma_best[0] and r["eta"] > cma_best[1]):
+            cma_best[0] = r["obj"]; cma_best[1] = r["eta"]
+            cma_best[2] = xx[0]; cma_best[3] = xx[1]
+        return r["obj"]
+
+    try:
+        es = cma.CMAEvolutionStrategy([800.0, 0.5], 0.15,
+                                       {"maxfevals": 120, "verbose": -9, "seed": 42})
+        es.optimize(_cma_obj_cb)
+    except Exception as e:
+        print(f"    CMA error: {e}")
+    t_cma = time.perf_counter() - t_cma
+    cma_final = _eval_outer(cma_best[2], cma_best[3], seed=42)
+    print(f"  CMA best: h2tout={cma_best[2]:.0f}K p_q={cma_best[3]:.3f} obj={cma_final['obj']:.5f} eta={cma_final['eta']:.4f}  calls={len(cma_history)} evals={sum(h['evals_add'] for h in cma_history) if cma_history else 0} time={t_cma:.1f}s")
+
+    # ═══════════════════════════════════════════════════════
+    # 3. DE (CMA 播种)
+    # ═══════════════════════════════════════════════════════
+    bounds = [(600.0, 1000.0), (0.05, 0.95)]
+    import numpy as np
+    import random as _rnd
+    rng_de = _rnd.Random(42)
+    de_init = np.array([[cma_best[2], cma_best[3]]])  # CMA 最优作种子
+    for _ in range(4):  # DE 要求 init 至少 S>4 个点
+        de_init = np.vstack([de_init, [rng_de.uniform(*b) for b in bounds]])
+    popsize, maxiter_de = 12, 10
+    de_best = [float("inf"), 0.0, 800.0, 0.5]
+    de_history: list[dict] = []
+
+    def _de_obj(xx):
+        r = _eval_outer(xx[0], xx[1], seed=42)
+        de_history.append({"h2t": xx[0], "pq": xx[1], "obj": r["obj"], "eta": r["eta"],
+                           "evals_add": r["evals"]})
+        if r["obj"] < de_best[0] or (r["obj"] == de_best[0] and r["eta"] > de_best[1]):
+            de_best[0] = r["obj"]; de_best[1] = r["eta"]
+            de_best[2] = xx[0]; de_best[3] = xx[1]
+        return r["obj"]
+
+    print(f"\n  DE pop={popsize} iter={maxiter_de} mut=(0.5,1.5) | seeded: [{cma_best[2]:.0f}K,{cma_best[3]:.3f}]")
+    t_de = time.perf_counter()
+    _sopt.differential_evolution(
+        _de_obj, bounds, seed=42, popsize=popsize, maxiter=maxiter_de,
+        strategy="best1bin", mutation=(0.5, 1.5), recombination=0.9,
+        init=de_init, polish=False,
+    )
+    t_de = time.perf_counter() - t_de
+    de_final = _eval_outer(de_best[2], de_best[3], seed=42)
+    print(f"  DE best: h2tout={de_best[2]:.0f}K p_q={de_best[3]:.3f} obj={de_final['obj']:.5f} eta={de_final['eta']:.4f}  calls={len(de_history)} evals={sum(h['evals_add'] for h in de_history)} time={t_de:.1f}s")
+
+    # ═══════════════════════════════════════════════════════
+    # 汇总
+    # ═══════════════════════════════════════════════════════
+    methods = [
+        ("Grid", grid_best["h2t"], grid_best["pq"], grid_best["obj"], grid_best["eta"],
+         len(grid_data), sum(d["evals"] for d in grid_data), t_grid),
+        ("CMA-ES", cma_best[2], cma_best[3], cma_final["obj"], cma_final["eta"],
+         len(cma_history), sum(h["evals_add"] for h in cma_history) if cma_history else 0, t_cma),
+        ("DE(CMA-seed)", de_best[2], de_best[3], de_final["obj"], de_final["eta"],
+         len(de_history), sum(h["evals_add"] for h in de_history), t_de),
+    ]
     print(f"\n{'='*80}")
-    print(f"  对比汇总")
+    print(f"  2D 优化对比汇总 (内层 pinch + 外层 eff_pinch)")
     print(f"{'='*80}")
-    print(f"  {'config':<30} {'best':>10} {'mean':>10} {'spread':>10}")
-    print(f"  {'-'*62}")
-    for s in all_summaries:
-        print(f"  {s['label']:<30} {s['best']:>10.4f} {s['mean']:>10.4f} {s['spread']:>10.4f}")
+    print(f"  {'Method':<12} {'h2_T_out':>8} {'p_q':>7} {'obj':>9} {'eta':>7} {'calls':>6} {'evals':>9} {'time':>7}")
+    print(f"  {'-'*76}")
+    for name, h2t, pq, obj, eta, fc, ev, t in methods:
+        print(f"  {name:<12} {h2t:>6.0f}K {pq:>5.3f}  {obj:>9.5f} {eta:>7.4f} {fc:>6} {ev:>9} {t:>6.1f}s")
     print(f"{'='*80}\n")
-    """1P0S 分拆惩罚对比: eff_pinch(合并) vs eff_pinch_split(分开冷热), h2_T_out=750K 固定。"""
-    from core.system import SystemInput, CycleConfig
-    from core import ExternalSourceInput, ProcessCategory, PropertyRegistry
-    from core.postprocess import analyze_pinch
-    from core.system import convert_sources
 
-    hp = dict(_HP)
-    hp["n_p_q"] = 1
-    hp["n_s_q"] = 0
-    hp["p_q_vals"] = (0.5,)
-    hp["s_q_vals"] = ()
-    hp["lbfgsb_starts"] = 48
-    hp["lbfgsb_maxiter"] = 80
-    hp["lbfgsb_workers"] = 8
-    hp["lbfgsb_sampler"] = "lhs"
-    hp["inner_method"] = "lbfgsb"
-    hp["penalty_w"] = 1000.0
-    hp["obj_mode"] = "eff_pinch"  # 合并（对照组）
-    hp["h2_T_out_lo"] = 750.0
-    hp["h2_T_out_hi"] = 750.0
+    # ── 验证 CMA-ES 最优解的 obj 构成 ──
+    # 直接计算: η 来自 cold source 功率, obj 来自 eff_pinch, penalty = obj + η
+    cma_eta = cma_final["eta"]
+    cma_obj = cma_final["obj"]
+    cma_penalty = cma_obj + cma_eta
+    print(f"\n  ── obj 构成验证 (h2tout={cma_best[2]:.0f}K, p_q={cma_best[3]:.3f}) ──")
+    print(f"  η                 = {cma_eta:.6f}")
+    print(f"  -η                = {-cma_eta:.6f}")
+    print(f"  obj(eff_pinch)    = {cma_obj:.6f}")
+    print(f"  penalty_term      = obj + η = {cma_penalty:.6f}")
+    if abs(cma_penalty) < 1e-5:
+        print(f"  → 公用工程贡献 ≈ 0 (util 在 tol 以内)")
+    else:
+        print(f"  → 公用工程有非零贡献! (penalty_w={hp['penalty_w']} k={hp['penalty_k']})")
+    print()
 
-    layer = _build_fixed_layer(hp)
-    n_sc = len(layer.subcycles)
-    hot = ExternalSourceInput(fluid="Air", mass_flow=hp["air_mf"],
-                              T_in=hp["air_T_in"], P_in=hp["air_P_in"],
-                              T_out=hp["air_T_out"], P_out=hp["air_P_out"])
-    cycle_in = ClosedCycleTPInput(
-        fluid="He", t_min=hp["t_min_lo"], t_max=hp["t_max_hi"],
-        p_min=hp["p_min_lo"], p_max=hp["p_max_hi"],
-        t_quantiles=hp["t_q_vals"], p_quantiles=hp["p_q_vals"],
-        s_quantiles=hp["s_q_vals"], subcycle_mass_flow_initial=20.0,
-    )
+    # ── 可视化 ──
+    _draw_2d_opt_v2(grid_data, de_history, [], cma_history,
+                     grid_best, (de_best[2], de_best[3]),
+                     (0, 0), (cma_best[2], cma_best[3]),
+                     out_dir)
 
-    seeds = [0, 100, 200, 300, 400, 500, 600, 700, 800]
+    # ── CSV ──
+    import csv
+    csv_path = out_dir / "grid.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["h2_T_out", "p_q", "obj", "eta", "evals", "flows"])
+        for d in grid_data:
+            w.writerow([d["h2t"], d["pq"], d["obj"], d["eta"], d["evals"],
+                        ",".join(f"{v:.1f}" for v in d.get("flows", []))])
+    print(f"  CSV: {csv_path}")
 
-    # ── 合并惩罚（对照组）──
-    hp_merged = dict(hp)
-    hp_merged["obj_mode"] = "eff_pinch"
-    cold_m = ExternalSourceInput(fluid=hp["cold_fluid"], mass_flow=hp["h2_mf_lo"],
-                                 T_in=hp["h2_T_in"], P_in=hp["h2_P_in"],
-                                 T_out=750.0, P_out=hp["h2_P_out"])
-    sys_m = SystemInput(
-        heat_sources=(hot,), cold_sources=(cold_m,),
-        cycles=(CycleConfig(input=cycle_in, use_non_ideal=hp["use_non_ideal"],
-                             delta_T_min=20.0, heat_method=None),),
-        delta_T_min=20.0, heat_method="system_pinch",
-    )
-    merged_results: list[dict] = []
-    print(f"\n{'='*80}")
-    print("  合并惩罚 eff_pinch (hot+cold)")
-    print(f"{'='*80}")
-    for seed in seeds:
-        result, _ = _inner_lbfgsb_fast(cycle_in, sys_m, dict(hp_merged), seed=seed)
-        merged_results.append({"seed": seed, "obj": result.obj, "eta": -result.obj,
-                               "evals": result.n_evals, "flows": list(result.flows)})
 
-    # ── 分拆惩罚 ──
-    hp_split = dict(hp)
-    hp_split["obj_mode"] = "eff_pinch_split"
-    cold_s = ExternalSourceInput(fluid=hp["cold_fluid"], mass_flow=hp["h2_mf_lo"],
-                                 T_in=hp["h2_T_in"], P_in=hp["h2_P_in"],
-                                 T_out=750.0, P_out=hp["h2_P_out"])
-    sys_s = SystemInput(
-        heat_sources=(hot,), cold_sources=(cold_s,),
-        cycles=(CycleConfig(input=cycle_in, use_non_ideal=hp["use_non_ideal"],
-                             delta_T_min=20.0, heat_method=None),),
-        delta_T_min=20.0, heat_method="system_pinch",
-    )
-    split_results: list[dict] = []
-    print(f"\n{'='*80}")
-    print("  分拆惩罚 eff_pinch_split (hot + cold 分开)")
-    print(f"{'='*80}")
-    for seed in seeds:
-        result, _ = _inner_lbfgsb_fast(cycle_in, sys_s, dict(hp_split), seed=seed)
-        split_results.append({"seed": seed, "obj": result.obj, "eta": -result.obj,
-                              "evals": result.n_evals, "flows": list(result.flows)})
+def _draw_2d_opt_v2(
+    grid_data, de_hist, lb_hist, cma_hist,
+    grid_best, de_best, lb_best, cma_best, out_dir: Path,
+) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
 
-    # ── 对比 ──
-    print(f"\n{'='*80}")
-    print(f"  {'seed':>5} {'merged_obj':>12} {'split_obj':>12} {'Δobj':>10}  "
-          f"{'merged_flows':>25}  {'split_flows':>25}")
-    print(f"  {'-'*78}")
-    for i, seed in enumerate(seeds):
-        mo = merged_results[i]["obj"]
-        so = split_results[i]["obj"]
-        mf = ",".join(f"{v:.1f}" for v in merged_results[i]["flows"])
-        sf = ",".join(f"{v:.1f}" for v in split_results[i]["flows"])
-        print(f"  {seed:>5} {mo:>12.6f} {so:>12.6f} {mo-so:>10.6f}  "
-              f"[{mf}]  [{sf}]")
+    h2t_vals = sorted(set(d["h2t"] for d in grid_data))
+    pq_vals = sorted(set(d["pq"] for d in grid_data))
+    Z_eta = np.full((len(pq_vals), len(h2t_vals)), -1.0)
+    Z_obj = np.full((len(pq_vals), len(h2t_vals)), 1e9)
+    for d in grid_data:
+        hi = h2t_vals.index(d["h2t"]); pi = pq_vals.index(d["pq"])
+        Z_eta[pi, hi] = d.get("eta", -1)
+        Z_obj[pi, hi] = d.get("obj", 1e9)
 
-    m_etas = [-r["obj"] for r in merged_results]
-    s_etas = [-r["obj"] for r in split_results]
-    print(f"  {'-'*78}")
-    print(f"  {'':>5} merged: best={max(m_etas):.4f} mean={sum(m_etas)/len(m_etas):.4f} "
-          f"spread={max(m_etas)-min(m_etas):.4f}")
-    print(f"  {'':>5} split:  best={max(s_etas):.4f} mean={sum(s_etas)/len(s_etas):.4f} "
-          f"spread={max(s_etas)-min(s_etas):.4f}")
-    print(f"{'='*80}\n")
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle("2D (h2_T_out, p_q) Optimization v2 | 1P0S S24 inner=pinch outer=eff_pinch",
+                 fontsize=11, fontweight="bold")
+
+    # 左: eta 热力图
+    ax0 = axes[0]
+    im0 = ax0.pcolormesh(h2t_vals, pq_vals, Z_eta, cmap="RdYlGn", shading="auto", vmin=0.0, vmax=0.55)
+    ax0.scatter(grid_best["h2t"], grid_best["pq"], marker="*", color="black", s=200,
+                edgecolors="white", linewidths=1.5, zorder=5, label="Grid")
+    ax0.scatter(de_best[0], de_best[1], marker="D", color="tab:blue", s=70, zorder=5, label="DE")
+    ax0.scatter(lb_best[0], lb_best[1], marker="D", color="tab:orange", s=70, zorder=5, label="L-BFGS-B")
+    ax0.scatter(cma_best[0], cma_best[1], marker="D", color="tab:green", s=70, zorder=5, label="CMA-ES")
+    ax0.set_xlabel("h2_T_out [K]"); ax0.set_ylabel("p_q"); ax0.set_title("eta heatmap")
+    ax0.legend(fontsize=7); fig.colorbar(im0, ax=ax0, label="eta")
+
+    # 右: 迭代路径
+    ax1 = axes[1]
+    if de_hist:
+        dh = de_hist
+        ax1.plot([d["h2t"] for d in dh], [d["pq"] for d in dh], "o-",
+                 color="tab:blue", alpha=0.3, markersize=2, linewidth=0.5, label="DE")
+    if lb_hist:
+        ax1.plot([d["h2t"] for d in lb_hist], [d["pq"] for d in lb_hist], "s-",
+                 color="tab:orange", alpha=0.3, markersize=2, linewidth=0.5, label="L-BFGS-B")
+    if cma_hist:
+        ax1.plot([d["h2t"] for d in cma_hist], [d["pq"] for d in cma_hist], "^-",
+                 color="tab:green", alpha=0.3, markersize=2, linewidth=0.5, label="CMA-ES")
+    ax1.scatter(grid_best["h2t"], grid_best["pq"], marker="*", color="black", s=200, zorder=5)
+    ax1.set_xlabel("h2_T_out [K]"); ax1.set_ylabel("p_q"); ax1.set_title("Search paths")
+    ax1.legend(fontsize=7); ax1.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    out_path = out_dir / "2d_opt_v2.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  可视化: {out_path}")

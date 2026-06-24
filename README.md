@@ -141,6 +141,7 @@ print(result.hot_utility_demand, result.cold_utility_demand)  # 公用工程需�
 | [`tests/test_layered_opt.py`](tests/test_layered_opt.py) | 分层优化：LHS+DE 外层 + CMA/L-BFGS-B 内层，多模式 |
 | [`tests/test_inner_compare.py`](tests/test_inner_compare.py) | CMA-ES vs L-BFGS-B 内层方法对比 |
 | [`tests/optimization_example.py`](tests/optimization_example.py) | CH₄ 冷源效率优化示例 |
+| [`tests/test_feasibility_de.py`](tests/test_feasibility_de.py) | 新框架：h2_T_out 外层纳入 + 内层 flows-only 优化 |
 
 ---
 
@@ -161,9 +162,13 @@ pytest -s tests/test_inner_compare.py::test_compare_inner
 
 # CH₄ 冷源效率优化
 pytest -s tests/optimization_example.py::test_h2_scan_efficiency
+
+# 新框架: h2_T_out 外层纳入 + 内层 flows-only
+pytest -s tests/test_feasibility_de.py::test_1p0s_baseline
+pytest -s tests/test_feasibility_de.py::test_h2tout_scan_sweep
 ```
 
-输出图表位于 `tests/run_layered_fast/`、`tests/inner_compare/`、`tests/optimization_example/`。
+输出图表位于 `tests/run_layered_fast/`、`tests/inner_compare/`、`tests/optimization_example/`、`tests/feasibility_de/`。
 
 ---
 
